@@ -247,6 +247,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "keccak"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e24a010dd405bd7ed803e5253182815b41bf2e6a80cc3bfc066658e03a198aa"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+]
+
+[[package]]
 name = "konst"
 version = "0.2.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -466,6 +476,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha3"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc9bad02c26382724b2d2692c6f179285e4b54eeecd7968f52a50059c3c11759"
+dependencies = [
+ "digest",
+ "keccak",
+ "sponge-cursor",
+]
+
+[[package]]
+name = "sponge-cursor"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a0219bd7d979d58245a4f41f695e1ac9f8befdffadd7f61f1bae9e39abc6620"
+
+[[package]]
 name = "starkom-bluesky"
 version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -484,7 +511,9 @@ version = "1.0.0"
 dependencies = [
  "anyhow",
  "ff",
+ "primitive-types",
  "sha2",
+ "sha3",
  "starkom-bluesky",
  "starkom-poly",
  "starkom-poseidon2",
@@ -492,9 +521,9 @@ dependencies = [
 
 [[package]]
 name = "starkom-poly"
-version = "1.0.0"
+version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a96a07ca3cd6b8c2fa1a94a9281e35026040486f43e34c3d1db3737e5c7fe3b"
+checksum = "5ca1d4a19eb78542a4e30a2f884fd0e787279f9b7927f3c7accdd7f3c2ae0ea8"
 dependencies = [
  "anyhow",
  "ff",
@@ -503,9 +532,9 @@ dependencies = [
 
 [[package]]
 name = "starkom-poseidon2"
-version = "1.1.0"
+version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04d5e581885097b20cfc696e72af9b36a0dda51294c905bed466209e1a57dcb2"
+checksum = "0a14ce9a9275f837b2b04bf90c71a9c455edf877c67e5b0b4a8f3552d51bde14"
 dependencies = [
  "ff",
  "starkom-bluesky",

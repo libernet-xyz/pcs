@@ -3,7 +3,9 @@
 
 mod deep;
 mod fri;
-mod poseidon;
+mod utils;
+
+pub mod hash;
 
 pub use deep::*;
 pub use fri::*;

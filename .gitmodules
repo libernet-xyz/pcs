@@ -1,9 +1,0 @@
-[submodule "bluesky"]
-	path = bluesky
-	url = https://github.com/libernet-xyz/bluesky.git
-[submodule "poly"]
-	path = poly
-	url = https://github.com/libernet-xyz/poly.git
-[submodule "poseidon2"]
-	path = poseidon2
-	url = https://github.com/libernet-xyz/poseidon2.git
