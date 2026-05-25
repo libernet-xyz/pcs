@@ -1,0 +1,12 @@
+[package]
+name = "starkom-pcs"
+version = "1.0.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+ff = "0.13.1"
+sha2 = "0.11.0"
+starkom-bluesky = { version = "2.1.0", path = "bluesky" }
+starkom-poly = { version = "1.0.1", path = "poly" }
+starkom-poseidon2 = { version = "1.1.0", path = "poseidon2" }
