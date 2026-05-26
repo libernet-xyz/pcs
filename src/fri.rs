@@ -3,11 +3,11 @@ use crate::utils;
 use anyhow::{Result, anyhow};
 use ff::{Field, PrimeField};
 use starkom_bluesky::Scalar;
-use starkom_poly as poly;
+use starkom_poly;
 use std::marker::PhantomData;
 use std::sync::LazyLock;
 
-type Polynomial = poly::Polynomial<Scalar>;
+type Polynomial = starkom_poly::Polynomial<Scalar>;
 
 /// Domain separator tag used when hashing the leaves of a Merkle tree.
 static LEAF_DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"starkom/fri/leaf"));
@@ -25,7 +25,7 @@ static GENERATOR_INV: LazyLock<Scalar> =
     LazyLock::new(|| Scalar::MULTIPLICATIVE_GENERATOR.invert().unwrap());
 
 /// Hashes a leaf of a Merkle tree.
-fn hash_leaf<H: Hash>(values: &[Scalar]) -> Scalar {
+fn hash_leaf<H: Hash<Scalar>>(values: &[Scalar]) -> Scalar {
     H::hash_many(
         std::iter::once(*LEAF_DST)
             .chain(std::iter::once(Scalar::from(values.len() as u64)))
@@ -54,7 +54,7 @@ fn hash_leaf<H: Hash>(values: &[Scalar]) -> Scalar {
 ///
 /// Note about usage: the Merkle trees we use in this module have scalar *vectors* for leaves, not
 /// just scalars.
-pub fn merklify<H: Hash>(mut values: &mut [Scalar], mut n: usize) {
+pub fn merklify<H: Hash<Scalar>>(mut values: &mut [Scalar], mut n: usize) {
     assert!(n.is_power_of_two());
     while n > 1 {
         let m = n / 2;
@@ -111,13 +111,13 @@ impl Commitment {
 /// are reconstructed separately during the verification of a whole `Query`. In particular, all root
 /// hashes are stored in the `Commitment`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LeafProof<H: Hash> {
+pub struct LeafProof<H: Hash<Scalar>> {
     leaf: Vec<Scalar>,
     path: Vec<Scalar>,
     _data: PhantomData<H>,
 }
 
-impl<H: Hash> LeafProof<H> {
+impl<H: Hash<Scalar>> LeafProof<H> {
     /// Returns a reference to the leaf values (one for every committed polynomial).
     pub fn leaf(&self) -> &[Scalar] {
         self.leaf.as_slice()
@@ -195,7 +195,7 @@ impl<H: Hash> LeafProof<H> {
 ///
 /// The internal nodes are single hashes.
 #[derive(Debug, Clone)]
-pub struct Tree<H: Hash> {
+pub struct Tree<H: Hash<Scalar>> {
     /// Number of polynomials in the tree. This is the number of values in each leaf.
     num_polys: usize,
     /// The leaves of the tree (N leaves with K evaluations each).
@@ -206,7 +206,7 @@ pub struct Tree<H: Hash> {
     _data: PhantomData<H>,
 }
 
-impl<H: Hash> Tree<H> {
+impl<H: Hash<Scalar>> Tree<H> {
     /// Constructs a Merkle tree from a matrix of polynomial evaluations.
     ///
     /// More than one polynomial can be batched in the same tree because we our tree leaves are
@@ -364,7 +364,7 @@ impl<H: Hash> Tree<H> {
 }
 
 #[derive(Debug, Clone)]
-pub struct Query<H: Hash> {
+pub struct Query<H: Hash<Scalar>> {
     /// The number of committed evaluations.
     n: usize,
     /// The index of the element we're opening (the partner index is inferred automatically).
@@ -375,7 +375,7 @@ pub struct Query<H: Hash> {
     _data: PhantomData<H>,
 }
 
-impl<H: Hash> Query<H> {
+impl<H: Hash<Scalar>> Query<H> {
     /// Returns the two opened indices.
     pub fn indices(&self) -> (usize, usize) {
         (self.index, (self.index + self.n / 2) % self.n)
@@ -488,7 +488,7 @@ impl<H: Hash> Query<H> {
 /// folded into constant ones. Note that the final Merkle tree still has more than one leaf due to
 /// the low-degree extension.
 #[derive(Debug, Clone)]
-pub struct Prover<H: Hash> {
+pub struct Prover<H: Hash<Scalar>> {
     /// The degree bound of the committed polynomials. This is the highest degree among the
     /// committed polynomials, plus one.
     degree_bound: usize,
@@ -500,7 +500,7 @@ pub struct Prover<H: Hash> {
     trees: Vec<Tree<H>>,
 }
 
-impl<H: Hash> Prover<H> {
+impl<H: Hash<Scalar>> Prover<H> {
     pub fn new(polynomials: Vec<Polynomial>, degree_bound: usize, blowup_log2: usize) -> Self {
         assert!(degree_bound.is_power_of_two());
         assert!(
@@ -597,8 +597,11 @@ impl<H: Hash> Prover<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hash::{Poseidon2Hash, Sha2Hash};
+    use crate::hash;
     use crate::utils::parse_scalar;
+
+    type Poseidon2Hash = hash::Poseidon2Hash<Scalar>;
+    type Sha2Hash = hash::Sha2Hash<Scalar>;
 
     #[test]
     fn test_merklify_one_sha2() {
@@ -682,7 +685,7 @@ mod tests {
         );
     }
 
-    fn test_merkle_tree<H: Hash>(leaves: Vec<Vec<Scalar>>, expected_root_hash: Scalar) {
+    fn test_merkle_tree<H: Hash<Scalar>>(leaves: Vec<Vec<Scalar>>, expected_root_hash: Scalar) {
         let tree = Tree::<H>::from_leaves(leaves.clone());
         assert_eq!(tree.num_polys(), leaves[0].len());
         assert_eq!(tree.num_leaves(), leaves.len());
@@ -822,7 +825,7 @@ mod tests {
         );
     }
 
-    fn test_prover_impl<H: Hash>(
+    fn test_prover_impl<H: Hash<Scalar>>(
         polynomials: Vec<Polynomial>,
         degree_bound: usize,
         blowup_log2: usize,
