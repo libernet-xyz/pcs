@@ -9,7 +9,9 @@ use starkom_poly;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
 
-type Polynomial = starkom_poly::Polynomial<Scalar>;
+/// Re-exported type alias for polynomials over BlueSky. The current implementation only works on
+/// that field.
+pub type Polynomial = starkom_poly::Polynomial<Scalar>;
 
 /// Target security level in bits.
 pub const LAMBDA: usize = 128;
