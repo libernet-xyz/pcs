@@ -76,7 +76,7 @@ pub struct Poseidon2Hash<F: PrimeField> {
 
 impl Poseidon2Hash<Scalar> {
     fn hash_internal(inputs: &[Scalar]) -> Scalar {
-        poseidon::hash::<poseidon::BlueSkyConfig<4>, Scalar, 4>(inputs)
+        poseidon::hash0::<poseidon::BlueSkyConfig<4>, Scalar, 4>(inputs)
     }
 }
 
