@@ -510,7 +510,7 @@ impl<H: Hash<Scalar>> Prover<H> {
         );
 
         let n = degree_bound << blowup_log2;
-        assert!(n <= 1usize << Scalar::S);
+        assert!(n as u64 <= 1u64 << Scalar::S);
 
         let main_tree = Tree::<H>::new(
             polynomials
