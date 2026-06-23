@@ -1,6 +1,6 @@
 [package]
 name = "starkom-pcs"
-version = "1.1.0"
+version = "2.0.0"
 description = "The DEEP-FRI polynomial commitment scheme used in Starkom."
 license = "Apache-2.0"
 repository = "https://github.com/libernet-xyz/pcs.git"
@@ -12,13 +12,10 @@ crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 anyhow = "1.0.102"
-ff = "0.13.1"
 primitive-types = "0.14.0"
 sha2 = "0.11.0"
 sha3 = "0.12.0"
-starkom-bluesky = { version = "2.2.0" }
-starkom-poly = { version = "1.2.0" }
-starkom-poseidon2 = { version = "2.0.0" }
-
-[dev-dependencies]
-blstrs = "0.7.1"
+starkom-bluesky = { version = "3.1.1" }
+starkom-ff = "2.3.0"
+starkom-poly = { version = "2.0.0" }
+starkom-poseidon2 = { version = "3.0.3" }
