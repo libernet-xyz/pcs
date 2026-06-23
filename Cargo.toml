@@ -7,6 +7,9 @@ repository = "https://github.com/libernet-xyz/pcs.git"
 readme = "README.md"
 edition = "2024"
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 anyhow = "1.0.102"
 ff = "0.13.1"
