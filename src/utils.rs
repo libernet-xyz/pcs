@@ -1,72 +1,38 @@
-use anyhow::{Context, Result};
-use ff::PrimeField;
-use primitive_types::{H512, U256, U512};
+use primitive_types::H512;
 use sha3::Digest;
-use starkom_bluesky::Scalar;
-use std::any::TypeId;
-use std::collections::BTreeMap;
-use std::sync::{LazyLock, Mutex};
-
-fn get_modulus<F: PrimeField<Repr = [u8; 32]>>() -> U512 {
-    static MODULI: LazyLock<Mutex<BTreeMap<TypeId, U512>>> = LazyLock::new(|| Mutex::default());
-    let type_id = TypeId::of::<F>();
-    let mut values = MODULI.lock().unwrap();
-    match values.get(&type_id) {
-        Some(value) => value.clone(),
-        None => {
-            let value = F::MODULUS.parse().unwrap();
-            values.insert(type_id, value);
-            value
-        }
-    }
-}
-
-/// Interprets the provided 64 bytes in little-endian order and converts them to a scalar via
-/// modular reduction.
-pub(crate) fn h512_to_scalar<F: PrimeField<Repr = [u8; 32]>>(h512: H512) -> F {
-    let dividend = U512::from_little_endian(h512.as_bytes());
-    let remainder = dividend % get_modulus::<F>();
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(&remainder.to_little_endian()[0..32]);
-    F::from_repr_vartime(bytes).unwrap()
-}
+use starkom_ff::PrimeField256;
 
 /// Hashes an arbitrary text string into a uniformly distributed scalar.
 ///
 /// Under the hood this function works by hashing the string with SHA3-512 and converting the
 /// resulting 64 bytes to a scalar via modular reduction.
-pub(crate) fn hash_to_scalar<F: PrimeField<Repr = [u8; 32]>>(message: &[u8]) -> F {
+pub(crate) fn hash_to_scalar<F: PrimeField256>(message: &[u8]) -> F {
     let mut hasher = sha3::Sha3_512::new();
     hasher.update(message);
-    h512_to_scalar::<F>(H512::from_slice(hasher.finalize().as_slice()))
+    F::from_h512(H512::from_slice(hasher.finalize().as_slice()))
 }
 
-/// Converts a BlueSky scalar to U256.
-pub(crate) fn scalar_to_u256(value: Scalar) -> U256 {
-    U256::from_little_endian(&value.to_repr())
-}
+#[cfg(test)]
+pub(crate) mod testing {
+    use starkom_bluesky::Scalar;
 
-/// Converts a U256 value to a BlueSky scalar, failing if the value is outside the BlueSky range.
-pub(crate) fn u256_to_scalar(value: U256) -> Result<Scalar> {
-    Scalar::from_repr_vartime(&value.to_little_endian()).context("invalid BlueSky scalar")
-}
-
-/// Parses a BlueSky scalar, panicking if parsing fails.
-///
-/// This functionality is provided only for static strings because user inputs must always be
-/// validated.
-pub(crate) fn parse_scalar(s: &'static str) -> Scalar {
-    s.parse().unwrap()
+    /// TEST ONLY: parses a BlueSky scalar, panicking if parsing fails.
+    pub(crate) fn parse_scalar(s: &'static str) -> Scalar {
+        s.parse().unwrap()
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::testing::parse_scalar;
     use super::*;
-    use blstrs::Scalar as BlsScalar;
+    use primitive_types::U256;
+    use starkom_bluesky::Scalar;
+    use starkom_ff::{Field, bls12_381::Scalar as BlsScalar};
 
     fn parse_bls_scalar(s: &'static str) -> BlsScalar {
         let u256: U256 = s.parse().unwrap();
-        BlsScalar::from_bytes_le(&u256.to_little_endian())
+        BlsScalar::try_from_le_bytes(&u256.to_little_endian())
             .into_option()
             .unwrap()
     }
@@ -92,31 +58,6 @@ mod tests {
         assert_eq!(
             hash_to_scalar::<BlsScalar>(b"sator arepo tenet opera rotas"),
             parse_bls_scalar("0x1fdb6bf666ad555ca1a740f680d59736b736aa58ccd139eafe8889370196aa24")
-        );
-    }
-
-    #[test]
-    fn test_scalar_to_u256() {
-        assert_eq!(
-            scalar_to_u256(parse_scalar(
-                "0x9ff20c13ccb8a61ced7558c8e10964efd5ee3557d3a2bc0dfb83662950fc85f"
-            )),
-            "0x9ff20c13ccb8a61ced7558c8e10964efd5ee3557d3a2bc0dfb83662950fc85f"
-                .parse()
-                .unwrap()
-        );
-    }
-
-    #[test]
-    fn test_u256_to_scalar() {
-        assert_eq!(
-            u256_to_scalar(
-                "0x18d82aec545e64ec800bfd5d81baed36fa8c3ea2fdf5514256eb5bf312613a8e"
-                    .parse()
-                    .unwrap()
-            )
-            .unwrap(),
-            parse_scalar("0x18d82aec545e64ec800bfd5d81baed36fa8c3ea2fdf5514256eb5bf312613a8e")
         );
     }
 }
