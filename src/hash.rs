@@ -38,7 +38,7 @@ impl Sha2Hash<Scalar> {
     fn hash_internal(inputs: impl IntoIterator<Item = Scalar>) -> [u8; 32] {
         let mut hasher = sha2::Sha256::default();
         for input in inputs {
-            hasher.update(input.to_le_bytes());
+            hasher.update(input.to_be_bytes());
         }
         let mut bytes: [u8; 32] = hasher.finalize().into();
         bytes.reverse();
