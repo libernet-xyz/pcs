@@ -321,35 +321,17 @@ impl<H: Hash<Scalar>> Prover<H> {
         let mut ood_values: Vec<Scalar> = Vec::with_capacity(num_rounds);
 
         for round in 0..=num_rounds {
-            // Evaluate the current polynomial on the coset domain and commit it.
             let tree = Tree::<H>::new(polynomial.clone().shifted_lde2(n));
             let root = tree.root_hash();
             trees.push(tree);
 
             if round < num_rounds {
-                // OOD challenge: a random point outside all evaluation domains.
                 let ood_point = H::hash_raw(*OOD_DST, root, Scalar::ZERO);
                 let ood_value = polynomial.evaluate(ood_point);
                 ood_values.push(ood_value);
 
-                // Fold challenge incorporates the OOD evaluation so the prover is bound to it
-                // before learning alpha. The coefficient-form fold uses alpha directly (no
-                // GENERATOR_INV): new_coeff_j = old_coeff_{2j} + alpha * old_coeff_{2j+1}.
                 let alpha = H::hash_raw(*FOLD_DST, root, ood_value);
-                let coeffs = polynomial.take();
-                let m = (coeffs.len() + 1) / 2;
-                let new_coeffs = (0..m)
-                    .map(|j| {
-                        let even = coeffs[2 * j];
-                        let odd = if 2 * j + 1 < coeffs.len() {
-                            coeffs[2 * j + 1]
-                        } else {
-                            Scalar::ZERO
-                        };
-                        even + alpha * odd
-                    })
-                    .collect();
-                polynomial = Polynomial::with_coefficients(new_coeffs);
+                polynomial = polynomial.fold2(alpha);
                 n >>= 1;
             }
         }
