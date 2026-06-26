@@ -59,7 +59,7 @@ pub fn merklify<H: Hash<Scalar>>(mut values: &mut [Scalar], mut n: usize) {
     while n > 1 {
         let m = n / 2;
         for j in 0..m {
-            values[n + j] = H::hash_raw(*TREE_DST, values[j * 2], values[j * 2 + 1]);
+            values[n + j] = H::hash_two(*TREE_DST, values[j * 2], values[j * 2 + 1]);
         }
         values = &mut values[n..];
         n = m;
@@ -150,9 +150,9 @@ impl<H: Hash<Scalar>> LeafProof<H> {
         let mut hash = hash_leaf::<H>(self.leaf.as_slice());
         for sibling in &self.path {
             hash = if index & 1 != 0 {
-                H::hash_raw(*TREE_DST, *sibling, hash)
+                H::hash_two(*TREE_DST, *sibling, hash)
             } else {
-                H::hash_raw(*TREE_DST, hash, *sibling)
+                H::hash_two(*TREE_DST, hash, *sibling)
             };
             index >>= 1;
         }
@@ -182,7 +182,7 @@ impl<H: Hash<Scalar>> LeafProof<H> {
             if sibling != hash {
                 return false;
             }
-            hash = H::hash_raw(*TREE_DST, hash, hash);
+            hash = H::hash_two(*TREE_DST, hash, hash);
         }
         true
     }
@@ -318,7 +318,7 @@ impl<H: Hash<Scalar>> Tree<H> {
         let n = self.leaves.len();
         assert!(n.is_power_of_two());
 
-        let alpha = H::hash_raw(*FOLD_DST, self.hashes[(n - 1) * 2], Scalar::ZERO) * *GENERATOR_INV;
+        let alpha = H::hash_two(*FOLD_DST, self.hashes[(n - 1) * 2], Scalar::ZERO) * *GENERATOR_INV;
 
         let k = n.trailing_zeros() as usize;
         let omega_inv = Scalar::ROOT_OF_UNITY_INV.pow_u64(1u64 << (Scalar::S - k));
@@ -439,7 +439,7 @@ impl<H: Hash<Scalar>> Query<H> {
         for r in 0..h {
             let (left, right) = &folds[r];
             let root_hash = commitment.roots()[r];
-            let alpha = H::hash_raw(*FOLD_DST, root_hash, Scalar::ZERO) * *GENERATOR_INV;
+            let alpha = H::hash_two(*FOLD_DST, root_hash, Scalar::ZERO) * *GENERATOR_INV;
             let neg = right.leaf();
 
             if 1usize << left.len() != m {

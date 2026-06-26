@@ -45,7 +45,7 @@ pub fn merklify<H: Hash<Scalar>>(mut values: &mut [Scalar], mut n: usize) {
     while n > 1 {
         let m = n / 2;
         for j in 0..m {
-            values[n + j] = H::hash_raw(*TREE_DST, values[j * 2], values[j * 2 + 1]);
+            values[n + j] = H::hash_two(*TREE_DST, values[j * 2], values[j * 2 + 1]);
         }
         values = &mut values[n..];
         n = m;
@@ -124,9 +124,9 @@ impl<H: Hash<Scalar>> LeafProof<H> {
         let mut hash = self.leaf;
         for sibling in &self.path {
             hash = if index & 1 != 0 {
-                H::hash_raw(*TREE_DST, *sibling, hash)
+                H::hash_two(*TREE_DST, *sibling, hash)
             } else {
-                H::hash_raw(*TREE_DST, hash, *sibling)
+                H::hash_two(*TREE_DST, hash, *sibling)
             };
             index >>= 1;
         }
@@ -153,7 +153,7 @@ impl<H: Hash<Scalar>> LeafProof<H> {
             if sibling != hash {
                 return false;
             }
-            hash = H::hash_raw(*TREE_DST, hash, hash);
+            hash = H::hash_two(*TREE_DST, hash, hash);
         }
         true
     }
@@ -326,11 +326,11 @@ impl<H: Hash<Scalar>> Prover<H> {
             trees.push(tree);
 
             if round < num_rounds {
-                let ood_point = H::hash_raw(*OOD_DST, root, Scalar::ZERO);
+                let ood_point = H::hash_two(*OOD_DST, root, Scalar::ZERO);
                 let ood_value = polynomial.evaluate(ood_point);
                 ood_values.push(ood_value);
 
-                let alpha = H::hash_raw(*FOLD_DST, root, ood_value);
+                let alpha = H::hash_two(*FOLD_DST, root, ood_value);
                 polynomial = polynomial.fold2(alpha);
                 n >>= 1;
             }
