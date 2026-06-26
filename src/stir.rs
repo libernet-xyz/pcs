@@ -282,12 +282,50 @@ impl<H: Hash<Scalar>> Query<H> {
     /// NOTE: for low-degree testing you also need to check that `len()` returns
     /// `log2(degree_bound) + 1`. This function only verifies the fold chain consistency and the
     /// OOD / shift consistency; it does not check the number of rounds.
-    pub fn verify(&self, _commitment: &Commitment) -> Result<()> {
+    pub fn verify(&self, commitment: &Commitment) -> Result<()> {
         assert!(self.n.is_power_of_two());
         assert!(self.index < self.n);
 
-        // TODO
-        todo!()
+        let num_rounds = commitment.num_rounds();
+        if self.folds.len() != num_rounds + 1 {
+            return Err(anyhow!("wrong number of fold proofs"));
+        }
+
+        let k = self.n.trailing_zeros() as usize;
+        let mut m = self.n;
+        let mut i = self.index;
+        let mut step = Scalar::ROOT_OF_UNITY_INV.pow_u64(1u64 << (Scalar::S - k));
+        let mut pos = self.folds[0].0.leaf();
+
+        for r in 0..=num_rounds {
+            let (left, right) = &self.folds[r];
+            let root = commitment.roots()[r];
+
+            if left.leaf() != pos {
+                return Err(anyhow!("fold chain broken at round {}", r));
+            }
+            left.verify(i, root)?;
+            right.verify((i + m / 2) % m, root)?;
+
+            if r < num_rounds {
+                let alpha =
+                    H::hash_two(*FOLD_DST, root, commitment.ood_values()[r]) * *GENERATOR_INV;
+                let v0 = left.leaf();
+                let v1 = right.leaf();
+                let omega_inv_i = step.pow_small(i);
+                m /= 2;
+                i %= m;
+                step = step.square();
+                pos = (v0 + v1 + alpha * omega_inv_i * (v0 - v1)) * Scalar::TWO_INV;
+            }
+        }
+
+        let (left, right) = self.folds.last().unwrap();
+        if !left.is_constant() || !right.is_constant() {
+            return Err(anyhow!("final oracle is not constant"));
+        }
+
+        Ok(())
     }
 }
 
@@ -405,4 +443,101 @@ impl<H: Hash<Scalar>> Prover<H> {
             _data: Default::default(),
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hash;
+
+    type Poseidon2Hash = hash::Poseidon2Hash<Scalar>;
+    type Sha2Hash = hash::Sha2Hash<Scalar>;
+
+    fn test_prover<H: Hash<Scalar>>(
+        polynomial: Polynomial,
+        degree_bound: usize,
+        blowup_log2: usize,
+    ) {
+        let n = degree_bound << blowup_log2;
+        let prover = Prover::<H>::new(polynomial, degree_bound, blowup_log2);
+        let commitment = prover.commit();
+        for index in 0..n {
+            let query = prover.query(index);
+            assert!(query.verify(&commitment).is_ok());
+        }
+    }
+
+    fn test_blowups<H: Hash<Scalar>>(polynomial: Polynomial, degree_bound: usize) {
+        test_prover::<H>(polynomial.clone(), degree_bound, 1);
+        test_prover::<H>(polynomial.clone(), degree_bound, 2);
+        test_prover::<H>(polynomial, degree_bound, 3);
+    }
+
+    #[test]
+    fn test_constant_polynomial_sha2() {
+        let p = Polynomial::with_coefficients(vec![Scalar::from_const(42)]);
+        test_blowups::<Sha2Hash>(p, 1);
+    }
+
+    #[test]
+    fn test_constant_polynomial_poseidon2() {
+        let p = Polynomial::with_coefficients(vec![Scalar::from_const(42)]);
+        test_blowups::<Poseidon2Hash>(p, 1);
+    }
+
+    #[test]
+    fn test_degree_one_polynomial_sha2() {
+        let p = Polynomial::with_coefficients(vec![Scalar::from_const(12), Scalar::from_const(34)]);
+        test_blowups::<Sha2Hash>(p, 2);
+    }
+
+    #[test]
+    fn test_degree_one_polynomial_poseidon2() {
+        let p = Polynomial::with_coefficients(vec![Scalar::from_const(12), Scalar::from_const(34)]);
+        test_blowups::<Poseidon2Hash>(p, 2);
+    }
+
+    #[test]
+    fn test_degree_two_polynomial_sha2() {
+        let p = Polynomial::with_coefficients(vec![
+            Scalar::from_const(12),
+            Scalar::from_const(34),
+            Scalar::from_const(56),
+        ]);
+        test_blowups::<Sha2Hash>(p, 4);
+    }
+
+    #[test]
+    fn test_degree_two_polynomial_poseidon2() {
+        let p = Polynomial::with_coefficients(vec![
+            Scalar::from_const(12),
+            Scalar::from_const(34),
+            Scalar::from_const(56),
+        ]);
+        test_blowups::<Poseidon2Hash>(p, 4);
+    }
+
+    #[test]
+    fn test_degree_three_polynomial_sha2() {
+        let p = Polynomial::with_coefficients(vec![
+            Scalar::from_const(12),
+            Scalar::from_const(34),
+            Scalar::from_const(56),
+            Scalar::from_const(78),
+        ]);
+        test_blowups::<Sha2Hash>(p, 4);
+    }
+
+    #[test]
+    fn test_degree_three_polynomial_poseidon2() {
+        let p = Polynomial::with_coefficients(vec![
+            Scalar::from_const(12),
+            Scalar::from_const(34),
+            Scalar::from_const(56),
+            Scalar::from_const(78),
+        ]);
+        test_blowups::<Poseidon2Hash>(p, 4);
+    }
+
+    // TODO
 }
