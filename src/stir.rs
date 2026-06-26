@@ -9,9 +9,6 @@ use std::sync::LazyLock;
 
 type Polynomial = starkom_poly::Polynomial<Scalar>;
 
-/// Domain separator tag used when hashing the leaves of a Merkle tree.
-static LEAF_DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"starkom/stir/leaf"));
-
 /// Domain separator tag used in (internal) Merkle tree hashes.
 static TREE_DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"starkom/stir/tree"));
 
@@ -26,17 +23,6 @@ static OOD_DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"star
 /// `alpha * g^{-1} * omega^{-i}`.
 static GENERATOR_INV: LazyLock<Scalar> =
     LazyLock::new(|| Scalar::MULTIPLICATIVE_GENERATOR.invert().unwrap());
-
-/// Hashes a leaf of a Merkle tree.
-fn hash_leaf<H: Hash<Scalar>>(values: &[Scalar]) -> Scalar {
-    H::hash_many(
-        std::iter::once(*LEAF_DST)
-            .chain(std::iter::once(Scalar::from(values.len() as u64)))
-            .chain(values.iter().cloned())
-            .collect::<Vec<Scalar>>()
-            .as_slice(),
-    )
-}
 
 /// Computes all Merkle hashes of a vector of values up to the root.
 ///
@@ -103,34 +89,28 @@ impl Commitment {
 
 /// A Merkle proof.
 ///
-/// NOTE: this object only stores the sister hashes of the Merkle path and the opened leaf values,
-/// it doesn't store the lookup key and the root hash anywhere because those pieces of information
-/// are reconstructed separately during the verification of a whole `Query`. In particular, all root
+/// NOTE: this object only stores the sister hashes of the Merkle path and the opened leaf value, it
+/// doesn't store the lookup key and the root hash anywhere because those pieces of information are
+/// reconstructed separately during the verification of a whole `Query`. In particular, all root
 /// hashes are stored in the `Commitment`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeafProof<H: Hash<Scalar>> {
-    leaf: Vec<Scalar>,
+    leaf: Scalar,
     path: Vec<Scalar>,
     _data: PhantomData<H>,
 }
 
 impl<H: Hash<Scalar>> LeafProof<H> {
     /// Returns a reference to the leaf values (one for every committed polynomial).
-    pub fn leaf(&self) -> &[Scalar] {
-        self.leaf.as_slice()
+    pub fn leaf(&self) -> Scalar {
+        self.leaf
     }
 
     /// Checks the leaf of this proof against the provided slice.
     ///
     /// The two must match or an error is returned.
-    pub fn check_leaf(&self, expected: &[Scalar]) -> Result<()> {
-        if expected.len() != self.leaf.len()
-            || self
-                .leaf
-                .iter()
-                .zip(expected.iter())
-                .any(|(&value1, &value2)| value1 != value2)
-        {
+    pub fn check_leaf(&self, expected: Scalar) -> Result<()> {
+        if self.leaf != expected {
             return Err(anyhow!("leaf value mismatch"));
         }
         Ok(())
@@ -144,7 +124,7 @@ impl<H: Hash<Scalar>> LeafProof<H> {
 
     /// Verifies the proof against the given root hash.
     pub fn verify(&self, mut index: usize, root_hash: Scalar) -> Result<()> {
-        let mut hash = hash_leaf::<H>(self.leaf.as_slice());
+        let mut hash = self.leaf;
         for sibling in &self.path {
             hash = if index & 1 != 0 {
                 H::hash_raw(*TREE_DST, *sibling, hash)
@@ -166,15 +146,12 @@ impl<H: Hash<Scalar>> LeafProof<H> {
         Ok(())
     }
 
-    /// Indicates whether or not the committed polynomials are constant.
+    /// Indicates whether or not the committed polynomial is constant.
     ///
-    /// This is used in low degree testing to check when the folding process collapses to degree-0
-    /// polynomials.
-    ///
-    /// Note that some polynomials may collapse earlier than others, and this function returns false
-    /// if one or more haven't collapsed yet. So it returns true if and only if all have collapsed.
+    /// This is used in low degree testing to check when the folding process collapses to a degree-0
+    /// polynomial.
     pub fn is_constant(&self) -> bool {
-        let mut hash = hash_leaf::<H>(self.leaf.as_slice());
+        let mut hash = self.leaf;
         for &sibling in &self.path {
             if sibling != hash {
                 return false;
@@ -185,7 +162,7 @@ impl<H: Hash<Scalar>> LeafProof<H> {
     }
 }
 
-/// A Merkle tree whose leaves are multiple polynomial evaluations.
+/// A Merkle tree of polynomial evaluations.
 ///
 /// The tree has N leaf in total, with N being the size of the extended domain, and each leaf has K
 /// polynomial evaluations, with K being the number of committed polynomials.
@@ -193,113 +170,59 @@ impl<H: Hash<Scalar>> LeafProof<H> {
 /// The internal nodes are single hashes.
 #[derive(Debug, Clone)]
 pub struct Tree<H: Hash<Scalar>> {
-    /// Number of polynomials in the tree. This is the number of values in each leaf.
-    num_polys: usize,
-    /// The leaves of the tree (N leaves with K evaluations each).
-    leaves: Vec<Vec<Scalar>>,
-    /// The internal nodes of the tree. There are 2*N-1 nodes in this array, with N = number of
-    /// leaves. The N nodes of the bottom layer are the hashes of the corresponding leaves.
-    hashes: Vec<Scalar>,
+    /// The nodes of the tree stored as a flat array, using the layout generated by `merklify`. The
+    /// array has 2*N-1 elements in total, with N being the number of committed evaluations (always
+    /// a power of 2). The root hash of the tree is located at index (N-1)*2.
+    data: Vec<Scalar>,
     _data: PhantomData<H>,
 }
 
 impl<H: Hash<Scalar>> Tree<H> {
-    /// Constructs a Merkle tree from a matrix of polynomial evaluations.
+    /// Constructs a Merkle tree from an array of polynomial evaluations.
     ///
-    /// More than one polynomial can be batched in the same tree because our tree leaves are vectors
-    /// rather than single scalars. The only requirement is that all polynomials have the same
-    /// number of evaluations (not necessarily the same degree).
-    ///
-    /// The provided `leaves` array has one entry for each leaf, and each leaf is a vector of K
-    /// polynomial evaluations, with K = number of batched polynomials.
-    ///
-    /// Neither the outer array nor the inner arrays can be empty.
-    pub fn from_leaves(leaves: Vec<Vec<Scalar>>) -> Self {
-        let num_polys = leaves[0].len();
-        assert!(num_polys > 0);
-        let n = leaves.len();
+    /// REQUIRES: the number of provided `values` must be a power of two.
+    pub fn new(mut values: Vec<Scalar>) -> Self {
+        let n = values.len();
         assert!(n.is_power_of_two());
-        let mut hashes = vec![Scalar::ZERO; n * 2 - 1];
-        for i in 0..n {
-            let leaf = leaves[i].as_slice();
-            assert_eq!(leaf.len(), num_polys);
-            hashes[i] = hash_leaf::<H>(leaf);
-        }
-        merklify::<H>(hashes.as_mut_slice(), n);
+        values.resize(n * 2 - 1, Scalar::ZERO);
+        merklify::<H>(values.as_mut_slice(), n);
         Self {
-            num_polys,
-            leaves,
-            hashes,
+            data: values,
             _data: Default::default(),
         }
-    }
-
-    /// Constructs a Merkle tree from a matrix of polynomial evaluations.
-    ///
-    /// The outer array of `values` contains one entry per committed polynomial, and each of the
-    /// inner arrays represents the evaluations of a polynomial.
-    ///
-    /// Therefore `values` has as many elements as the number of polynomials being committed and the
-    /// length of the inner arrays must equal the size of the (extended) evaluation domain.
-    ///
-    /// Note that the only difference between `new` and `from_leaves` is that the dimensions of the
-    /// provided matrix are inverted.
-    ///
-    /// Neither the outer array nor the inner arrays can be empty.
-    pub fn new(values: Vec<Vec<Scalar>>) -> Self {
-        let k = values.len();
-        assert!(k > 0);
-        let n = values[0].len();
-        let leaves: Vec<Vec<Scalar>> = (0..n)
-            .map(|i| {
-                (0..k)
-                    .map(|j| {
-                        assert_eq!(n, values[j].len());
-                        values[j][i]
-                    })
-                    .collect()
-            })
-            .collect();
-        Self::from_leaves(leaves)
-    }
-
-    /// Returns the number of polynomials stored in the tree.
-    ///
-    /// Each leaf of the tree has this number of values.
-    pub fn num_polys(&self) -> usize {
-        self.num_polys
     }
 
     /// Returns the number of leaves in the tree, corresponding to the size of the evaluation domain
     /// (always a power of 2).
     pub fn num_leaves(&self) -> usize {
-        self.leaves.len()
+        (self.data.len() + 1) / 2
     }
 
     /// Returns the root hash of the Merkle tree.
     pub fn root_hash(&self) -> Scalar {
-        let n = self.leaves.len();
-        self.hashes[(n - 1) * 2]
+        let n = self.num_leaves();
+        self.data[(n - 1) * 2]
     }
 
-    /// Returns a reference to the i-th leaf.
+    /// Returns the i-th leaf.
     ///
-    /// Note that the leaf contains k elements, one for every committed polynomial.
-    pub fn leaf(&self, index: usize) -> &[Scalar] {
-        self.leaves[index].as_slice()
+    /// REQUIRES: `index` must be strictly less than [`Self::num_leaves`], although this is not
+    /// strictly enforced.
+    pub fn leaf(&self, index: usize) -> Scalar {
+        self.data[index]
     }
 
     /// Returns a Merkle proof for the leaf at `index`.
     pub fn query(&self, mut index: usize) -> LeafProof<H> {
-        let mut n = self.leaves.len();
+        let mut n = self.num_leaves();
         assert!(n.is_power_of_two());
         assert!(index < n);
-        let leaf = self.leaves[index].clone();
+        let leaf = self.data[index];
         let mut path = Vec::with_capacity(n.trailing_zeros() as usize);
-        let mut hashes = self.hashes.as_slice();
+        let mut data = self.data.as_slice();
         while n > 1 {
-            path.push(hashes[index ^ 1]);
-            hashes = &hashes[n..];
+            path.push(data[index ^ 1]);
+            data = &data[n..];
             n /= 2;
             index >>= 1;
         }
@@ -339,8 +262,8 @@ impl<H: Hash<Scalar>> Query<H> {
         Polynomial::coset_element2(self.index, self.n)
     }
 
-    /// Returns the leaf values of f_0 at the main query position and its fold-partner.
-    pub fn values(&self) -> (&[Scalar], &[Scalar]) {
+    /// Returns the values of f_0 at the main query position and its fold-partner.
+    pub fn values(&self) -> (Scalar, Scalar) {
         (self.folds[0].0.leaf(), self.folds[0].1.leaf())
     }
 
@@ -351,8 +274,8 @@ impl<H: Hash<Scalar>> Query<H> {
 
     /// Returns the shift proof values for the given folding round r (0-indexed).
     ///
-    /// Each element of the returned slice is the leaf values of f_{r+1} at one shift position.
-    pub fn shift_values(&self, round: usize) -> Vec<&[Scalar]> {
+    /// Each element of the returned vector is the value of f_{r+1} at one shift position.
+    pub fn shift_values(&self, round: usize) -> Vec<Scalar> {
         self.shift_proofs[round]
             .iter()
             .map(|proof| proof.leaf())
@@ -391,23 +314,14 @@ pub struct Prover<H: Hash<Scalar>> {
 }
 
 impl<H: Hash<Scalar>> Prover<H> {
-    pub fn new(polynomials: Vec<Polynomial>, degree_bound: usize, blowup_log2: usize) -> Self {
+    pub fn new(polynomial: Polynomial, degree_bound: usize, blowup_log2: usize) -> Self {
         assert!(degree_bound.is_power_of_two());
-        assert!(
-            polynomials
-                .iter()
-                .all(|polynomial| degree_bound >= polynomial.degree_bound())
-        );
+        assert!(degree_bound >= polynomial.degree_bound());
 
         let n = degree_bound << blowup_log2;
         assert!(n as u64 <= 1u64 << Scalar::S);
 
-        let main_tree = Tree::<H>::new(
-            polynomials
-                .into_iter()
-                .map(|polynomial| polynomial.shifted_lde2(n))
-                .collect(),
-        );
+        let main_tree = Tree::<H>::new(polynomial.shifted_lde2(n));
 
         // TODO
         todo!()
