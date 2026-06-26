@@ -209,9 +209,9 @@ pub struct Tree<H: Hash<Scalar>> {
 impl<H: Hash<Scalar>> Tree<H> {
     /// Constructs a Merkle tree from a matrix of polynomial evaluations.
     ///
-    /// More than one polynomial can be batched in the same tree because we our tree leaves are
-    /// vectors rather than single scalars. The only requirement is that all polynomials have the
-    /// same number of evaluations (not necessarily the same degree).
+    /// More than one polynomial can be batched in the same tree because our tree leaves are vectors
+    /// rather than single scalars. The only requirement is that all polynomials have the same
+    /// number of evaluations (not necessarily the same degree).
     ///
     /// The provided `leaves` array has one entry for each leaf, and each leaf is a vector of K
     /// polynomial evaluations, with K = number of batched polynomials.
