@@ -22,7 +22,10 @@ static QUERY_DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"st
 /// Domain separator tag for the Fiat-Shamir challenge used to build the random linear combination.
 static RLC_DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"starkom/pcs/rlc"));
 
-/// Returns the number of FRI queries required to achieve 128-bit security using a blowup factor of
+/// Domain separator tag for the Fiat-Shamir challenge used to batch DEEP quotients into one.
+static BATCH_DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"starkom/pcs/batch"));
+
+/// Returns the number of STIR queries required to achieve 128-bit security using a blowup factor of
 /// `2^blowup_log2` when opening `num_points` evaluation points.
 fn num_queries(blowup_log2: usize, num_points: usize) -> usize {
     let extra = num_points.next_power_of_two().trailing_zeros() as usize;
@@ -42,13 +45,13 @@ fn rlc(values: &[Scalar], alpha: Scalar) -> Scalar {
     rlc
 }
 
-/// A batched DEEP-FRI polynomial commitment (see `Committer` for details).
+/// A batched DEEP-STIR polynomial commitment (see `Committer` for details).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Commitment {
     /// The root hashes of the Merkle trees where the evaluations of all batched polynomials are
     /// stored. There is one root hash per polynomial batch.
     tree_roots: Vec<Scalar>,
-    /// The underlying FRI commitment.
+    /// The underlying STIR commitment.
     inner: fri::Commitment,
 }
 
@@ -58,8 +61,8 @@ impl Commitment {
         self.tree_roots.as_slice()
     }
 
-    /// Returns the FRI query indices derived via Fiat-Shamir from the full commitment transcript
-    /// (all polynomial and FRI Merkle root hashes).
+    /// Returns the STIR query indices derived via Fiat-Shamir from the full commitment transcript
+    /// (all polynomial and STIR Merkle root hashes).
     fn get_query_indices<H: Hash<Scalar>>(
         &self,
         degree_bound: usize,
@@ -87,14 +90,14 @@ impl Commitment {
     }
 }
 
-/// Collects batches of polynomials and allows building a DEEP-FRI prover for them.
+/// Collects batches of polynomials and allows building a DEEP-STIR prover for them.
 ///
 /// This works by building Merkle trees on the batched polynomials, one tree per batch, and
 /// eventually handing everything over to a newly constructed `Prover` (see the `commit` method).
 ///
 /// This two-stage Committer-Prover architecture allows getting Merkle roots for the proven
-/// polynomials before running the FRI folding argument and even before batching all polynomials, so
-/// that Fiat-Shamir challenges can be derived before any quotients are built.
+/// polynomials before running the STIR folding argument and even before batching all polynomials,
+/// so that Fiat-Shamir challenges can be derived before any quotients are built.
 #[derive(Debug, Clone)]
 pub struct Committer<H: Hash<Scalar>> {
     /// The proven degree bound. The degree of all batched polynomials must be strictly less than
@@ -114,7 +117,7 @@ impl<H: Hash<Scalar>> Committer<H> {
     /// Constructs a `Committer` with the given degree bound, blowup factor, and first batch of
     /// polynomials.
     ///
-    /// We require specifying the first batch because our DEEP-FRI protocol requires at least one
+    /// We require specifying the first batch because our DEEP-STIR protocol requires at least one
     /// committed polynomial to work.
     pub fn new(degree_bound: usize, blowup_log2: usize, polynomials: Vec<Polynomial>) -> Self {
         let mut committer = Self {
@@ -155,7 +158,7 @@ impl<H: Hash<Scalar>> Committer<H> {
         self.trees[index].root_hash()
     }
 
-    /// Adds a batch of polynomials, returnin the index of the newly created batch.
+    /// Adds a batch of polynomials, returning the index of the newly created batch.
     ///
     /// The returned index can be used with the `tree` and `root_hash` methods to get the Merkle
     /// tree and root hash for the batch, respectively.
@@ -199,7 +202,7 @@ impl<H: Hash<Scalar>> Committer<H> {
     }
 
     /// Consumes the `Committer`, calculates all DEEP quotients, and returns a polynomial
-    /// `Commitment` and a DEEP-FRI `Prover`.
+    /// `Commitment` and a DEEP-STIR `Prover`.
     ///
     /// `points` is the set of points to open in the `Prover`. The contained scalars are
     /// (off-domain) X-coordinates; the corresponding Y-coordinates will be computed automatically
@@ -247,17 +250,23 @@ impl<H: Hash<Scalar>> Committer<H> {
             combined
         };
 
-        let quotients = points
-            .iter()
-            .map(|(&z, values)| {
+        let beta = H::hash_two(*BATCH_DST, alpha, Scalar::ZERO);
+
+        let batched_quotient = {
+            let mut batched = Polynomial::default();
+            let mut pow = Scalar::ONE;
+            for (&z, values) in &points {
                 let value = rlc(values.as_slice(), alpha);
                 let (quotient, remainder) = (combined.clone() - value).horner(z);
                 assert_eq!(remainder, Scalar::ZERO);
-                quotient
-            })
-            .collect();
+                batched += quotient * pow;
+                pow *= beta;
+            }
+            batched
+        };
 
-        let inner_prover = fri::Prover::<H>::new(quotients, self.degree_bound, self.blowup_log2);
+        let inner_prover =
+            fri::Prover::<H>::new(vec![batched_quotient], self.degree_bound, self.blowup_log2);
 
         let commitment = Commitment {
             tree_roots: self.trees.iter().map(|tree| tree.root_hash()).collect(),
@@ -274,7 +283,7 @@ impl<H: Hash<Scalar>> Committer<H> {
     }
 }
 
-/// A DEEP-FRI proof.
+/// A DEEP-STIR proof.
 #[derive(Debug, Clone)]
 pub struct Proof<H: Hash<Scalar>> {
     /// The proven degree bound. If the proof is valid the degree of all batched polynomials is
@@ -287,11 +296,11 @@ pub struct Proof<H: Hash<Scalar>> {
     /// The opened points. Keys are (off-domain) X-coordinates, values are the corresponding
     /// evaluations (one for every committed polynomial).
     points: BTreeMap<Scalar, Vec<Scalar>>,
-    /// Merkle proofs of the opened points, relative to the raw Merkle trees (not the FRI folds).
-    /// The outer array has one entry for every FRI query (`openings.len() == queries.len()`), and
+    /// Merkle proofs of the opened points, relative to the raw Merkle trees (not the STIR folds).
+    /// The outer array has one entry for every STIR query (`openings.len() == queries.len()`), and
     /// the inner arrays contain one proof for every Merkle tree.
     openings: Vec<Vec<LeafProof<H>>>,
-    /// FRI queries on the DEEP quotients. The number of queries is calculated by `num_queries`
+    /// STIR queries on the DEEP quotients. The number of queries is calculated by `num_queries`
     /// above and is tuned so as to achieve 128-bit security.
     queries: Vec<fri::Query<H>>,
 }
@@ -356,6 +365,7 @@ impl<H: Hash<Scalar>> Proof<H> {
                 .collect::<Vec<Scalar>>()
                 .as_slice(),
         );
+        let beta = H::hash_two(*BATCH_DST, alpha, Scalar::ZERO);
 
         for ((query, openings), &expected_index) in
             (self.queries.iter().zip(self.openings.iter())).zip(indices.iter())
@@ -389,30 +399,45 @@ impl<H: Hash<Scalar>> Proof<H> {
             let combined = rlc(
                 openings
                     .iter()
-                    .map(|proof| proof.leaf().iter().cloned())
-                    .flatten()
+                    .flat_map(|proof| proof.leaf().iter().cloned())
                     .collect::<Vec<Scalar>>()
                     .as_slice(),
                 alpha,
             );
 
-            let (quotients, _) = query.values();
-            if quotients.len() != self.points.len() {
+            let (quotient_values, _) = query.values();
+            if quotient_values.len() != 1 {
                 return Err(anyhow!(
-                    "the number of evaluation claims doesn't match the number of FRI quotients (got {}, want {})",
-                    self.points.len(),
-                    quotients.len()
+                    "expected 1 batched quotient value, got {}",
+                    quotient_values.len()
                 ));
             }
+            let q_combined = quotient_values[0];
 
             let x = query.x();
-            for ((&z, values), &quotient) in self.points.iter().zip(quotients.iter()) {
+            let denominators: Vec<Scalar> = self.points.keys().map(|&z| x - z).collect();
+            let full_product = denominators
+                .iter()
+                .copied()
+                .fold(Scalar::ONE, |acc, d| acc * d);
+            let mut rhs = Scalar::ZERO;
+            let mut pow = Scalar::ONE;
+            for (j, (&_z, values)) in self.points.iter().enumerate() {
                 let v = rlc(values.as_slice(), alpha);
-                let numerator = combined - v;
-                let denominator = x - z;
-                if quotient * denominator != numerator {
-                    return Err(anyhow!("algebraic check failed at query index {index}"));
-                }
+                let cofactor = {
+                    let mut c = Scalar::ONE;
+                    for (k, &d) in denominators.iter().enumerate() {
+                        if k != j {
+                            c *= d;
+                        }
+                    }
+                    c
+                };
+                rhs += pow * (combined - v) * cofactor;
+                pow *= beta;
+            }
+            if q_combined * full_product != rhs {
+                return Err(anyhow!("algebraic check failed at query index {index}"));
             }
         }
 
@@ -420,7 +445,7 @@ impl<H: Hash<Scalar>> Proof<H> {
     }
 }
 
-/// A DEEP-FRI prover.
+/// A DEEP-STIR prover.
 ///
 /// `Prover`s are constructed by `Committer::commit()`; see that method for details.
 #[derive(Debug, Clone)]
@@ -436,8 +461,8 @@ pub struct Prover<H: Hash<Scalar>> {
     /// The keys of the map are the (off-domain) X-coordinates of the points, while values are lists
     /// of polynomial evaluations at that point (one for every committed polynomial).
     points: BTreeMap<Scalar, Vec<Scalar>>,
-    /// The underlying FRI prover for the DEEP quotients. There's one quotient for every opened
-    /// point, and all quotients are batched into the same FRI folding argument.
+    /// The underlying STIR prover for the DEEP quotients. There's one quotient for every opened
+    /// point, and all quotients are batched into the same STIR folding argument.
     inner_prover: fri::Prover<H>,
 }
 
@@ -480,7 +505,7 @@ impl<H: Hash<Scalar>> Prover<H> {
         &self.points
     }
 
-    /// Makes a DEEP-FRI proof opening the committed polynomials at the points specified at
+    /// Makes a DEEP-STIR proof opening the committed polynomials at the points specified at
     /// commitment time (see `Committer::commit()`).
     pub fn prove(&self, commitment: &Commitment) -> Proof<H> {
         let indices = commitment.get_query_indices::<H>(
@@ -516,6 +541,10 @@ mod tests {
 
     type Sha2Hash = hash::Sha2Hash<Scalar>;
     type Poseidon2Hash = hash::Poseidon2Hash<Scalar>;
+
+    const fn from_const(value: u64) -> Scalar {
+        Scalar::from_const(value)
+    }
 
     fn test_prover_impl<H: Hash<Scalar>>(
         polynomials: Vec<Polynomial>,
@@ -561,7 +590,7 @@ mod tests {
     #[test]
     fn test_one_constant_polynomial_one_point_1() {
         test_prover(
-            vec![Polynomial::with_coefficients(vec![Scalar::from_const(12)])],
+            vec![Polynomial::with_coefficients(vec![from_const(12)])],
             &[123],
             1,
         );
@@ -570,7 +599,7 @@ mod tests {
     #[test]
     fn test_one_constant_polynomial_one_point_2() {
         test_prover(
-            vec![Polynomial::with_coefficients(vec![Scalar::from_const(12)])],
+            vec![Polynomial::with_coefficients(vec![from_const(12)])],
             &[321],
             1,
         );
@@ -579,7 +608,7 @@ mod tests {
     #[test]
     fn test_one_constant_polynomial_one_point_3() {
         test_prover(
-            vec![Polynomial::with_coefficients(vec![Scalar::from_const(34)])],
+            vec![Polynomial::with_coefficients(vec![from_const(34)])],
             &[123],
             1,
         );
@@ -588,7 +617,7 @@ mod tests {
     #[test]
     fn test_one_constant_polynomial_two_points() {
         test_prover(
-            vec![Polynomial::with_coefficients(vec![Scalar::from_const(12)])],
+            vec![Polynomial::with_coefficients(vec![from_const(12)])],
             &[123, 456],
             1,
         );
@@ -597,7 +626,7 @@ mod tests {
     #[test]
     fn test_one_constant_polynomial_three_points() {
         test_prover(
-            vec![Polynomial::with_coefficients(vec![Scalar::from_const(12)])],
+            vec![Polynomial::with_coefficients(vec![from_const(12)])],
             &[789, 456, 123],
             1,
         );
@@ -607,8 +636,8 @@ mod tests {
     fn test_one_polynomial_degree_one_one_point_1() {
         test_prover(
             vec![Polynomial::with_coefficients(vec![
-                Scalar::from_const(12),
-                Scalar::from_const(34),
+                from_const(12),
+                from_const(34),
             ])],
             &[123],
             2,
@@ -619,8 +648,8 @@ mod tests {
     fn test_one_polynomial_degree_one_one_point_2() {
         test_prover(
             vec![Polynomial::with_coefficients(vec![
-                Scalar::from_const(12),
-                Scalar::from_const(34),
+                from_const(12),
+                from_const(34),
             ])],
             &[321],
             2,
@@ -631,8 +660,8 @@ mod tests {
     fn test_one_polynomial_degree_one_one_point_3() {
         test_prover(
             vec![Polynomial::with_coefficients(vec![
-                Scalar::from_const(34),
-                Scalar::from_const(56),
+                from_const(34),
+                from_const(56),
             ])],
             &[123],
             2,
@@ -643,8 +672,8 @@ mod tests {
     fn test_one_polynomial_degree_one_two_points() {
         test_prover(
             vec![Polynomial::with_coefficients(vec![
-                Scalar::from_const(12),
-                Scalar::from_const(34),
+                from_const(12),
+                from_const(34),
             ])],
             &[123, 456],
             2,
@@ -655,8 +684,8 @@ mod tests {
     fn test_one_polynomial_degree_one_three_points() {
         test_prover(
             vec![Polynomial::with_coefficients(vec![
-                Scalar::from_const(12),
-                Scalar::from_const(34),
+                from_const(12),
+                from_const(34),
             ])],
             &[789, 456, 123],
             2,
@@ -668,16 +697,16 @@ mod tests {
         test_prover(
             vec![
                 Polynomial::with_coefficients(vec![
-                    Scalar::from_const(12),
-                    Scalar::from_const(34),
-                    Scalar::from_const(56),
-                    Scalar::from_const(78),
+                    from_const(12),
+                    from_const(34),
+                    from_const(56),
+                    from_const(78),
                 ]),
                 Polynomial::with_coefficients(vec![
-                    Scalar::from_const(42),
-                    Scalar::from_const(43),
-                    Scalar::from_const(44),
-                    Scalar::from_const(45),
+                    from_const(42),
+                    from_const(43),
+                    from_const(44),
+                    from_const(45),
                 ]),
             ],
             &[123],
@@ -690,16 +719,16 @@ mod tests {
         test_prover(
             vec![
                 Polynomial::with_coefficients(vec![
-                    Scalar::from_const(12),
-                    Scalar::from_const(34),
-                    Scalar::from_const(56),
-                    Scalar::from_const(78),
+                    from_const(12),
+                    from_const(34),
+                    from_const(56),
+                    from_const(78),
                 ]),
                 Polynomial::with_coefficients(vec![
-                    Scalar::from_const(42),
-                    Scalar::from_const(43),
-                    Scalar::from_const(44),
-                    Scalar::from_const(45),
+                    from_const(42),
+                    from_const(43),
+                    from_const(44),
+                    from_const(45),
                 ]),
             ],
             &[321],
@@ -712,16 +741,16 @@ mod tests {
         test_prover(
             vec![
                 Polynomial::with_coefficients(vec![
-                    Scalar::from_const(45),
-                    Scalar::from_const(44),
-                    Scalar::from_const(43),
-                    Scalar::from_const(42),
+                    from_const(45),
+                    from_const(44),
+                    from_const(43),
+                    from_const(42),
                 ]),
                 Polynomial::with_coefficients(vec![
-                    Scalar::from_const(78),
-                    Scalar::from_const(56),
-                    Scalar::from_const(34),
-                    Scalar::from_const(12),
+                    from_const(78),
+                    from_const(56),
+                    from_const(34),
+                    from_const(12),
                 ]),
             ],
             &[123],
@@ -734,16 +763,16 @@ mod tests {
         test_prover(
             vec![
                 Polynomial::with_coefficients(vec![
-                    Scalar::from_const(12),
-                    Scalar::from_const(34),
-                    Scalar::from_const(56),
-                    Scalar::from_const(78),
+                    from_const(12),
+                    from_const(34),
+                    from_const(56),
+                    from_const(78),
                 ]),
                 Polynomial::with_coefficients(vec![
-                    Scalar::from_const(42),
-                    Scalar::from_const(43),
-                    Scalar::from_const(44),
-                    Scalar::from_const(45),
+                    from_const(42),
+                    from_const(43),
+                    from_const(44),
+                    from_const(45),
                 ]),
             ],
             &[123, 456],
@@ -756,16 +785,16 @@ mod tests {
         test_prover(
             vec![
                 Polynomial::with_coefficients(vec![
-                    Scalar::from_const(12),
-                    Scalar::from_const(34),
-                    Scalar::from_const(56),
-                    Scalar::from_const(78),
+                    from_const(12),
+                    from_const(34),
+                    from_const(56),
+                    from_const(78),
                 ]),
                 Polynomial::with_coefficients(vec![
-                    Scalar::from_const(42),
-                    Scalar::from_const(43),
-                    Scalar::from_const(44),
-                    Scalar::from_const(45),
+                    from_const(42),
+                    from_const(43),
+                    from_const(44),
+                    from_const(45),
                 ]),
             ],
             &[789, 456, 123],
