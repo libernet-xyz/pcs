@@ -286,31 +286,39 @@ impl<H: Hash<Scalar>> Query<H> {
         }
 
         let k = self.n.trailing_zeros() as usize;
-        let mut m = self.n;
+        let mut n = self.n;
         let mut i = self.index;
         let mut step = Scalar::ROOT_OF_UNITY_INV.pow_u64(1u64 << (Scalar::S - k));
         let mut pos = self.folds[0].0.leaf();
 
-        for r in 0..=num_rounds {
-            let (left, right) = &self.folds[r];
-            let root = commitment.roots()[r];
+        let (mut left, mut right) = (&self.folds[0].0, &self.folds[0].1);
+        let mut root = commitment.roots()[0];
+
+        if left.leaf() != pos {
+            return Err(anyhow!("fold chain broken at round 0"));
+        }
+        left.verify(i, root)?;
+        right.verify((i + n / 2) % n, root)?;
+
+        for r in 0..num_rounds {
+            let alpha = H::hash_two(*FOLD_DST, root, commitment.ood_values()[r]);
+            let v0 = left.leaf();
+            let v1 = right.leaf();
+            let omega_inv_i = step.pow_small(i);
+            n /= 2;
+            i %= n;
+            step = step.square();
+            pos = (v0 + v1 + alpha * omega_inv_i * (v0 - v1)) * Scalar::TWO_INV;
+
+            left = &self.folds[r + 1].0;
+            right = &self.folds[r + 1].1;
+            root = commitment.roots()[r + 1];
 
             if left.leaf() != pos {
                 return Err(anyhow!("fold chain broken at round {}", r));
             }
             left.verify(i, root)?;
-            right.verify((i + m / 2) % m, root)?;
-
-            if r < num_rounds {
-                let alpha = H::hash_two(*FOLD_DST, root, commitment.ood_values()[r]);
-                let v0 = left.leaf();
-                let v1 = right.leaf();
-                let omega_inv_i = step.pow_small(i);
-                m /= 2;
-                i %= m;
-                step = step.square();
-                pos = (v0 + v1 + alpha * omega_inv_i * (v0 - v1)) * Scalar::TWO_INV;
-            }
+            right.verify((i + n / 2) % n, root)?;
         }
 
         let (left, right) = self.folds.last().unwrap();
@@ -353,20 +361,22 @@ impl<H: Hash<Scalar>> Prover<H> {
         let mut trees: Vec<Tree<H>> = Vec::with_capacity(num_rounds + 1);
         let mut ood_values: Vec<Scalar> = Vec::with_capacity(num_rounds);
 
-        for round in 0..=num_rounds {
-            let tree = Tree::<H>::new(polynomial.clone().lde2(n));
-            let root = tree.root_hash();
+        let mut tree = Tree::<H>::new(polynomial.clone().lde2(n));
+        let mut root = tree.root_hash();
+        trees.push(tree);
+
+        for _ in 0..num_rounds {
+            let ood_point = H::hash_two(*OOD_DST, root, Scalar::ZERO);
+            let ood_value = polynomial.evaluate(ood_point);
+            ood_values.push(ood_value);
+
+            let alpha = H::hash_two(*FOLD_DST, root, ood_value);
+            polynomial = polynomial.fold2(alpha);
+            n >>= 1;
+
+            tree = Tree::<H>::new(polynomial.clone().lde2(n));
+            root = tree.root_hash();
             trees.push(tree);
-
-            if round < num_rounds {
-                let ood_point = H::hash_two(*OOD_DST, root, Scalar::ZERO);
-                let ood_value = polynomial.evaluate(ood_point);
-                ood_values.push(ood_value);
-
-                let alpha = H::hash_two(*FOLD_DST, root, ood_value);
-                polynomial = polynomial.fold2(alpha);
-                n >>= 1;
-            }
         }
 
         Self {
@@ -533,6 +543,4 @@ mod tests {
         ]);
         test_blowups::<Poseidon2Hash>(p, 4);
     }
-
-    // TODO
 }
