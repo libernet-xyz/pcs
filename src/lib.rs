@@ -8,6 +8,7 @@ mod utils;
 
 pub mod fri;
 pub mod hash;
+pub mod stir;
 pub mod whir;
 
 pub use deep::*;

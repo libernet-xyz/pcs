@@ -25,7 +25,7 @@ static RLC_DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"star
 /// Domain separator tag for the Fiat-Shamir challenge used to batch DEEP quotients into one.
 static BATCH_DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"starkom/pcs/batch"));
 
-/// Returns the number of STIR queries required to achieve 128-bit security using a blowup factor of
+/// Returns the number of FRI queries required to achieve 128-bit security using a blowup factor of
 /// `2^blowup_log2` when opening `num_points` evaluation points.
 fn num_queries(blowup_log2: usize, num_points: usize) -> usize {
     let extra = num_points.next_power_of_two().trailing_zeros() as usize;
@@ -45,13 +45,13 @@ fn rlc(values: &[Scalar], alpha: Scalar) -> Scalar {
     rlc
 }
 
-/// A batched DEEP-STIR polynomial commitment (see `Committer` for details).
+/// A batched DEEP-FRI polynomial commitment (see `Committer` for details).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Commitment {
     /// The root hashes of the Merkle trees where the evaluations of all batched polynomials are
     /// stored. There is one root hash per polynomial batch.
     tree_roots: Vec<Scalar>,
-    /// The underlying STIR commitment.
+    /// The underlying FRI commitment.
     inner: fri::Commitment,
 }
 
@@ -61,8 +61,8 @@ impl Commitment {
         self.tree_roots.as_slice()
     }
 
-    /// Returns the STIR query indices derived via Fiat-Shamir from the full commitment transcript
-    /// (all polynomial and STIR Merkle root hashes).
+    /// Returns the FRI query indices derived via Fiat-Shamir from the full commitment transcript
+    /// (all polynomial and FRI Merkle root hashes).
     fn get_query_indices<H: Hash<Scalar>>(
         &self,
         degree_bound: usize,
@@ -90,13 +90,13 @@ impl Commitment {
     }
 }
 
-/// Collects batches of polynomials and allows building a DEEP-STIR prover for them.
+/// Collects batches of polynomials and allows building a DEEP-FRI prover for them.
 ///
 /// This works by building Merkle trees on the batched polynomials, one tree per batch, and
 /// eventually handing everything over to a newly constructed `Prover` (see the `commit` method).
 ///
 /// This two-stage Committer-Prover architecture allows getting Merkle roots for the proven
-/// polynomials before running the STIR folding argument and even before batching all polynomials,
+/// polynomials before running the FRI folding argument and even before batching all polynomials,
 /// so that Fiat-Shamir challenges can be derived before any quotients are built.
 #[derive(Debug, Clone)]
 pub struct Committer<H: Hash<Scalar>> {
@@ -117,7 +117,7 @@ impl<H: Hash<Scalar>> Committer<H> {
     /// Constructs a `Committer` with the given degree bound, blowup factor, and first batch of
     /// polynomials.
     ///
-    /// We require specifying the first batch because our DEEP-STIR protocol requires at least one
+    /// We require specifying the first batch because our DEEP-FRI protocol requires at least one
     /// committed polynomial to work.
     pub fn new(degree_bound: usize, blowup_log2: usize, polynomials: Vec<Polynomial>) -> Self {
         let mut committer = Self {
@@ -202,7 +202,7 @@ impl<H: Hash<Scalar>> Committer<H> {
     }
 
     /// Consumes the `Committer`, calculates all DEEP quotients, and returns a polynomial
-    /// `Commitment` and a DEEP-STIR `Prover`.
+    /// `Commitment` and a DEEP-FRI `Prover`.
     ///
     /// `points` is the set of points to open in the `Prover`. The contained scalars are
     /// (off-domain) X-coordinates; the corresponding Y-coordinates will be computed automatically
@@ -283,7 +283,7 @@ impl<H: Hash<Scalar>> Committer<H> {
     }
 }
 
-/// A DEEP-STIR proof.
+/// A DEEP-FRI proof.
 #[derive(Debug, Clone)]
 pub struct Proof<H: Hash<Scalar>> {
     /// The proven degree bound. If the proof is valid the degree of all batched polynomials is
@@ -296,11 +296,11 @@ pub struct Proof<H: Hash<Scalar>> {
     /// The opened points. Keys are (off-domain) X-coordinates, values are the corresponding
     /// evaluations (one for every committed polynomial).
     points: BTreeMap<Scalar, Vec<Scalar>>,
-    /// Merkle proofs of the opened points, relative to the raw Merkle trees (not the STIR folds).
-    /// The outer array has one entry for every STIR query (`openings.len() == queries.len()`), and
+    /// Merkle proofs of the opened points, relative to the raw Merkle trees (not the FRI folds).
+    /// The outer array has one entry for every FRI query (`openings.len() == queries.len()`), and
     /// the inner arrays contain one proof for every Merkle tree.
     openings: Vec<Vec<LeafProof<H>>>,
-    /// STIR queries on the DEEP quotients. The number of queries is calculated by `num_queries`
+    /// FRI queries on the DEEP quotients. The number of queries is calculated by `num_queries`
     /// above and is tuned so as to achieve 128-bit security.
     queries: Vec<fri::Query<H>>,
 }
@@ -445,7 +445,7 @@ impl<H: Hash<Scalar>> Proof<H> {
     }
 }
 
-/// A DEEP-STIR prover.
+/// A DEEP-FRI prover.
 ///
 /// `Prover`s are constructed by `Committer::commit()`; see that method for details.
 #[derive(Debug, Clone)]
@@ -461,8 +461,8 @@ pub struct Prover<H: Hash<Scalar>> {
     /// The keys of the map are the (off-domain) X-coordinates of the points, while values are lists
     /// of polynomial evaluations at that point (one for every committed polynomial).
     points: BTreeMap<Scalar, Vec<Scalar>>,
-    /// The underlying STIR prover for the DEEP quotients. There's one quotient for every opened
-    /// point, and all quotients are batched into the same STIR folding argument.
+    /// The underlying FRI prover for the DEEP quotients. There's one quotient for every opened
+    /// point, and all quotients are batched into the same FRI folding argument.
     inner_prover: fri::Prover<H>,
 }
 
@@ -505,7 +505,7 @@ impl<H: Hash<Scalar>> Prover<H> {
         &self.points
     }
 
-    /// Makes a DEEP-STIR proof opening the committed polynomials at the points specified at
+    /// Makes a DEEP-FRI proof opening the committed polynomials at the points specified at
     /// commitment time (see `Committer::commit()`).
     pub fn prove(&self, commitment: &Commitment) -> Proof<H> {
         let indices = commitment.get_query_indices::<H>(
