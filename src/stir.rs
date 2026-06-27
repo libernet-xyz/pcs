@@ -18,12 +18,6 @@ static FOLD_DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"sta
 /// Domain separator tag used when deriving the per-round out-of-domain (OOD) challenge point.
 static OOD_DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"starkom/stir/ood"));
 
-/// The modular inverse of the multiplicative generator, used to correct the coset shift in the STIR
-/// fold formula: the standard formula divides by `x = g * omega^i`, so the fold coefficient is
-/// `alpha * g^{-1} * omega^{-i}`.
-static GENERATOR_INV: LazyLock<Scalar> =
-    LazyLock::new(|| Scalar::MULTIPLICATIVE_GENERATOR.invert().unwrap());
-
 /// Computes all Merkle hashes of a vector of values up to the root.
 ///
 /// `n` is the number of values and must be a power of two.
@@ -308,8 +302,7 @@ impl<H: Hash<Scalar>> Query<H> {
             right.verify((i + m / 2) % m, root)?;
 
             if r < num_rounds {
-                let alpha =
-                    H::hash_two(*FOLD_DST, root, commitment.ood_values()[r]) * *GENERATOR_INV;
+                let alpha = H::hash_two(*FOLD_DST, root, commitment.ood_values()[r]);
                 let v0 = left.leaf();
                 let v1 = right.leaf();
                 let omega_inv_i = step.pow_small(i);
@@ -354,12 +347,14 @@ impl<H: Hash<Scalar>> Prover<H> {
         let mut n = degree_bound << blowup_log2;
         assert!(n as u64 <= 1u64 << Scalar::S);
 
+        polynomial = polynomial.shift_domain();
+
         let num_rounds = degree_bound.trailing_zeros() as usize;
         let mut trees: Vec<Tree<H>> = Vec::with_capacity(num_rounds + 1);
         let mut ood_values: Vec<Scalar> = Vec::with_capacity(num_rounds);
 
         for round in 0..=num_rounds {
-            let tree = Tree::<H>::new(polynomial.clone().shifted_lde2(n));
+            let tree = Tree::<H>::new(polynomial.clone().lde2(n));
             let root = tree.root_hash();
             trees.push(tree);
 

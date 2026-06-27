@@ -179,7 +179,7 @@ impl<H: Hash<Scalar>> Committer<H> {
         let leaves = {
             let evaluations = polynomials
                 .iter()
-                .map(|polynomial| polynomial.clone().shifted_lde2(n))
+                .map(|polynomial| polynomial.clone().shift_domain().lde2(n))
                 .collect::<Vec<Vec<Scalar>>>();
             let mut leaves: Vec<Vec<Scalar>> = vec![vec![Scalar::ZERO; k]; n];
             for i in 0..n {
