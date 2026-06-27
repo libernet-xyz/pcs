@@ -532,8 +532,6 @@ impl<H: Hash<Scalar>> Prover<H> {
     }
 }
 
-// TODO
-
 #[cfg(test)]
 mod tests {
     use super::*;
