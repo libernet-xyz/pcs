@@ -454,9 +454,155 @@ impl<H: Hash<Scalar>> Prover<H> {
 mod tests {
     use super::*;
     use crate::hash;
+    use crate::utils::testing::parse_scalar;
 
     type Poseidon2Hash = hash::Poseidon2Hash<Scalar>;
     type Sha2Hash = hash::Sha2Hash<Scalar>;
+
+    #[inline(always)]
+    const fn from_const(value: u64) -> Scalar {
+        Scalar::from_const(value)
+    }
+
+    #[test]
+    fn test_merklify_one_sha2() {
+        let mut values = vec![from_const(12)];
+        merklify::<Sha2Hash>(&mut values, 1);
+        assert_eq!(values, vec![from_const(12)]);
+    }
+
+    #[test]
+    fn test_merklify_one_poseidon2() {
+        let mut values = vec![from_const(12)];
+        merklify::<Poseidon2Hash>(&mut values, 1);
+        assert_eq!(values, vec![from_const(12)]);
+    }
+
+    #[test]
+    fn test_merklify_two_sha2() {
+        let mut values = vec![from_const(34), from_const(56)];
+        values.resize(3, Scalar::ZERO);
+        merklify::<Sha2Hash>(&mut values, 2);
+        assert_eq!(
+            values,
+            vec![
+                from_const(34),
+                from_const(56),
+                parse_scalar("0x2128ee5f5c3dae387b2a8c0eb5f973b55f2006bde0e7c42451c34098dc8f5bdb"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_merklify_two_poseidon2() {
+        let mut values = vec![from_const(34), from_const(56)];
+        values.resize(3, Scalar::ZERO);
+        merklify::<Poseidon2Hash>(&mut values, 2);
+        assert_eq!(
+            values,
+            vec![
+                from_const(34),
+                from_const(56),
+                parse_scalar("0x3c839a90bbe84c87658a911f111a53fbf987b689293e3c6d5cb1d3ea18a46766"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_merklify_four_sha2() {
+        let mut values = vec![
+            from_const(78),
+            from_const(90),
+            from_const(12),
+            from_const(34),
+        ];
+        values.resize(7, Scalar::ZERO);
+        merklify::<Sha2Hash>(&mut values, 4);
+        assert_eq!(
+            values,
+            vec![
+                from_const(78),
+                from_const(90),
+                from_const(12),
+                from_const(34),
+                parse_scalar("0x5d581e47871ecf9f36a20adc7e18b94ce567538ca356bf154de35afbb06890e6"),
+                parse_scalar("0x0bc5f8cb935dd42ae01ae4dbabeecf5c214d68dcba5dc373ca3febf7bc990871"),
+                parse_scalar("0x5e10c0a412f87035505eddb7cec64ba054c702700d582a635fbaca6a82fb3d69"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_merklify_four_poseidon2() {
+        let mut values = vec![
+            from_const(78),
+            from_const(90),
+            from_const(12),
+            from_const(34),
+        ];
+        values.resize(7, Scalar::ZERO);
+        merklify::<Poseidon2Hash>(&mut values, 4);
+        assert_eq!(
+            values,
+            vec![
+                from_const(78),
+                from_const(90),
+                from_const(12),
+                from_const(34),
+                parse_scalar("0x77c3bc8611e4dd4d151899dc4de22efa00cdf84684f6c4d1fb02e065acb8cc9b"),
+                parse_scalar("0x67f4f96eb09ada85ce578080b5c31dbe70e0eaebd10132744308201d6d8560d9"),
+                parse_scalar("0x73b8138a99bc95064bb3bdeb86e119cf0194db35d6e60f0436f1e0404822b1fc"),
+            ]
+        );
+    }
+
+    fn test_merkle_tree<H: Hash<Scalar>>(leaves: Vec<Scalar>, expected_root_hash: Scalar) {
+        let n = leaves.len();
+        let tree = Tree::<H>::new(leaves.clone());
+        assert_eq!(tree.num_leaves(), n);
+        assert_eq!(tree.root_hash(), expected_root_hash);
+        for i in 0..n {
+            let proof = tree.query(i);
+            assert!(proof.verify(i, expected_root_hash).is_ok());
+            assert_eq!(proof.leaf(), leaves[i]);
+        }
+    }
+
+    #[test]
+    fn test_merkle_tree_one_leaf_1() {
+        test_merkle_tree::<Sha2Hash>(vec![from_const(12)], from_const(12));
+        test_merkle_tree::<Poseidon2Hash>(vec![from_const(12)], from_const(12));
+    }
+
+    #[test]
+    fn test_merkle_tree_one_leaf_2() {
+        test_merkle_tree::<Sha2Hash>(vec![from_const(34)], from_const(34));
+        test_merkle_tree::<Poseidon2Hash>(vec![from_const(34)], from_const(34));
+    }
+
+    #[test]
+    fn test_merkle_tree_two_leaves_1() {
+        test_merkle_tree::<Sha2Hash>(
+            vec![from_const(12), from_const(34)],
+            parse_scalar("0x0bc5f8cb935dd42ae01ae4dbabeecf5c214d68dcba5dc373ca3febf7bc990871"),
+        );
+        test_merkle_tree::<Poseidon2Hash>(
+            vec![from_const(12), from_const(34)],
+            parse_scalar("0x67f4f96eb09ada85ce578080b5c31dbe70e0eaebd10132744308201d6d8560d9"),
+        );
+    }
+
+    #[test]
+    fn test_merkle_tree_two_leaves_2() {
+        test_merkle_tree::<Sha2Hash>(
+            vec![from_const(34), from_const(56)],
+            parse_scalar("0x2128ee5f5c3dae387b2a8c0eb5f973b55f2006bde0e7c42451c34098dc8f5bdb"),
+        );
+        test_merkle_tree::<Poseidon2Hash>(
+            vec![from_const(34), from_const(56)],
+            parse_scalar("0x3c839a90bbe84c87658a911f111a53fbf987b689293e3c6d5cb1d3ea18a46766"),
+        );
+    }
 
     fn test_prover<H: Hash<Scalar>>(
         polynomial: Polynomial,
@@ -480,55 +626,47 @@ mod tests {
 
     #[test]
     fn test_constant_polynomial_sha2() {
-        let p = Polynomial::with_coefficients(vec![Scalar::from_const(42)]);
+        let p = Polynomial::with_coefficients(vec![from_const(42)]);
         test_blowups::<Sha2Hash>(p, 1);
     }
 
     #[test]
     fn test_constant_polynomial_poseidon2() {
-        let p = Polynomial::with_coefficients(vec![Scalar::from_const(42)]);
+        let p = Polynomial::with_coefficients(vec![from_const(42)]);
         test_blowups::<Poseidon2Hash>(p, 1);
     }
 
     #[test]
     fn test_degree_one_polynomial_sha2() {
-        let p = Polynomial::with_coefficients(vec![Scalar::from_const(12), Scalar::from_const(34)]);
+        let p = Polynomial::with_coefficients(vec![from_const(12), from_const(34)]);
         test_blowups::<Sha2Hash>(p, 2);
     }
 
     #[test]
     fn test_degree_one_polynomial_poseidon2() {
-        let p = Polynomial::with_coefficients(vec![Scalar::from_const(12), Scalar::from_const(34)]);
+        let p = Polynomial::with_coefficients(vec![from_const(12), from_const(34)]);
         test_blowups::<Poseidon2Hash>(p, 2);
     }
 
     #[test]
     fn test_degree_two_polynomial_sha2() {
-        let p = Polynomial::with_coefficients(vec![
-            Scalar::from_const(12),
-            Scalar::from_const(34),
-            Scalar::from_const(56),
-        ]);
+        let p = Polynomial::with_coefficients(vec![from_const(12), from_const(34), from_const(56)]);
         test_blowups::<Sha2Hash>(p, 4);
     }
 
     #[test]
     fn test_degree_two_polynomial_poseidon2() {
-        let p = Polynomial::with_coefficients(vec![
-            Scalar::from_const(12),
-            Scalar::from_const(34),
-            Scalar::from_const(56),
-        ]);
+        let p = Polynomial::with_coefficients(vec![from_const(12), from_const(34), from_const(56)]);
         test_blowups::<Poseidon2Hash>(p, 4);
     }
 
     #[test]
     fn test_degree_three_polynomial_sha2() {
         let p = Polynomial::with_coefficients(vec![
-            Scalar::from_const(12),
-            Scalar::from_const(34),
-            Scalar::from_const(56),
-            Scalar::from_const(78),
+            from_const(12),
+            from_const(34),
+            from_const(56),
+            from_const(78),
         ]);
         test_blowups::<Sha2Hash>(p, 4);
     }
@@ -536,10 +674,10 @@ mod tests {
     #[test]
     fn test_degree_three_polynomial_poseidon2() {
         let p = Polynomial::with_coefficients(vec![
-            Scalar::from_const(12),
-            Scalar::from_const(34),
-            Scalar::from_const(56),
-            Scalar::from_const(78),
+            from_const(12),
+            from_const(34),
+            from_const(56),
+            from_const(78),
         ]);
         test_blowups::<Poseidon2Hash>(p, 4);
     }
