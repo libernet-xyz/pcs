@@ -93,8 +93,8 @@ impl Commitment {
 /// eventually handing everything over to a newly constructed `Prover` (see the `commit` method).
 ///
 /// This two-stage Committer-Prover architecture allows getting Merkle roots for the proven
-/// polynomials before running the FRI folding argument and even before batching all polynomials,
-/// so that Fiat-Shamir challenges can be derived before any quotients are built.
+/// polynomials before running the FRI folding argument and even before batching all polynomials, so
+/// that Fiat-Shamir challenges can be derived before any quotients are built.
 #[derive(Debug, Clone)]
 pub struct Committer<H: Hash<Scalar>> {
     /// The proven degree bound. The degree of all batched polynomials must be strictly less than
@@ -249,9 +249,9 @@ impl<H: Hash<Scalar>> Committer<H> {
 
         let quotients = points
             .iter()
-            .map(|(z, values)| {
+            .map(|(&z, values)| {
                 let value = rlc(values.as_slice(), alpha);
-                let (quotient, remainder) = (combined.clone() - value).horner(*z);
+                let (quotient, remainder) = (combined.clone() - value).horner(z);
                 assert_eq!(remainder, Scalar::ZERO);
                 quotient
             })
