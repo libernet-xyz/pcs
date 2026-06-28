@@ -37,6 +37,29 @@ pub(crate) fn merklify<H: Hash<Scalar>>(mut values: &mut [Scalar], mut n: usize)
     }
 }
 
+/// Computes the Merkle root for the given `values`.
+///
+/// This is exactly the same as calling `merklify(values, n)[(n - 1) * 2]` with `n = values.len()`.
+/// In other words, it yields the same Merkle root as [`merklify`]. However, if you only need the
+/// root, `merkle_root` is more efficient because it doesn't need any extra space allocation.
+///
+/// REQUIRES: `values.len()` must be a power of two.
+pub(crate) fn merkle_root<H: Hash<Scalar>>(values: &[Scalar]) -> Scalar {
+    let n = values.len();
+    match n {
+        0 => panic!(),
+        1 => values[0],
+        _ => {
+            let m = n >> 1;
+            H::hash_two(
+                *TREE_DST,
+                merkle_root::<H>(&values[0..m]),
+                merkle_root::<H>(&values[m..]),
+            )
+        }
+    }
+}
+
 /// A Merkle proof.
 ///
 /// This object only stores the opened value and the sister hashes of the Merkle path, it doesn't
@@ -275,6 +298,49 @@ mod tests {
                 parse_scalar("0x2688824af31127719d22129eaffc023e4f6f95284266c13afafdf83a318ceecb"),
                 parse_scalar("0x467c24411c9026c050fb87ba35d9e97b75fb3a29781d47e7694c8b2243bd4a64"),
             ]
+        );
+    }
+
+    #[test]
+    fn test_merkle_root_one() {
+        assert_eq!(merkle_root::<Sha2Hash>(&[from_const(12)]), from_const(12));
+        assert_eq!(
+            merkle_root::<Poseidon2Hash>(&[from_const(12)]),
+            from_const(12)
+        );
+    }
+
+    #[test]
+    fn test_merkle_root_two() {
+        assert_eq!(
+            merkle_root::<Sha2Hash>(&[from_const(34), from_const(56)]),
+            parse_scalar("0x73c58b1874a3ee3fe9f84fd5a718723e0c99c0603cf2bb1ddab0d304f618ede4"),
+        );
+        assert_eq!(
+            merkle_root::<Poseidon2Hash>(&[from_const(34), from_const(56)]),
+            parse_scalar("0x4ba7811146d5c70c6f632561cc0513e0862c663829058a1c4949be700061a52a"),
+        );
+    }
+
+    #[test]
+    fn test_merkle_root_four() {
+        assert_eq!(
+            merkle_root::<Sha2Hash>(&[
+                from_const(78),
+                from_const(90),
+                from_const(12),
+                from_const(34),
+            ]),
+            parse_scalar("0x05ae4aaf2f9524414e56c1fc4435f1d8eeed092ba309564f9974f365fe55c3e5"),
+        );
+        assert_eq!(
+            merkle_root::<Poseidon2Hash>(&[
+                from_const(78),
+                from_const(90),
+                from_const(12),
+                from_const(34),
+            ]),
+            parse_scalar("0x467c24411c9026c050fb87ba35d9e97b75fb3a29781d47e7694c8b2243bd4a64"),
         );
     }
 
