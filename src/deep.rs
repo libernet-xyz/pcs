@@ -42,7 +42,7 @@ fn rlc(values: &[Scalar], alpha: Scalar) -> Scalar {
     rlc
 }
 
-/// A batched DEEP-FRI polynomial commitment (see `Committer` for details).
+/// A batched DEEP-FRI polynomial commitment (see [`Committer`] for details).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Commitment {
     /// The root hashes of the Merkle trees where the evaluations of all batched polynomials are
@@ -90,7 +90,8 @@ impl Commitment {
 /// Collects batches of polynomials and allows building a DEEP-FRI prover for them.
 ///
 /// This works by building Merkle trees on the batched polynomials, one tree per batch, and
-/// eventually handing everything over to a newly constructed `Prover` (see the `commit` method).
+/// eventually handing everything over to a newly constructed [`Prover`] (see the [`Self::commit`]
+/// method).
 ///
 /// This two-stage Committer-Prover architecture allows getting Merkle roots for the proven
 /// polynomials before running the FRI folding argument and even before batching all polynomials, so
@@ -111,7 +112,7 @@ pub struct Committer<H: Hash<Scalar>> {
 }
 
 impl<H: Hash<Scalar>> Committer<H> {
-    /// Constructs a `Committer` with the given degree bound, blowup factor, and first batch of
+    /// Constructs a [`Committer`] with the given degree bound, blowup factor, and first batch of
     /// polynomials.
     ///
     /// We require specifying the first batch because our DEEP-FRI protocol requires at least one
@@ -143,12 +144,13 @@ impl<H: Hash<Scalar>> Committer<H> {
         self.trees.len()
     }
 
-    /// Returns the i-th Merkle tree. `index` must be less than `num_trees()`.
+    /// Returns the i-th Merkle tree. `index` must be less than [`Self::num_trees()`].
     pub fn tree(&self, index: usize) -> &Tree<H> {
         &self.trees[index]
     }
 
-    /// Returns the root hash of the i-th Merkle tree. `index` must be less than `num_trees()`.
+    /// Returns the root hash of the i-th Merkle tree. `index` must be less than
+    /// [`Self::num_trees()`].
     ///
     /// This value can be used to derive Fiat-Shamir challenges.
     pub fn root_hash(&self, index: usize) -> Scalar {
@@ -157,11 +159,11 @@ impl<H: Hash<Scalar>> Committer<H> {
 
     /// Adds a batch of polynomials, returning the index of the newly created batch.
     ///
-    /// The returned index can be used with the `tree` and `root_hash` methods to get the Merkle
-    /// tree and root hash for the batch, respectively.
+    /// The returned index can be used with the [`Self::tree`] and [`Self::root_hash`] methods to
+    /// get the Merkle tree and root hash for the batch, respectively.
     ///
     /// REQUIRES: the degree of all specified polynomials must be strictly less than
-    /// `degree_bound()`.
+    /// [`Self::degree_bound()`].
     pub fn add_batch(&mut self, polynomials: Vec<Polynomial>) -> usize {
         assert!(!polynomials.is_empty());
         let k = polynomials.len();
@@ -198,10 +200,10 @@ impl<H: Hash<Scalar>> Committer<H> {
         index
     }
 
-    /// Consumes the `Committer`, calculates all DEEP quotients, and returns a polynomial
-    /// `Commitment` and a DEEP-FRI `Prover`.
+    /// Consumes the [`Committer`], calculates all DEEP quotients, and returns a polynomial
+    /// [`Commitment`] and a DEEP-FRI [`Prover`].
     ///
-    /// `points` is the set of points to open in the `Prover`. The contained scalars are
+    /// `points` is the set of points to open in the [`Prover`]. The contained scalars are
     /// (off-domain) X-coordinates; the corresponding Y-coordinates will be computed automatically
     /// for every batched polynomial.
     pub fn commit(self, points: BTreeSet<Scalar>) -> (Commitment, Prover<H>) {
@@ -291,7 +293,7 @@ pub struct Proof<H: Hash<Scalar>> {
     /// The outer array has one entry for every FRI query (`openings.len() == queries.len()`), and
     /// the inner arrays contain one proof for every Merkle tree.
     openings: Vec<Vec<LeafProof<H>>>,
-    /// FRI queries on the DEEP quotients. The number of queries is calculated by `num_queries`
+    /// FRI queries on the DEEP quotients. The number of queries is calculated by [`num_queries`]
     /// above and is tuned so as to achieve 128-bit security.
     queries: Vec<fri::Query<H>>,
 }
@@ -421,7 +423,7 @@ impl<H: Hash<Scalar>> Proof<H> {
 
 /// A DEEP-FRI prover.
 ///
-/// `Prover`s are constructed by `Committer::commit()`; see that method for details.
+/// [`Prover`]s are constructed by [`Committer::commit()`]; see that method for details.
 #[derive(Debug, Clone)]
 pub struct Prover<H: Hash<Scalar>> {
     /// The degree bound to prove.
@@ -466,7 +468,8 @@ impl<H: Hash<Scalar>> Prover<H> {
         &self.trees[index]
     }
 
-    /// Returns the root hash of the i-th Merkle tree. `index` must be less than `num_trees()`.
+    /// Returns the root hash of the i-th Merkle tree. `index` must be less than
+    /// [`Self::num_trees()`].
     ///
     /// This value can be used to derive Fiat-Shamir challenges.
     pub fn root_hash(&self, index: usize) -> Scalar {
@@ -480,7 +483,7 @@ impl<H: Hash<Scalar>> Prover<H> {
     }
 
     /// Makes a DEEP-FRI proof opening the committed polynomials at the points specified at
-    /// commitment time (see `Committer::commit()`).
+    /// commitment time (see [`Committer::commit()`]).
     pub fn prove(&self, commitment: &Commitment) -> Proof<H> {
         let indices = commitment.get_query_indices::<H>(
             self.degree_bound,

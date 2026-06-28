@@ -1,10 +1,10 @@
 use crate::hash::Hash;
-use crate::merkle;
-use crate::merkle::merkle_root;
+use crate::merkle::{self, Tree, merkle_root};
 use crate::utils;
 use starkom_bluesky::Scalar;
 use starkom_ff::{Field, PrimeField};
 use starkom_poly;
+use std::collections::BTreeSet;
 use std::marker::PhantomData;
 use std::sync::LazyLock;
 
@@ -61,6 +61,56 @@ impl Commitment {
     /// Returns the Merkle root of the initial (pre-fold) oracle.
     pub fn root(&self) -> Scalar {
         self.roots[0]
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Committer<H: Hash<Scalar>> {
+    /// The degree bound of the committed polynomial (always a power of 2).
+    degree_bound: usize,
+    /// The base-2 logarithm of the blowup factor.
+    blowup_log2: usize,
+    /// All polynomials batched so far.
+    polynomials: Vec<Polynomial>,
+    /// The Merkle trees built so far, one for each polynomial.
+    trees: Vec<Tree<H>>,
+    _data: PhantomData<H>,
+}
+
+impl<H: Hash<Scalar>> Committer<H> {
+    pub fn new(degree_bound: usize, blowup_log2: usize) -> Self {
+        Self {
+            degree_bound,
+            blowup_log2,
+            polynomials: vec![],
+            trees: vec![],
+            _data: PhantomData::default(),
+        }
+    }
+
+    /// Returns the proven degree bound.
+    pub fn degree_bound(&self) -> usize {
+        self.degree_bound
+    }
+
+    /// Returns the size of the extended evaluation domain.
+    pub fn extended_domain_size(&self) -> usize {
+        self.degree_bound << self.blowup_log2
+    }
+
+    pub fn add_polynomial(&mut self, polynomial: Polynomial) {
+        let values = polynomial
+            .clone()
+            .shift_domain()
+            .lde2(self.extended_domain_size());
+        let tree = Tree::<H>::new(values);
+        self.polynomials.push(polynomial);
+        self.trees.push(tree);
+    }
+
+    pub fn commit(self, points: BTreeSet<Scalar>) -> (Commitment, Prover<H>) {
+        // TODO
+        todo!()
     }
 }
 
@@ -126,7 +176,7 @@ pub struct Prover<H: Hash<Scalar>> {
     blowup_log2: usize,
     /// Merkle trees for all committed oracles: trees[0] is the initial oracle f₀, trees[r+1] is
     /// the oracle after the r-th folding round.
-    trees: Vec<merkle::Tree<H>>,
+    trees: Vec<Tree<H>>,
     /// Sumcheck polynomials from the commit phase: one Vec per folding round, each holding the
     /// per-sub-round degree-≤2 coefficient triples [a₀, a₁, a₂].
     sumcheck_polynomials: Vec<Vec<[Scalar; 3]>>,
