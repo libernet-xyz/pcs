@@ -22,9 +22,6 @@ static QUERY_DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"st
 /// Domain separator tag for the Fiat-Shamir challenge used to build the random linear combination.
 static RLC_DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"starkom/pcs/rlc"));
 
-/// Domain separator tag for the Fiat-Shamir challenge used to batch DEEP quotients into one.
-static BATCH_DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"starkom/pcs/batch"));
-
 /// Returns the number of FRI queries required to achieve 128-bit security using a blowup factor of
 /// `2^blowup_log2` when opening `num_points` evaluation points.
 fn num_queries(blowup_log2: usize, num_points: usize) -> usize {
@@ -250,23 +247,17 @@ impl<H: Hash<Scalar>> Committer<H> {
             combined
         };
 
-        let beta = H::hash_two(*BATCH_DST, alpha, Scalar::ZERO);
-
-        let batched_quotient = {
-            let mut batched = Polynomial::default();
-            let mut pow = Scalar::ONE;
-            for (&z, values) in &points {
+        let quotients = points
+            .iter()
+            .map(|(z, values)| {
                 let value = rlc(values.as_slice(), alpha);
-                let (quotient, remainder) = (combined.clone() - value).horner(z);
+                let (quotient, remainder) = (combined.clone() - value).horner(*z);
                 assert_eq!(remainder, Scalar::ZERO);
-                batched += quotient * pow;
-                pow *= beta;
-            }
-            batched
-        };
+                quotient
+            })
+            .collect();
 
-        let inner_prover =
-            fri::Prover::<H>::new(vec![batched_quotient], self.degree_bound, self.blowup_log2);
+        let inner_prover = fri::Prover::<H>::new(quotients, self.degree_bound, self.blowup_log2);
 
         let commitment = Commitment {
             tree_roots: self.trees.iter().map(|tree| tree.root_hash()).collect(),
@@ -365,7 +356,6 @@ impl<H: Hash<Scalar>> Proof<H> {
                 .collect::<Vec<Scalar>>()
                 .as_slice(),
         );
-        let beta = H::hash_two(*BATCH_DST, alpha, Scalar::ZERO);
 
         for ((query, openings), &expected_index) in
             (self.queries.iter().zip(self.openings.iter())).zip(indices.iter())
@@ -405,39 +395,23 @@ impl<H: Hash<Scalar>> Proof<H> {
                 alpha,
             );
 
-            let (quotient_values, _) = query.values();
-            if quotient_values.len() != 1 {
+            let (quotients, _) = query.values();
+            if quotients.len() != self.points.len() {
                 return Err(anyhow!(
-                    "expected 1 batched quotient value, got {}",
-                    quotient_values.len()
+                    "the number of evaluation claims doesn't match the number of FRI quotients (got {}, want {})",
+                    self.points.len(),
+                    quotients.len()
                 ));
             }
-            let q_combined = quotient_values[0];
 
             let x = query.x();
-            let denominators: Vec<Scalar> = self.points.keys().map(|&z| x - z).collect();
-            let full_product = denominators
-                .iter()
-                .copied()
-                .fold(Scalar::ONE, |acc, d| acc * d);
-            let mut rhs = Scalar::ZERO;
-            let mut pow = Scalar::ONE;
-            for (j, (&_z, values)) in self.points.iter().enumerate() {
+            for ((&z, values), &quotient) in self.points.iter().zip(quotients.iter()) {
                 let v = rlc(values.as_slice(), alpha);
-                let cofactor = {
-                    let mut c = Scalar::ONE;
-                    for (k, &d) in denominators.iter().enumerate() {
-                        if k != j {
-                            c *= d;
-                        }
-                    }
-                    c
-                };
-                rhs += pow * (combined - v) * cofactor;
-                pow *= beta;
-            }
-            if q_combined * full_product != rhs {
-                return Err(anyhow!("algebraic check failed at query index {index}"));
+                let numerator = combined - v;
+                let denominator = x - z;
+                if quotient * denominator != numerator {
+                    return Err(anyhow!("algebraic check failed at query index {index}"));
+                }
             }
         }
 

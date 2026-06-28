@@ -153,6 +153,7 @@ impl<H: Hash<Scalar>> Prover<H> {
             .next_power_of_two();
 
         for polynomial in &mut polynomials {
+            polynomial.trim();
             polynomial.pad(degree_bound);
         }
 
