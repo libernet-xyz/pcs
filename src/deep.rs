@@ -1,5 +1,6 @@
-use crate::fri::{self, LeafProof, Tree};
+use crate::fri;
 use crate::hash::Hash;
+use crate::merkle::{Proof as LeafProof, Tree};
 use crate::utils;
 use anyhow::{Result, anyhow};
 use primitive_types::U256;
