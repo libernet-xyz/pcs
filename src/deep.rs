@@ -145,11 +145,6 @@ impl<H: Hash<Scalar>> Committer<H> {
         self.trees.len()
     }
 
-    /// Returns the i-th Merkle tree. `index` must be less than [`Self::num_trees()`].
-    pub fn tree(&self, index: usize) -> &Tree<H> {
-        &self.trees[index]
-    }
-
     /// Returns the root hash of the i-th Merkle tree. `index` must be less than
     /// [`Self::num_trees()`].
     ///
@@ -160,8 +155,8 @@ impl<H: Hash<Scalar>> Committer<H> {
 
     /// Adds a batch of polynomials, returning the index of the newly created batch.
     ///
-    /// The returned index can be used with the [`Self::tree`] and [`Self::root_hash`] methods to
-    /// get the Merkle tree and root hash for the batch, respectively.
+    /// The returned index can be used with the [`Self::root_hash`] method to get the Merkle root
+    /// for the batch.
     ///
     /// REQUIRES: the degree of all specified polynomials must be strictly less than
     /// [`Self::degree_bound()`].
@@ -290,9 +285,10 @@ pub struct Proof<H: Hash<Scalar>> {
     /// The opened points. Keys are (off-domain) X-coordinates, values are the corresponding
     /// evaluations (one for every committed polynomial).
     points: BTreeMap<Scalar, Vec<Scalar>>,
-    /// Merkle proofs of the opened points, relative to the raw Merkle trees (not the FRI folds).
-    /// The outer array has one entry for every FRI query (`openings.len() == queries.len()`), and
-    /// the inner arrays contain one proof for every Merkle tree.
+    /// Merkle proofs for the points at the query positions, relative to the raw Merkle trees (not
+    /// the FRI folds). The outer array has one entry for every FRI query
+    /// (`openings.len() == queries.len()`), and the inner arrays contain one proof for every Merkle
+    /// tree.
     openings: Vec<Vec<LeafProof<H>>>,
     /// FRI queries on the DEEP quotients. The number of queries is calculated by [`num_queries`]
     /// above and is tuned so as to achieve 128-bit security.
@@ -462,11 +458,6 @@ impl<H: Hash<Scalar>> Prover<H> {
     /// Returns the number of Merkle trees, corresponding to the number of polynomial batches.
     pub fn num_trees(&self) -> usize {
         self.trees.len()
-    }
-
-    /// Returns the i-th Merkle tree. `index` must be less than `num_trees()`.
-    pub fn tree(&self, index: usize) -> &Tree<H> {
-        &self.trees[index]
     }
 
     /// Returns the root hash of the i-th Merkle tree. `index` must be less than

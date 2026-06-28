@@ -1,9 +1,9 @@
 use crate::hash::Hash;
 use crate::utils;
+use anyhow::Result;
 use starkom_bluesky::Scalar;
-use starkom_ff::{Field, PrimeField};
 use starkom_poly;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 use std::sync::LazyLock;
 
@@ -21,58 +21,6 @@ static OOD_DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"star
 
 /// Domain separator tag used when deriving the OOD combination randomness γ.
 static GAMMA_DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"starkom/whir/gamma"));
-
-/// Computes f̂(b) = ∑_{k ⊆ b} coefficients[k] for all b ∈ {0,1}^m via the zeta (sum-over-subsets)
-/// transform. `coefficients` must have power-of-2 length. Bit i of b selects variable Xᵢ₊₁, so
-/// b=0 means all variables are 0 and b=2^m-1 means all variables are 1.
-fn build_f_table(coefficients: &[Scalar]) -> Vec<Scalar> {
-    let len = coefficients.len();
-    debug_assert!(len.is_power_of_two());
-    let m = len.trailing_zeros() as usize;
-    let mut table = coefficients.to_vec();
-    for i in 0..m {
-        for b in 0..len {
-            if (b >> i) & 1 == 1 {
-                let addend = table[b ^ (1 << i)];
-                table[b] += addend;
-            }
-        }
-    }
-    table
-}
-
-/// Computes eq(b, pow(z, m)) for all b ∈ {0,1}^m, where pow(z, m) = (z, z², z⁴, …, z^{2^{m-1}}).
-/// Used to add an evaluation claim at z to the weight table between folding rounds.
-fn build_eq_table(z: Scalar, m: usize) -> Vec<Scalar> {
-    let mut table = vec![Scalar::ONE];
-    let mut z_pow = z;
-    for _ in 0..m {
-        let one_minus = Scalar::ONE - z_pow;
-        let half = table.len();
-        let mut extended = vec![Scalar::ZERO; half * 2];
-        for (b, &val) in table.iter().enumerate() {
-            extended[b] = val * one_minus;
-            extended[b | half] = val * z_pow;
-        }
-        table = extended;
-        z_pow = z_pow.square();
-    }
-    table
-}
-
-/// Interpolates a univariate polynomial of degree ≤ 2 from its values at t = 0, 1, 2.
-/// Returns [a₀, a₁, a₂] such that p(t) = a₀ + a₁·t + a₂·t².
-fn interpolate_degree2(h0: Scalar, h1: Scalar, h2: Scalar) -> [Scalar; 3] {
-    let a0 = h0;
-    let a2 = (h0 - (h1 + h1) + h2) * Scalar::TWO_INV;
-    let a1 = h1 - h0 - a2;
-    [a0, a1, a2]
-}
-
-/// Evaluates p(t) = a₀ + a₁·t + a₂·t² at `t`.
-fn eval_degree2(coeffs: &[Scalar; 3], t: Scalar) -> Scalar {
-    coeffs[0] + t * (coeffs[1] + t * coeffs[2])
-}
 
 /// A WHIR commitment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,12 +54,67 @@ impl<H: Hash<Scalar>> Committer<H> {
         self.degree_bound << self.blowup_log2
     }
 
-    pub fn add_batch(&mut self, polynomials: Vec<Polynomial>) {
+    /// Adds a batch of polynomials, returning the index of the newly created batch.
+    ///
+    /// REQUIRES: the degree of all specified polynomials must be strictly less than
+    /// [`Self::degree_bound()`].
+    pub fn add_batch(&mut self, polynomials: Vec<Polynomial>) -> usize {
         // TODO
         todo!()
     }
 
     pub fn commit(self, points: BTreeSet<Scalar>) -> (Commitment, Prover<H>) {
+        // TODO
+        todo!()
+    }
+}
+
+/// A WHIR proof.
+#[derive(Debug, Clone)]
+pub struct Proof<H: Hash<Scalar>> {
+    /// The proven degree bound. If the proof is valid the degree of all batched polynomials is
+    /// guaranteed to be strictly less than this value.
+    degree_bound: usize,
+    /// The base-2 logarithm of the blowup factor.
+    blowup_log2: usize,
+    /// Number of committed polynomials.
+    num_polys: usize,
+    /// The opened points. Keys are (off-domain) X-coordinates, values are the corresponding
+    /// evaluations (one for every committed polynomial).
+    points: BTreeMap<Scalar, Vec<Scalar>>,
+    // TODO
+    _data: PhantomData<H>,
+}
+
+impl<H: Hash<Scalar>> Proof<H> {
+    /// Returns the proven degree bound.
+    pub fn degree_bound(&self) -> usize {
+        self.degree_bound
+    }
+
+    /// Returns the base-2 logarithm of the blowup factor used in the proof.
+    pub fn blowup_log2(&self) -> usize {
+        self.blowup_log2
+    }
+
+    /// Returns the size of the extended evaluation domain.
+    pub fn extended_domain_size(&self) -> usize {
+        self.degree_bound << self.blowup_log2
+    }
+
+    /// Returns the number of committed polynomials.
+    pub fn num_polys(&self) -> usize {
+        self.num_polys
+    }
+
+    /// Returns a reference to the opened points. Keys are (off-domain) X-coordinates, values are
+    /// the corresponding evaluations (one for every committed polynomial).
+    pub fn points(&self) -> &BTreeMap<Scalar, Vec<Scalar>> {
+        &self.points
+    }
+
+    /// Verifies this proof against the given commitment.
+    pub fn verify(&self, commitment: &Commitment) -> Result<()> {
         // TODO
         todo!()
     }
@@ -126,4 +129,23 @@ pub struct Prover<H: Hash<Scalar>> {
     blowup_log2: usize,
     // TODO
     _data: PhantomData<H>,
+}
+
+impl<H: Hash<Scalar>> Prover<H> {
+    /// Returns the proven degree bound.
+    pub fn degree_bound(&self) -> usize {
+        self.degree_bound
+    }
+
+    /// Returns the size of the extended evaluation domain.
+    pub fn extended_domain_size(&self) -> usize {
+        self.degree_bound << self.blowup_log2
+    }
+
+    /// Makes a WHIR proof opening the committed polynomials at the points specified at commitment
+    /// time (see [`Committer::commit()`]).
+    pub fn prove(&self, commitment: &Commitment) -> Proof<H> {
+        // TODO
+        todo!()
+    }
 }
