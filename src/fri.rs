@@ -197,7 +197,7 @@ impl<H: Hash<Scalar>> Prover<H> {
         let n = degree_bound << blowup_log2;
         assert!(n as u64 <= 1u64 << Scalar::S);
 
-        let main_tree = Tree::<H>::new(
+        let main_tree = Tree::<H>::new2(
             polynomials
                 .into_iter()
                 .map(|polynomial| polynomial.shift_domain().lde2(n))

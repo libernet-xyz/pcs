@@ -162,7 +162,6 @@ impl<H: Hash<Scalar>> Committer<H> {
     /// [`Self::degree_bound()`].
     pub fn add_batch(&mut self, polynomials: Vec<Polynomial>) -> usize {
         assert!(!polynomials.is_empty());
-        let k = polynomials.len();
 
         let degree_bound = polynomials
             .iter()
@@ -174,24 +173,15 @@ impl<H: Hash<Scalar>> Committer<H> {
         let n = self.degree_bound << self.blowup_log2;
         assert!(n.trailing_zeros() as usize <= Scalar::S);
 
-        let leaves = {
-            let evaluations = polynomials
-                .iter()
-                .map(|polynomial| polynomial.clone().shift_domain().lde2(n))
-                .collect::<Vec<Vec<Scalar>>>();
-            let mut leaves: Vec<Vec<Scalar>> = vec![vec![Scalar::ZERO; k]; n];
-            for i in 0..n {
-                for j in 0..k {
-                    leaves[i][j] = evaluations[j][i];
-                }
-            }
-            leaves
-        };
+        let evaluations = polynomials
+            .iter()
+            .map(|polynomial| polynomial.clone().shift_domain().lde2(n))
+            .collect::<Vec<Vec<Scalar>>>();
 
         let index = self.trees.len();
 
         self.polynomials.extend(polynomials);
-        self.trees.push(Tree::<H>::from_leaves(leaves));
+        self.trees.push(Tree::<H>::new2(evaluations));
 
         index
     }

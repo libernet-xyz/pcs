@@ -1,151 +1,152 @@
 use crate::hash::Hash;
 use crate::utils;
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use starkom_bluesky::Scalar;
-use starkom_poly;
-use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 use std::sync::LazyLock;
 
-type Polynomial = starkom_poly::Polynomial<Scalar>;
+/// Domain separator tag used in (internal) Merkle tree hashes.
+static TREE_DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"starkom/whir/tree"));
 
-/// Domain separator tag used when deriving the Fiat-Shamir challenge for the random linear
-/// combination.
-static RLC_DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"starkom/whir/rlc"));
+/// Computes all Merkle hashes of a vector of values up to the root.
+///
+/// `n` is the number of values and must be a power of two.
+///
+/// The full Merkle tree is stored inline in the `values` vector as follows:
+///
+///   * the first `n` elements are the values of the original vector,
+///   * the next `n / 2` elements are the hashes of the second-last layer of the tree,
+///   * the next `n / 4` elements are the hashes of the third-last layer of the tree,
+///   * ...
+///   * the last stored element is the Merkle root.
+///
+/// It's the caller's responsibility to ensure the `values` array has at least `n * 2 - 1` slots so
+/// that the full tree can be stored.
+///
+/// Note that the Merkle root will be at index `(n - 1) * 2`.
+fn merklify<H: Hash<Scalar>>(mut values: &mut [Scalar], mut n: usize) {
+    assert!(n.is_power_of_two());
+    while n > 1 {
+        let m = n / 2;
+        for j in 0..m {
+            values[n + j] = H::hash_two(*TREE_DST, values[j * 2], values[j * 2 + 1]);
+        }
+        values = &mut values[n..];
+        n = m;
+    }
+}
 
-/// Domain separator tag used when deriving the Fiat-Shamir challenge for WHIR folding.
-static FOLD_DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"starkom/whir/fold"));
-
-/// Domain separator tag used when deriving the per-round out-of-domain (OOD) challenge point.
-static OOD_DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"starkom/whir/ood"));
-
-/// Domain separator tag used when deriving the OOD combination randomness γ.
-static GAMMA_DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"starkom/whir/gamma"));
-
-/// A WHIR commitment.
+/// A Merkle proof.
+///
+/// NOTE: this object only stores the opened value and the sister hashes of the Merkle path, it
+/// doesn't store the lookup key or the root hash anywhere because those pieces of information are
+/// reconstructed separately during the verification of a whole WHIR [`Proof`]. In particular, all
+/// root hashes are stored in the [`Commitment`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Commitment {
-    // TODO
-}
-
-#[derive(Debug, Clone)]
-pub struct Committer<H: Hash<Scalar>> {
-    /// The degree bound of the committed polynomial (always a power of 2).
-    degree_bound: usize,
-    /// The base-2 logarithm of the blowup factor.
-    blowup_log2: usize,
-    // TODO
+struct LeafProof<H: Hash<Scalar>> {
+    value: Scalar,
+    path: Vec<Scalar>,
     _data: PhantomData<H>,
 }
 
-impl<H: Hash<Scalar>> Committer<H> {
-    pub fn new(degree_bound: usize, blowup_log2: usize) -> Self {
-        // TODO
-        todo!()
+impl<H: Hash<Scalar>> LeafProof<H> {
+    /// Returns the leaf value.
+    fn leaf(&self) -> Scalar {
+        self.value
     }
 
-    /// Returns the proven degree bound.
-    pub fn degree_bound(&self) -> usize {
-        self.degree_bound
+    /// Returns the length of the Merkle path, corresponding to the height of the tree minus 1 (the
+    /// root hash is not included in this count).
+    fn len(&self) -> usize {
+        self.path.len()
     }
 
-    /// Returns the size of the extended evaluation domain.
-    pub fn extended_domain_size(&self) -> usize {
-        self.degree_bound << self.blowup_log2
+    /// Verifies the proof against the given root hash.
+    fn verify(&self, mut index: usize, root_hash: Scalar) -> Result<()> {
+        let mut hash = self.value;
+        for sibling in &self.path {
+            hash = if index & 1 != 0 {
+                H::hash_two(*TREE_DST, *sibling, hash)
+            } else {
+                H::hash_two(*TREE_DST, hash, *sibling)
+            };
+            index >>= 1;
+        }
+        if index != 0 {
+            return Err(anyhow!("invalid index"));
+        }
+        if hash != root_hash {
+            return Err(anyhow!(
+                "root hash mismatch (got {}, want {})",
+                hash,
+                root_hash
+            ));
+        }
+        Ok(())
     }
 
-    /// Adds a batch of polynomials, returning the index of the newly created batch.
+    /// Indicates whether or not the committed polynomials are constant.
     ///
-    /// REQUIRES: the degree of all specified polynomials must be strictly less than
-    /// [`Self::degree_bound()`].
-    pub fn add_batch(&mut self, polynomials: Vec<Polynomial>) -> usize {
-        // TODO
-        todo!()
-    }
-
-    pub fn commit(self, points: BTreeSet<Scalar>) -> (Commitment, Prover<H>) {
-        // TODO
-        todo!()
+    /// This is used in low degree testing to check when the folding process collapses to degree-0
+    /// polynomials.
+    fn is_constant(&self) -> bool {
+        let mut hash = self.value;
+        for &sibling in &self.path {
+            if sibling != hash {
+                return false;
+            }
+            hash = H::hash_two(*TREE_DST, hash, hash);
+        }
+        true
     }
 }
 
-/// A WHIR proof.
-#[derive(Debug, Clone)]
-pub struct Proof<H: Hash<Scalar>> {
-    /// The proven degree bound. If the proof is valid the degree of all batched polynomials is
-    /// guaranteed to be strictly less than this value.
-    degree_bound: usize,
-    /// The base-2 logarithm of the blowup factor.
-    blowup_log2: usize,
-    /// Number of committed polynomials.
-    num_polys: usize,
-    /// The opened points. Keys are (off-domain) X-coordinates, values are the corresponding
-    /// evaluations (one for every committed polynomial).
-    points: BTreeMap<Scalar, Vec<Scalar>>,
-    // TODO
+#[derive(Debug, Default, Clone)]
+struct Tree<H: Hash<Scalar>> {
+    /// The nodes of the tree. There are 2*N-1 elements in this array, with N = number of leaves.
+    /// The nodes of the bottom layer are the leaves, that is the committed polynomial evaluations.
+    data: Vec<Scalar>,
     _data: PhantomData<H>,
 }
 
-impl<H: Hash<Scalar>> Proof<H> {
-    /// Returns the proven degree bound.
-    pub fn degree_bound(&self) -> usize {
-        self.degree_bound
+impl<H: Hash<Scalar>> Tree<H> {
+    /// Returns the number of leaves in the tree, corresponding to the size of the evaluation domain
+    /// (always a power of 2).
+    fn num_leaves(&self) -> usize {
+        (self.data.len() + 1) / 2
     }
 
-    /// Returns the base-2 logarithm of the blowup factor used in the proof.
-    pub fn blowup_log2(&self) -> usize {
-        self.blowup_log2
+    /// Returns the root hash of the Merkle tree.
+    fn root_hash(&self) -> Scalar {
+        let n = self.num_leaves();
+        self.data[(n - 1) * 2]
     }
 
-    /// Returns the size of the extended evaluation domain.
-    pub fn extended_domain_size(&self) -> usize {
-        self.degree_bound << self.blowup_log2
+    /// Returns a reference to the i-th leaf.
+    ///
+    /// Note that the leaf contains k elements, one for every committed polynomial.
+    fn leaf(&self, index: usize) -> Scalar {
+        self.data[index]
     }
 
-    /// Returns the number of committed polynomials.
-    pub fn num_polys(&self) -> usize {
-        self.num_polys
-    }
-
-    /// Returns a reference to the opened points. Keys are (off-domain) X-coordinates, values are
-    /// the corresponding evaluations (one for every committed polynomial).
-    pub fn points(&self) -> &BTreeMap<Scalar, Vec<Scalar>> {
-        &self.points
-    }
-
-    /// Verifies this proof against the given commitment.
-    pub fn verify(&self, commitment: &Commitment) -> Result<()> {
-        // TODO
-        todo!()
-    }
-}
-
-/// A WHIR prover.
-#[derive(Debug)]
-pub struct Prover<H: Hash<Scalar>> {
-    /// The degree bound of the committed polynomial (always a power of 2).
-    degree_bound: usize,
-    /// The base-2 logarithm of the blowup factor.
-    blowup_log2: usize,
-    // TODO
-    _data: PhantomData<H>,
-}
-
-impl<H: Hash<Scalar>> Prover<H> {
-    /// Returns the proven degree bound.
-    pub fn degree_bound(&self) -> usize {
-        self.degree_bound
-    }
-
-    /// Returns the size of the extended evaluation domain.
-    pub fn extended_domain_size(&self) -> usize {
-        self.degree_bound << self.blowup_log2
-    }
-
-    /// Makes a WHIR proof opening the committed polynomials at the points specified at commitment
-    /// time (see [`Committer::commit()`]).
-    pub fn prove(&self, commitment: &Commitment) -> Proof<H> {
-        // TODO
-        todo!()
+    /// Returns a Merkle proof for the leaf at `index`.
+    fn query(&self, mut index: usize) -> LeafProof<H> {
+        let mut n = self.num_leaves();
+        assert!(n.is_power_of_two());
+        assert!(index < n);
+        let value = self.data[index];
+        let mut path = Vec::with_capacity(n.trailing_zeros() as usize);
+        let mut data = self.data.as_slice();
+        while n > 1 {
+            path.push(data[index ^ 1]);
+            data = &data[n..];
+            n /= 2;
+            index >>= 1;
+        }
+        LeafProof {
+            value,
+            path,
+            _data: Default::default(),
+        }
     }
 }
