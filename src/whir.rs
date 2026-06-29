@@ -1,5 +1,5 @@
 use crate::hash::Hash;
-use crate::merkle::Tree;
+use crate::merkle::{self, Tree};
 use crate::utils;
 use anyhow::Result;
 use starkom_bluesky::Scalar;
@@ -123,11 +123,71 @@ impl<H: Hash<Scalar>> Prover<H> {
 }
 
 /// A WHIR opening proof.
+///
+/// Produced by [`Prover::open`] and verified by [`Proof::verify`] against the corresponding
+/// [`Commitment`]. The proof is self-contained: the verifier needs only the commitment and this
+/// struct to reconstruct the full Fiat-Shamir transcript and execute all decision-phase checks.
+///
+/// The layout follows the full transcript of Construction 5.1 (§5, page 32) and its BCS
+/// compilation into a non-interactive proof.
 #[derive(Debug, Clone)]
 pub struct Proof<H: Hash<Scalar>> {
+    /// Number of committed polynomials.
+    num_polys: usize,
+    /// Degree bound (power of two); mirrors [`Commitment::degree_bound`].
     degree_bound: usize,
+    /// Base-2 log of the blowup factor; mirrors [`Commitment::blowup_log2`].
     blowup_log2: usize,
-    // TODO
+
+    /// Claimed evaluation values.
+    ///
+    /// `points[z][i]` is the claimed value of the i-th committed polynomial at z.
+    /// These define the CRS constraint `σ₀` and weight polynomial `ŵ₀` that seed the initial
+    /// sumcheck (Construction 5.1, "Inputs" and step 1).
+    points: BTreeMap<Scalar, Vec<Scalar>>,
+
+    /// Merkle roots of the M-1 folded oracles f₁, …, f_{M-1} (step 2a).
+    ///
+    /// `fold_roots[i-1]` is the root of the Merkle tree for oracle fᵢ.
+    /// The initial oracle f₀ is already committed via [`Commitment::poly_tree_root`].
+    fold_roots: Vec<Scalar>,
+
+    /// Sumcheck polynomials for every round (steps 1a and 2e).
+    ///
+    /// `sumcheck_polys[0]` contains k₀ entries for the initial sumcheck (step 1).
+    /// `sumcheck_polys[i]` for i ≥ 1 contains kᵢ entries for main-loop round i (step 2e).
+    /// Each entry `[a₀, a₁, a₂]` stores the coefficients of the univariate polynomial
+    /// ĥ(X) = a₀ + a₁·X + a₂·X² (degree < d* = 3, because ŵ has degree 1 in Z and each Xⱼ).
+    sumcheck_polys: Vec<Vec<[Scalar; 3]>>,
+
+    /// Out-of-domain answers for main-loop rounds 1, …, M-1 (step 2c).
+    ///
+    /// `ood_answers[i-1]` = yᵢ,₀ = f̂ᵢ(pow(zᵢ,₀, mᵢ)), the MLE of fᵢ evaluated at the
+    /// verifier's out-of-domain sample for round i.
+    ood_answers: Vec<Scalar>,
+
+    /// Multilinear coefficients of the final polynomial f̂_M (step 3).
+    ///
+    /// `final_poly[b]` = f̂_M(b) for b ∈ {0,1}^{m_M}, in lexicographic order (b as a usize).
+    /// The verifier evaluates f̂_M on the boolean hypercube to check the weight constraint
+    /// (decision phase step 3b/c) and fold-consistency with g_{M-1} (decision step 3a).
+    final_poly: Vec<Scalar>,
+
+    /// Merkle-proof openings for shift-query evaluations (step 2d / decision step 2b).
+    ///
+    /// `oracle_query_proofs[i][j]` contains 2^{kᵢ} Merkle proofs opening oracle fᵢ at the coset
+    /// of positions required to evaluate gᵢ = Fold(fᵢ, **α**ᵢ) at shift query z_{i+1, j+1}.
+    ///
+    /// For i = 0 the oracle is the per-polynomial tree (vector leaves of width `num_polys`);
+    /// for i > 0 it is the i-th folded oracle tree (single-valued leaves).
+    oracle_query_proofs: Vec<Vec<Vec<merkle::Proof<H>>>>,
+
+    /// Merkle-proof openings for the final fold-consistency checks (step 4 / decision step 3a).
+    ///
+    /// `final_query_proofs[l]` contains 2^{k_{M-1}} Merkle proofs opening oracle f_{M-1} at the
+    /// coset needed to evaluate g_{M-1} = Fold(f_{M-1}, **α**_{M-1}) at final query r_l^fin.
+    final_query_proofs: Vec<Vec<merkle::Proof<H>>>,
+
     _data: PhantomData<H>,
 }
 
