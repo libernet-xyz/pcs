@@ -18,12 +18,9 @@ static EVAL_COMBO_DST: LazyLock<Scalar> =
 static SC_ALPHA_DST: LazyLock<Scalar> =
     LazyLock::new(|| utils::hash_to_scalar(b"starkom/whir/sc_alpha"));
 static OOD_DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"starkom/whir/ood"));
-static SHIFT_DST: LazyLock<Scalar> =
-    LazyLock::new(|| utils::hash_to_scalar(b"starkom/whir/shift"));
-static COMBO_DST: LazyLock<Scalar> =
-    LazyLock::new(|| utils::hash_to_scalar(b"starkom/whir/combo"));
-static FINAL_DST: LazyLock<Scalar> =
-    LazyLock::new(|| utils::hash_to_scalar(b"starkom/whir/final"));
+static SHIFT_DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"starkom/whir/shift"));
+static COMBO_DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"starkom/whir/combo"));
+static FINAL_DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"starkom/whir/final"));
 
 // --- Module-level helpers ---
 
@@ -72,9 +69,6 @@ fn pow_seg(z: Scalar, start: usize, len: usize) -> Vec<Scalar> {
 }
 
 /// ∏_{r=0}^{num_rounds−1} eq_k(alphas_slice[r], pow_seg(z, r·k, k)).
-///
-/// Used to compute the "constant factor" of an eq constraint after substituting
-/// the accumulated Fiat-Shamir fold challenges **α** in place of the fixed variables.
 fn eq_prod(z: Scalar, num_rounds: usize, k: usize, alphas_slice: &[Vec<Scalar>]) -> Scalar {
     let mut result = Scalar::ONE;
     for r in 0..num_rounds {
@@ -90,7 +84,6 @@ fn multilinear_eval(poly: &[Scalar], point: &[Scalar]) -> Scalar {
     for &alpha in point {
         let half = evals.len() / 2;
         for j in 0..half {
-            // Eliminate variable i (LSB-first): fold adjacent pair.
             evals[j] = evals[j] + alpha * (evals[j + half] - evals[j]);
         }
         evals.truncate(half);
@@ -98,15 +91,91 @@ fn multilinear_eval(poly: &[Scalar], point: &[Scalar]) -> Scalar {
     evals[0]
 }
 
+/// Sum-Over-Subsets (SOS) DP: given a coefficient vector (ascending degree), return the
+/// multilinear-extension truth table f̂(b) = Σ_{j ⊆ b} c_j for all b ∈ {0,1}^m.
+///
+/// `m` must satisfy 2^m == the padded coefficient length; coefficients shorter than 2^m are
+/// zero-extended.
+fn sos_dp(coeffs: &[Scalar], m: usize) -> Vec<Scalar> {
+    let n = 1 << m;
+    let mut table = coeffs.to_vec();
+    table.resize(n, Scalar::ZERO);
+    for l in 0..m {
+        for j in 0..n {
+            if (j >> l) & 1 == 1 {
+                let prev = table[j ^ (1 << l)];
+                table[j] += prev;
+            }
+        }
+    }
+    table
+}
+
+/// Compute the truth table of eq_tensor(z, m)[b] = ∏_{l=0}^{m-1} eq1(bit_l(b), z^{2^l})
+/// for all b ∈ {0,1}^m (LSB-first encoding: bit 0 of b corresponds to l=0).
+fn eq_tensor_table(z: Scalar, m: usize) -> Vec<Scalar> {
+    let zs = pow_seg(z, 0, m);
+    let mut table = vec![Scalar::ONE];
+    // Process from high bit to low bit so that each new variable lands in the LSB position.
+    for l in (0..m).rev() {
+        let zl = zs[l];
+        let one_minus_zl = Scalar::ONE - zl;
+        let old_len = table.len();
+        let mut new_table = Vec::with_capacity(old_len * 2);
+        for &v in &table {
+            new_table.push(v * one_minus_zl); // bit l = 0
+            new_table.push(v * zl); // bit l = 1
+        }
+        table = new_table;
+    }
+    table
+}
+
+/// Fold a multilinear truth table in-place by eliminating variable 0 (the LSB).
+///
+/// After this call, `table[j]` = (1−alpha)·table_old[2j] + alpha·table_old[2j+1].
+fn mle_fold(table: &mut Vec<Scalar>, alpha: Scalar) {
+    let half = table.len() / 2;
+    for j in 0..half {
+        let v0 = table[j << 1];
+        let v1 = table[(j << 1) | 1];
+        table[j] = v0 + alpha * (v1 - v0);
+    }
+    table.truncate(half);
+}
+
+/// Compute the degree-2 sumcheck polynomial h(X) = Σ_{b∈{0,1}^{m-1}} f̂(X,b)·ŵ(X,b),
+/// returned as its coefficient vector [a₀, a₁, a₂] where h(X) = a₀ + a₁X + a₂X².
+fn sumcheck_poly(f_table: &[Scalar], w_table: &[Scalar]) -> [Scalar; 3] {
+    let half = f_table.len() / 2;
+    let mut h0 = Scalar::ZERO;
+    let mut h1 = Scalar::ZERO;
+    let mut h2 = Scalar::ZERO;
+    for j in 0..half {
+        let f0 = f_table[j << 1];
+        let f1 = f_table[(j << 1) | 1];
+        let w0 = w_table[j << 1];
+        let w1 = w_table[(j << 1) | 1];
+        h0 += f0 * w0;
+        h1 += f1 * w1;
+        // h(2) via multilinear extension: f(2,b) = 2f(1,b)−f(0,b)
+        h2 += (f1.double() - f0) * (w1.double() - w0);
+    }
+    let a0 = h0;
+    let a2 = (h2 - h1.double() + h0) * Scalar::TWO_INV;
+    let a1 = h1 - a0 - a2;
+    [a0, a1, a2]
+}
+
 /// Verify the 2^k Merkle proofs and apply k FRI-style fold steps to compute
-/// Fold(f_{prev}, **α**)(y) where y is the domain element at `query_index` in ℒ_curr
-/// (the k-times-squared domain of the oracle's domain ℒ_prev = domain of size `domain_size`).
+/// Fold(f_{prev}, **α**)(y) where y is the domain element at `query_index` in the k-times-folded
+/// domain.
 ///
-/// The 2^k pre-image indices in ℒ_prev are {query_index + l·n_q : l = 0,…,2^k−1}
-/// where n_q = domain_size >> k is the size of ℒ_curr.
+/// The 2^k pre-image indices in the source domain (size `domain_size`) are
+/// {query_index + l·n_q : l = 0,…,2^k−1} where n_q = domain_size >> k.
 ///
-/// If `is_initial` is true the oracle is the per-polynomial tree (vector leaves);
-/// otherwise it is a folded oracle tree (single-valued leaves).
+/// If `is_initial` is true the oracle is the per-polynomial tree (vector leaves); otherwise it is a
+/// folded oracle tree (single-valued leaves).
 fn compute_fold<H: Hash<Scalar>>(
     proofs: &[merkle::Proof<H>],
     query_index: usize,
@@ -142,23 +211,21 @@ fn compute_fold<H: Hash<Scalar>>(
         values.push(val);
     }
 
-    // Apply k fold steps (same formula as fri.rs).
-    // step starts as ω_n^{−1} where n = domain_size.
+    // Apply k fold steps.  `step` = ω_n^{−1} for the current domain size n.
     let log_n = domain_size.trailing_zeros() as u32;
-    let mut step =
-        Scalar::ROOT_OF_UNITY_INV.pow_u64(1u64 << (Scalar::S as u32 - log_n));
+    let mut step = Scalar::ROOT_OF_UNITY_INV.pow_u64(1u64 << (Scalar::S as u32 - log_n));
     let mut half = 1usize << (k - 1);
 
     for round in 0..k {
         let mut new_values = Vec::with_capacity(half);
         for j in 0..half {
-            // Left pre-image index in original domain.
             let left_idx = query_index + j * (n_q << round);
             let omega_inv = step.pow_small(left_idx);
             let left = values[j];
             let right = values[j + half];
-            new_values
-                .push((left + right + alphas[round] * omega_inv * (left - right)) * Scalar::TWO_INV);
+            new_values.push(
+                (left + right + alphas[round] * omega_inv * (left - right)) * Scalar::TWO_INV,
+            );
         }
         values = new_values;
         step = step.square();
@@ -171,9 +238,7 @@ fn compute_fold<H: Hash<Scalar>>(
 
 /// A WHIR polynomial commitment.
 ///
-/// Produced by [`Prover::commit`] and consumed by the verifier. Serves as the anchor for external
-/// Fiat-Shamir derivation: the PLONK layer (or any other caller) feeds [`Self::root_hash()`] into
-/// its own transcript to bind its challenges to this commitment.
+/// Produced by [`Prover::commit`] and consumed by the verifier.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Commitment {
     /// Number of committed polynomials.
@@ -181,20 +246,13 @@ pub struct Commitment {
     /// Degree bound (a power of two). All committed polynomials have degree strictly less than this
     /// value.
     degree_bound: usize,
-    /// Base-2 logarithm of the blowup factor. The coset evaluation domain has
-    /// `degree_bound << blowup_log2` points.
+    /// Base-2 logarithm of the blowup factor.
     blowup_log2: usize,
     /// Root hash of the per-polynomial Merkle tree.
     ///
     /// The tree has `degree_bound << blowup_log2` leaves; leaf `j` is the vector
-    /// `[p₀(g·ωʲ), …, p_{n-1}(g·ωʲ)]` of coset-domain evaluations of all `n` committed polynomials
-    /// at position `j`, where `g` is the multiplicative generator (coset shift) and `ω` is the
-    /// canonical root of unity for the evaluation domain.
-    ///
-    /// This root cryptographically binds every polynomial to all of its coset-domain evaluations.
-    /// The WHIR prover derives the RLC challenge γ by hashing this root via Fiat-Shamir, so any
-    /// caller wishing to interleave their own challenges with the commitment must do so by hashing
-    /// this root into their transcript before generating those challenges.
+    /// `[p₀(ωʲ), …, p_{n-1}(ωʲ)]` of evaluation-domain evaluations of all `n` committed
+    /// polynomials at position `j`, where `ω` is the canonical root of unity for the domain.
     poly_tree_root: Scalar,
 }
 
@@ -214,20 +272,29 @@ impl Commitment {
 pub struct Prover<H: Hash<Scalar>> {
     degree_bound: usize,
     blowup_log2: usize,
-    /// Committed polynomials, padded to `degree_bound` coefficients and shifted via
-    /// `shift_domain` so that `p.clone().lde2(n)` yields their coset-domain evaluations.
+    /// Number of fold2 steps per WHIR round (the sumcheck depth per round).
+    k: usize,
+    /// Number of shift queries per round (tuned for 128-bit security).
+    t: usize,
+    /// Number of final fold-consistency queries.
+    num_final_queries: usize,
+    /// Committed polynomials, padded to `degree_bound` coefficients.
     polynomials: Vec<Polynomial>,
-    /// Per-polynomial Merkle tree over the coset evaluation domain.
+    /// Per-polynomial Merkle tree over the evaluation domain {ω^j : j=0,…,n−1}.
     poly_tree: Tree<H>,
 }
 
 impl<H: Hash<Scalar>> Prover<H> {
-    /// Commits to a batch of polynomials.
+    /// Commits to a batch of polynomials with folding parameter `k`.
     ///
-    /// All polynomials are padded to the same degree bound—the next power of two at or above the
-    /// maximum degree among them—and evaluated on the coset domain
-    /// `{g·ωʲ : j = 0, …, n-1}` where `n = degree_bound << blowup_log2`.
-    pub fn new(mut polynomials: Vec<Polynomial>, blowup_log2: usize) -> Self {
+    /// All polynomials are padded to the same degree bound and evaluated on the domain
+    /// `{ωʲ : j = 0, …, n-1}` where `n = degree_bound << blowup_log2`.
+    ///
+    /// Requires `degree_bound` (after padding) to be at least `2^k` so that at least one WHIR
+    /// round exists.
+    pub fn new(mut polynomials: Vec<Polynomial>, blowup_log2: usize, k: usize) -> Self {
+        assert!(k >= 1, "folding parameter k must be at least 1");
+
         let degree_bound = polynomials
             .iter_mut()
             .map(|polynomial| {
@@ -238,20 +305,33 @@ impl<H: Hash<Scalar>> Prover<H> {
             .unwrap()
             .next_power_of_two();
 
+        let m0 = degree_bound.trailing_zeros() as usize;
+        assert!(
+            m0 >= k,
+            "degree bound must be at least 2^k for WHIR to have at least one round"
+        );
+
         polynomials = polynomials
             .into_iter()
             .map(|mut polynomial| {
                 polynomial.pad(degree_bound);
-                polynomial.shift_domain()
+                polynomial
             })
             .collect();
 
         let n = degree_bound << blowup_log2;
         let poly_tree = Tree::<H>::new(polynomials.iter().map(|p| p.clone().lde2(n)).collect());
 
+        // t and num_final_queries tuned for 128-bit security against proximity testing.
+        let t = 128usize.div_ceil(blowup_log2);
+        let num_final_queries = t;
+
         Self {
             degree_bound,
             blowup_log2,
+            k,
+            t,
+            num_final_queries,
             polynomials,
             poly_tree,
         }
@@ -269,11 +349,238 @@ impl<H: Hash<Scalar>> Prover<H> {
 
     /// Produces a WHIR proof opening the committed polynomials at the given evaluation points.
     ///
+    /// Implements Construction 5.1 (§5, page 32–34 of the WHIR paper, Arnon-Chiesa-Fenzi-Yogev
+    /// 2024) compiled via BCS into a non-interactive proof via Fiat-Shamir.
+    ///
     /// `points` maps each evaluation point to the vector of claimed evaluations across all
     /// committed polynomials: `points[z][i]` is the claimed value of polynomial `i` at point `z`.
     pub fn open(&self, points: BTreeMap<Scalar, Vec<Scalar>>) -> Proof<H> {
-        // TODO
-        todo!()
+        let k = self.k;
+        let t = self.t;
+        let num_final_queries = self.num_final_queries;
+        let m0 = self.degree_bound.trailing_zeros() as usize;
+        let n0 = self.degree_bound << self.blowup_log2;
+        let big_m = m0 / k; // total WHIR rounds
+
+        let poly_tree_root = self.poly_tree.root_hash();
+
+        // ── Fiat-Shamir: initial challenges ──────────────────────────────────────────────
+
+        // γ (per-polynomial RLC challenge)
+        let gamma = H::hash_many(&[*RLC_DST, poly_tree_root]);
+
+        // Combined per-point claims
+        let combined_claims: Vec<(Scalar, Scalar)> = points
+            .iter()
+            .map(|(z, vals)| (*z, rlc(vals, gamma)))
+            .collect();
+
+        // η (multi-constraint batching challenge)
+        let mut state = {
+            let mut inputs = vec![
+                *EVAL_COMBO_DST,
+                poly_tree_root,
+                Scalar::from(combined_claims.len() as u64),
+            ];
+            for &(z, v) in &combined_claims {
+                inputs.push(z);
+                inputs.push(v);
+            }
+            H::hash_many(&inputs)
+        };
+        let eta = state;
+
+        // ── Build combined oracle polynomial (unshifted, from original coefficients) ────
+
+        let f_combined = {
+            let mut combined = Polynomial::default();
+            let mut power = Scalar::ONE;
+            for poly in &self.polynomials {
+                combined += poly.clone() * power;
+                power *= gamma;
+            }
+            combined
+        };
+
+        // MLE truth table of f_combined: f_table[b] = f̂(b) for b ∈ {0,1}^m0.
+        let mut f_table = sos_dp(f_combined.coefficients(), m0);
+
+        // Weight table: w_table[b] = Σ_j η^j · eq_tensor(z_j, m0)[b].
+        let mut w_table = vec![Scalar::ZERO; 1 << m0];
+        {
+            let mut eta_pow = Scalar::ONE;
+            for &(z, _) in &combined_claims {
+                let eq_z = eq_tensor_table(z, m0);
+                for (b, &eq_b) in eq_z.iter().enumerate() {
+                    w_table[b] += eta_pow * eq_b;
+                }
+                eta_pow *= eta;
+            }
+        }
+
+        // ── Output collections ────────────────────────────────────────────────────────────
+
+        let mut sumcheck_polys: Vec<Vec<[Scalar; 3]>> = Vec::with_capacity(big_m);
+        let mut fold_roots: Vec<Scalar> = Vec::with_capacity(big_m - 1);
+        let mut ood_answers: Vec<Scalar> = Vec::with_capacity(big_m - 1);
+        let mut all_alphas: Vec<Vec<Scalar>> = Vec::with_capacity(big_m);
+        let mut fold_trees: Vec<Tree<H>> = Vec::with_capacity(big_m.saturating_sub(1));
+        let mut shift_idx_per_round: Vec<Vec<usize>> = Vec::with_capacity(big_m - 1);
+
+        // Current folded polynomial in coefficient form (tracks fᵢ).
+        let mut f_poly = f_combined;
+
+        // ── Round 0: initial sumcheck ─────────────────────────────────────────────────────
+
+        {
+            let mut round_polys = Vec::with_capacity(k);
+            let mut round_alphas = Vec::with_capacity(k);
+            for _ in 0..k {
+                let h = sumcheck_poly(&f_table, &w_table);
+                let alpha = H::hash_many(&[*SC_ALPHA_DST, state, h[0], h[1], h[2]]);
+                state = alpha;
+                round_polys.push(h);
+                round_alphas.push(alpha);
+                mle_fold(&mut f_table, alpha);
+                mle_fold(&mut w_table, alpha);
+                f_poly = f_poly.fold2(alpha);
+            }
+            all_alphas.push(round_alphas);
+            sumcheck_polys.push(round_polys);
+        }
+        let _ = poly_eval(sumcheck_polys[0][k - 1], all_alphas[0][k - 1]);
+
+        // ── Main loop (rounds i = 1, …, M-1) ─────────────────────────────────────────────
+
+        for i in 1..big_m {
+            let m_i = m0 - k * i;
+            let n_i = n0 >> (k * i);
+
+            // Commit fᵢ (fold oracle i, evaluated on the unshifted domain {ω_{nᵢ}^j}).
+            let f_i_evals = f_poly.clone().lde2(n_i);
+            let f_i_tree = Tree::<H>::new(vec![f_i_evals.clone()]);
+            let fold_root = f_i_tree.root_hash();
+            fold_roots.push(fold_root);
+            fold_trees.push(f_i_tree);
+
+            // OOD challenge z_{i,0}
+            state = H::hash_many(&[*OOD_DST, state, fold_root]);
+            let z_ood = state;
+            let y_i0 = f_poly.evaluate(z_ood);
+            ood_answers.push(y_i0);
+            state = H::hash_many(&[*OOD_DST, state, y_i0]);
+
+            // Shift query indices in ℒᵢ (size n_i); derived without updating state.
+            let q_mod = U256::from(n_i as u64);
+            let shift_indices: Vec<usize> = (0..t)
+                .map(|j| {
+                    let h = H::hash_many(&[*SHIFT_DST, state, Scalar::from(j as u64)]);
+                    (h.to_u256() % q_mod).low_u64() as usize
+                })
+                .collect();
+
+            // γᵢ (combination challenge for this round)
+            let gamma_i = H::hash_many(&[*COMBO_DST, state, Scalar::from(t as u64)]);
+            state = gamma_i;
+
+            shift_idx_per_round.push(shift_indices.clone());
+
+            // Add OOD and shift-query contributions to the weight table (currently size 2^{m_i}).
+            {
+                let eq_ood = eq_tensor_table(z_ood, m_i);
+                for (b, &eq_b) in eq_ood.iter().enumerate() {
+                    w_table[b] += gamma_i * eq_b;
+                }
+                let mut gamma_pow = gamma_i * gamma_i;
+                for &q in &shift_indices {
+                    let z_shift = Polynomial::domain_element2(q, n_i);
+                    let eq_shift = eq_tensor_table(z_shift, m_i);
+                    for (b, &eq_b) in eq_shift.iter().enumerate() {
+                        w_table[b] += gamma_pow * eq_b;
+                    }
+                    gamma_pow *= gamma_i;
+                }
+            }
+
+            // Round i sumcheck (k sub-rounds over the current m_i-variable MLE).
+            {
+                let mut round_polys = Vec::with_capacity(k);
+                let mut round_alphas = Vec::with_capacity(k);
+                for _ in 0..k {
+                    let h = sumcheck_poly(&f_table, &w_table);
+                    let alpha = H::hash_many(&[*SC_ALPHA_DST, state, h[0], h[1], h[2]]);
+                    state = alpha;
+                    round_polys.push(h);
+                    round_alphas.push(alpha);
+                    mle_fold(&mut f_table, alpha);
+                    mle_fold(&mut w_table, alpha);
+                    f_poly = f_poly.fold2(alpha);
+                }
+                let _ = poly_eval(round_polys[k - 1], round_alphas[k - 1]);
+                all_alphas.push(round_alphas);
+                sumcheck_polys.push(round_polys);
+            }
+        }
+
+        // final_poly = MLE truth table of f_M (after all k·M folds), size 2^{m_final}.
+        let final_poly = f_table;
+
+        // ── Generate shift-query Merkle proofs ────────────────────────────────────────────
+        // Done AFTER fold_trees is fully built to avoid borrow conflicts.
+        let mut oracle_query_proofs: Vec<Vec<Vec<merkle::Proof<H>>>> =
+            Vec::with_capacity(big_m - 1);
+        for i in 1..big_m {
+            // Preimage count n_q in the source oracle for each target index q in ℒᵢ.
+            let n_prev = n0 >> (k * (i - 1));
+            let n_q = n_prev >> k; // = n_i (size of ℒᵢ)
+            let prev_tree: &Tree<H> = if i == 1 {
+                &self.poly_tree
+            } else {
+                &fold_trees[i - 2]
+            };
+            let mut proofs_for_round: Vec<Vec<merkle::Proof<H>>> =
+                Vec::with_capacity(shift_idx_per_round[i - 1].len());
+            for &q in &shift_idx_per_round[i - 1] {
+                let proofs: Vec<merkle::Proof<H>> = (0..(1usize << k))
+                    .map(|l| prev_tree.query(q + l * n_q))
+                    .collect();
+                proofs_for_round.push(proofs);
+            }
+            oracle_query_proofs.push(proofs_for_round);
+        }
+
+        // ── Generate final-query Merkle proofs ────────────────────────────────────────────
+        let last_domain_size = n0 >> (k * (big_m - 1));
+        let final_q_domain_size = last_domain_size >> k;
+        let final_q_mod = U256::from(final_q_domain_size as u64);
+        let n_q_final = final_q_domain_size; // = last_domain_size >> k
+        let last_oracle: &Tree<H> = if big_m == 1 {
+            &self.poly_tree
+        } else {
+            &fold_trees[big_m - 2]
+        };
+
+        let mut final_query_proofs: Vec<Vec<merkle::Proof<H>>> =
+            Vec::with_capacity(num_final_queries);
+        for l in 0..num_final_queries {
+            let r_hash = H::hash_many(&[*FINAL_DST, state, Scalar::from(l as u64)]);
+            let r_idx = (r_hash.to_u256() % final_q_mod).low_u64() as usize;
+            let proofs: Vec<merkle::Proof<H>> = (0..(1usize << k))
+                .map(|j| last_oracle.query(r_idx + j * n_q_final))
+                .collect();
+            final_query_proofs.push(proofs);
+        }
+
+        Proof {
+            points,
+            fold_roots,
+            sumcheck_polys,
+            ood_answers,
+            final_poly,
+            oracle_query_proofs,
+            final_query_proofs,
+            _data: PhantomData,
+        }
     }
 }
 
@@ -283,64 +590,36 @@ impl<H: Hash<Scalar>> Prover<H> {
 /// [`Commitment`]. The proof is self-contained: the verifier needs only the commitment and this
 /// struct to reconstruct the full Fiat-Shamir transcript and execute all decision-phase checks.
 ///
-/// The layout follows the full transcript of Construction 5.1 (§5, page 32) and its BCS
-/// compilation into a non-interactive proof.
+/// The layout follows Construction 5.1 (§5, page 32) compiled via BCS into a non-interactive proof.
 #[derive(Debug, Clone)]
 pub struct Proof<H: Hash<Scalar>> {
-    /// Number of committed polynomials.
-    num_polys: usize,
-    /// Degree bound (power of two); mirrors [`Commitment::degree_bound`].
-    degree_bound: usize,
-    /// Base-2 log of the blowup factor; mirrors [`Commitment::blowup_log2`].
-    blowup_log2: usize,
-
     /// Claimed evaluation values.
     ///
     /// `points[z][i]` is the claimed value of the i-th committed polynomial at z.
-    /// These define the CRS constraint `σ₀` and weight polynomial `ŵ₀` that seed the initial
-    /// sumcheck (Construction 5.1, "Inputs" and step 1).
     points: BTreeMap<Scalar, Vec<Scalar>>,
 
     /// Merkle roots of the M-1 folded oracles f₁, …, f_{M-1} (step 2a).
-    ///
-    /// `fold_roots[i-1]` is the root of the Merkle tree for oracle fᵢ.
-    /// The initial oracle f₀ is already committed via [`Commitment::poly_tree_root`].
     fold_roots: Vec<Scalar>,
 
     /// Sumcheck polynomials for every round (steps 1a and 2e).
     ///
-    /// `sumcheck_polys[0]` contains k₀ entries for the initial sumcheck (step 1).
-    /// `sumcheck_polys[i]` for i ≥ 1 contains kᵢ entries for main-loop round i (step 2e).
-    /// Each entry `[a₀, a₁, a₂]` stores the coefficients of the univariate polynomial
-    /// ĥ(X) = a₀ + a₁·X + a₂·X² (degree < d* = 3, because ŵ has degree 1 in Z and each Xⱼ).
+    /// `sumcheck_polys[i]` contains k entries; each entry `[a₀, a₁, a₂]` stores the coefficients
+    /// of h(X) = a₀ + a₁X + a₂X².
     sumcheck_polys: Vec<Vec<[Scalar; 3]>>,
 
     /// Out-of-domain answers for main-loop rounds 1, …, M-1 (step 2c).
-    ///
-    /// `ood_answers[i-1]` = yᵢ,₀ = f̂ᵢ(pow(zᵢ,₀, mᵢ)), the MLE of fᵢ evaluated at the
-    /// verifier's out-of-domain sample for round i.
     ood_answers: Vec<Scalar>,
 
-    /// Multilinear coefficients of the final polynomial f̂_M (step 3).
-    ///
-    /// `final_poly[b]` = f̂_M(b) for b ∈ {0,1}^{m_M}, in lexicographic order (b as a usize).
-    /// The verifier evaluates f̂_M on the boolean hypercube to check the weight constraint
-    /// (decision phase step 3b/c) and fold-consistency with g_{M-1} (decision step 3a).
+    /// Multilinear values of the final polynomial f̂_M on {0,1}^{m_M}.
     final_poly: Vec<Scalar>,
 
     /// Merkle-proof openings for shift-query evaluations (step 2d / decision step 2b).
     ///
-    /// `oracle_query_proofs[i][j]` contains 2^{kᵢ} Merkle proofs opening oracle fᵢ at the coset
-    /// of positions required to evaluate gᵢ = Fold(fᵢ, **α**ᵢ) at shift query z_{i+1, j+1}.
-    ///
-    /// For i = 0 the oracle is the per-polynomial tree (vector leaves of width `num_polys`);
-    /// for i > 0 it is the i-th folded oracle tree (single-valued leaves).
+    /// `oracle_query_proofs[i-1][j]` contains 2^k proofs opening oracle f_{i-1} at the 2^k
+    /// preimages of shift-query index j in ℒᵢ.
     oracle_query_proofs: Vec<Vec<Vec<merkle::Proof<H>>>>,
 
     /// Merkle-proof openings for the final fold-consistency checks (step 4 / decision step 3a).
-    ///
-    /// `final_query_proofs[l]` contains 2^{k_{M-1}} Merkle proofs opening oracle f_{M-1} at the
-    /// coset needed to evaluate g_{M-1} = Fold(f_{M-1}, **α**_{M-1}) at final query r_l^fin.
     final_query_proofs: Vec<Vec<merkle::Proof<H>>>,
 
     _data: PhantomData<H>,
@@ -349,30 +628,23 @@ pub struct Proof<H: Hash<Scalar>> {
 impl<H: Hash<Scalar>> Proof<H> {
     /// Verifies this proof against the given commitment and the evaluation claims embedded in it.
     ///
-    /// Executes all decision-phase checks from Construction 5.1 (§5, page 32) and the
-    /// multi-constraint batching from Construction 5.5 (§5.2, page 40):
-    ///
-    /// 1. Initial sumcheck claim and sub-round consistency (decision step 1).
-    /// 2. Per-round sumcheck claim (step 2c) and consistency (step 2d), using Merkle-proof fold
-    ///    evaluations for the shift queries (step 2b).
-    /// 3. Final fold-consistency check: f̂_M(**r**_l^fin) = g_{M-1}(r_l^fin) (step 3a).
-    /// 4. Weight constraint check: ∑_b ŵ_{M-1}(f̂_M(b), **α**_{M-1}, b) = ĥ_{M-1,k}(α_{M-1,k}) (step 3c).
+    /// Implements all decision-phase checks from Construction 5.1 (§5, page 32) and the
+    /// multi-constraint batching from Construction 5.5 (§5.2, page 40).
     pub fn verify(&self, commitment: &Commitment) -> Result<()> {
         // ── Parameters ───────────────────────────────────────────────────────────────
         let poly_tree_root = commitment.poly_tree_root;
-        let m0 = commitment.degree_bound.trailing_zeros() as usize; // log₂(degree bound)
-        let n0 = commitment.degree_bound << commitment.blowup_log2; // |ℒ₀|
+        let m0 = commitment.degree_bound.trailing_zeros() as usize;
+        let n0 = commitment.degree_bound << commitment.blowup_log2;
 
         if self.sumcheck_polys.is_empty() {
             return Err(anyhow!("empty sumcheck_polys"));
         }
-        let k = self.sumcheck_polys[0].len(); // folding parameter
+        let k = self.sumcheck_polys[0].len();
         if k == 0 {
             return Err(anyhow!("zero folding parameter"));
         }
-        // M = total WHIR rounds (1 initial + M-1 main loop).
         let big_m = self.fold_roots.len() + 1;
-        let m_final = m0.saturating_sub(k * big_m); // remaining vars in f̂_M (= 0 when k|m₀)
+        let m_final = m0.saturating_sub(k * big_m);
 
         // Structural length checks.
         if self.sumcheck_polys.len() != big_m {
@@ -384,7 +656,10 @@ impl<H: Hash<Scalar>> Proof<H> {
         }
         for (i, round) in self.sumcheck_polys.iter().enumerate() {
             if round.len() != k {
-                return Err(anyhow!("sumcheck_polys[{i}] length: got {}, want {k}", round.len()));
+                return Err(anyhow!(
+                    "sumcheck_polys[{i}] length: got {}, want {k}",
+                    round.len()
+                ));
             }
         }
         if self.ood_answers.len() != big_m - 1 {
@@ -410,18 +685,14 @@ impl<H: Hash<Scalar>> Proof<H> {
         }
 
         // ── Fiat-Shamir: initial challenges ──────────────────────────────────────────
-        // γ (per-polynomial RLC challenge) — Construction 5.5, step "combination randomness"
-        // applied at the oracle-commitment level.
         let gamma = H::hash_many(&[*RLC_DST, poly_tree_root]);
 
-        // Combined per-point claims: combined_claims[j] = (z_j, Σ_i γⁱ · points[z_j][i]).
         let combined_claims: Vec<(Scalar, Scalar)> = self
             .points
             .iter()
             .map(|(z, vals)| (*z, rlc(vals, gamma)))
             .collect();
 
-        // η (multi-constraint batching challenge for the initial eval constraints).
         let mut state = {
             let mut inputs = vec![
                 *EVAL_COMBO_DST,
@@ -435,12 +706,13 @@ impl<H: Hash<Scalar>> Proof<H> {
             H::hash_many(&inputs)
         };
 
-        // σ₀ = Σ_j η^j · combined_claims[j].1  (Construction 5.5: combined target).
-        let eta = state; // saved for the weight-constraint computation at the end
-        let sigma0 = rlc(&combined_claims.iter().map(|(_, v)| *v).collect::<Vec<_>>(), eta);
+        let eta = state;
+        let sigma0 = rlc(
+            &combined_claims.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
+            eta,
+        );
 
         // ── Round 0: initial sumcheck (decision step 1) ──────────────────────────────
-        // (a) Σ_{b∈{0,1}} ĥ_{0,1}(b) = σ₀.
         if poly_sum(self.sumcheck_polys[0][0]) != sigma0 {
             return Err(anyhow!("initial sumcheck claim mismatch"));
         }
@@ -453,10 +725,7 @@ impl<H: Hash<Scalar>> Proof<H> {
                 let alpha = H::hash_many(&[*SC_ALPHA_DST, state, h[0], h[1], h[2]]);
                 state = alpha;
                 round0_alphas.push(alpha);
-                // (b) Σ_b ĥ_{0,ℓ}(b) = ĥ_{0,ℓ-1}(α_{0,ℓ-1}).
-                if l + 1 < k
-                    && poly_sum(self.sumcheck_polys[0][l + 1]) != poly_eval(h, alpha)
-                {
+                if l + 1 < k && poly_sum(self.sumcheck_polys[0][l + 1]) != poly_eval(h, alpha) {
                     return Err(anyhow!(
                         "sumcheck consistency failed in round 0 sub-round {}",
                         l + 1
@@ -465,23 +734,26 @@ impl<H: Hash<Scalar>> Proof<H> {
             }
             all_alphas.push(round0_alphas);
         }
-        let mut prev_sc_last =
-            poly_eval(self.sumcheck_polys[0][k - 1], all_alphas[0][k - 1]);
+        let mut prev_sc_last = poly_eval(self.sumcheck_polys[0][k - 1], all_alphas[0][k - 1]);
 
         // Saved data for the weight-constraint check at the end.
         let mut ood_field_elems: Vec<Scalar> = Vec::with_capacity(big_m - 1);
         let mut shift_q_per_round: Vec<Vec<usize>> = Vec::with_capacity(big_m - 1);
         let mut gamma_per_round: Vec<Scalar> = Vec::with_capacity(big_m - 1);
 
-        // ── Main loop (rounds i = 1, …, M-1) ─────────────────────────────────────────
+        // ── Main loop (rounds i = 1, …, M-1) ─────────────────────────────────────────────
         for i in 1..big_m {
             let fold_root = self.fold_roots[i - 1];
-            let prev_domain_size = n0 >> (k * (i - 1)); // |ℒᵢ₋₁|
-            let curr_domain_size = n0 >> (k * i); // |ℒᵢ|
-            let prev_oracle_root = if i == 1 { poly_tree_root } else { self.fold_roots[i - 2] };
+            let prev_domain_size = n0 >> (k * (i - 1));
+            let curr_domain_size = n0 >> (k * i);
+            let prev_oracle_root = if i == 1 {
+                poly_tree_root
+            } else {
+                self.fold_roots[i - 2]
+            };
             let is_initial = i == 1;
 
-            // Absorb fᵢ root → derive OOD sample z_{i,0} ∈ 𝔽.
+            // Absorb fᵢ root → OOD sample z_{i,0}.
             state = H::hash_many(&[*OOD_DST, state, fold_root]);
             let z_ood_raw = state;
             ood_field_elems.push(z_ood_raw);
@@ -490,21 +762,17 @@ impl<H: Hash<Scalar>> Proof<H> {
             let y_i0 = self.ood_answers[i - 1];
             state = H::hash_many(&[*OOD_DST, state, y_i0]);
 
-            // Derive shift query indices in ℒᵢ (size curr_domain_size).
+            // Derive shift query indices in ℒᵢ.
             let t = self.oracle_query_proofs[i - 1].len();
             let q_mod = U256::from(curr_domain_size as u64);
             let shift_indices: Vec<usize> = (0..t)
                 .map(|j| {
-                    let h = H::hash_many(&[
-                        *SHIFT_DST,
-                        state,
-                        Scalar::from(j as u64),
-                    ]);
+                    let h = H::hash_many(&[*SHIFT_DST, state, Scalar::from(j as u64)]);
                     (h.to_u256() % q_mod).low_u64() as usize
                 })
                 .collect();
 
-            // Derive γᵢ (combination challenge for this round).
+            // Derive γᵢ.
             let gamma_i = H::hash_many(&[*COMBO_DST, state, Scalar::from(t as u64)]);
             state = gamma_i;
             gamma_per_round.push(gamma_i);
@@ -548,9 +816,7 @@ impl<H: Hash<Scalar>> Proof<H> {
                 let alpha = H::hash_many(&[*SC_ALPHA_DST, state, h[0], h[1], h[2]]);
                 state = alpha;
                 round_alphas.push(alpha);
-                if l + 1 < k
-                    && poly_sum(self.sumcheck_polys[i][l + 1]) != poly_eval(h, alpha)
-                {
+                if l + 1 < k && poly_sum(self.sumcheck_polys[i][l + 1]) != poly_eval(h, alpha) {
                     return Err(anyhow!(
                         "sumcheck consistency failed in round {i} sub-round {}",
                         l + 1
@@ -563,20 +829,15 @@ impl<H: Hash<Scalar>> Proof<H> {
 
         // ── Final polynomial checks (decision step 3) ─────────────────────────────────
         let last_oracle_root = self.fold_roots.last().copied().unwrap_or(poly_tree_root);
-        // ℒ_{M-1} has size n0 >> (k*(M-1)).
         let last_domain_size = n0 >> (k * (big_m - 1));
-        // Final query domain ℒ_{M-1}^{(2^k)} has size last_domain_size >> k.
         let final_q_domain_size = last_domain_size >> k;
         let final_q_mod = U256::from(final_q_domain_size as u64);
 
         for l in 0..self.final_query_proofs.len() {
-            // Derive r_l^fin index in the final query domain.
-            let r_hash =
-                H::hash_many(&[*FINAL_DST, state, Scalar::from(l as u64)]);
+            let r_hash = H::hash_many(&[*FINAL_DST, state, Scalar::from(l as u64)]);
             let r_idx = (r_hash.to_u256() % final_q_mod).low_u64() as usize;
 
             // Compute g_{M-1}(r_l^fin) via fold on f_{M-1}.
-            // When big_m == 1 the final oracle is the initial per-poly tree (vector leaves).
             let g_val = compute_fold::<H>(
                 &self.final_query_proofs[l],
                 r_idx,
@@ -588,7 +849,7 @@ impl<H: Hash<Scalar>> Proof<H> {
             )?;
 
             // Decision step 3a: f̂_M(pow(r_raw, m_M)) = g_{M-1}(r_raw).
-            let r_raw = Polynomial::coset_element2(r_idx, final_q_domain_size);
+            let r_raw = Polynomial::domain_element2(r_idx, final_q_domain_size);
             let r_vec = pow_seg(r_raw, 0, m_final);
             let f_m_val = multilinear_eval(&self.final_poly, &r_vec);
             if f_m_val != g_val {
@@ -597,21 +858,12 @@ impl<H: Hash<Scalar>> Proof<H> {
         }
 
         // ── Weight constraint (decision step 3c) ──────────────────────────────────────
-        // Σ_{b∈{0,1}^{m_M}} ŵ_{M-1}(f̂_M(b), **α**_{M-1}, b) = prev_sc_last.
-        //
-        // Expands to: Σ_{contribution} const_factor · f̂_M(eval_point) = prev_sc_last,
-        // where each contribution is from an initial eval constraint or an OOD/shift-query
-        // constraint accumulated into ŵ.  The eval_point is the last m_M components of
-        // the corresponding pow(·) vector; the const_factor encodes all fixed eq factors
-        // from substituting the accumulated fold challenges.
         let weight_sum = {
             let mut sum = Scalar::ZERO;
 
             // Initial eval constraints: one per eval point z.
             for (j, &(z, _)) in combined_claims.iter().enumerate() {
-                // eq_prod covers all M rounds (alphas[0..M]).
                 let const_z = eta.pow_small(j) * eq_prod(z, big_m, k, &all_alphas);
-                // pow(z, m₀)[k·M ..] = pow_seg(z, k·M, m_M).
                 let eval_pt = pow_seg(z, k * big_m, m_final);
                 sum += const_z * multilinear_eval(&self.final_poly, &eval_pt);
             }
@@ -620,11 +872,10 @@ impl<H: Hash<Scalar>> Proof<H> {
             for i in 1..big_m {
                 let gamma_i = gamma_per_round[i - 1];
                 let curr_domain_size = n0 >> (k * i);
-                // Number of rounds' worth of eq factors still to be applied: big_m - i.
                 let remaining = big_m - i;
                 let alphas_from_i = &all_alphas[i..];
 
-                // j = 0: OOD sample z_{i,0} with coefficient γᵢ^1.
+                // OOD sample z_{i,0} with coefficient γᵢ^1.
                 {
                     let z_ood = ood_field_elems[i - 1];
                     let const_i0 = gamma_i * eq_prod(z_ood, remaining, k, alphas_from_i);
@@ -632,10 +883,10 @@ impl<H: Hash<Scalar>> Proof<H> {
                     sum += const_i0 * multilinear_eval(&self.final_poly, &eval_pt);
                 }
 
-                // j = 1,…,t: shift queries with coefficient γᵢ^{j+1} (1-indexed j).
-                let mut gamma_pow = gamma_i * gamma_i; // γᵢ^2 for j=1
+                // Shift queries with coefficient γᵢ^{j+2}.
+                let mut gamma_pow = gamma_i * gamma_i;
                 for &q in &shift_q_per_round[i - 1] {
-                    let z_shift = Polynomial::coset_element2(q, curr_domain_size);
+                    let z_shift = Polynomial::domain_element2(q, curr_domain_size);
                     let const_ij = gamma_pow * eq_prod(z_shift, remaining, k, alphas_from_i);
                     let eval_pt = pow_seg(z_shift, k * remaining, m_final);
                     sum += const_ij * multilinear_eval(&self.final_poly, &eval_pt);
@@ -657,6 +908,119 @@ impl<H: Hash<Scalar>> Proof<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hash;
 
-    // TODO
+    type Sha2Hash = hash::Sha2Hash<Scalar>;
+    type Poseidon2Hash = hash::Poseidon2Hash<Scalar>;
+
+    const fn from_const(value: u64) -> Scalar {
+        Scalar::from_const(value)
+    }
+
+    fn test_open_impl<H: Hash<Scalar>>(
+        polynomials: Vec<Polynomial>,
+        points: &[u64],
+        k: usize,
+        blowup_log2: usize,
+    ) {
+        let eval_points: BTreeMap<Scalar, Vec<Scalar>> = points
+            .iter()
+            .map(|&z| {
+                let z_scalar = Scalar::from(z);
+                let vals = polynomials
+                    .iter()
+                    .map(|p| p.evaluate(z_scalar))
+                    .collect::<Vec<_>>();
+                (z_scalar, vals)
+            })
+            .collect();
+
+        let prover = Prover::<H>::new(polynomials, blowup_log2, k);
+        let commitment = prover.commit();
+        let proof = prover.open(eval_points);
+        assert!(proof.verify(&commitment).is_ok());
+    }
+
+    fn test_open(polynomials: Vec<Polynomial>, points: &[u64], k: usize) {
+        test_open_impl::<Sha2Hash>(polynomials.clone(), points, k, 1);
+        test_open_impl::<Poseidon2Hash>(polynomials.clone(), points, k, 1);
+        test_open_impl::<Sha2Hash>(polynomials.clone(), points, k, 2);
+        test_open_impl::<Poseidon2Hash>(polynomials, points, k, 2);
+    }
+
+    #[test]
+    fn test_one_polynomial_degree_one_one_point() {
+        test_open(
+            vec![Polynomial::with_coefficients(vec![
+                from_const(12),
+                from_const(34),
+            ])],
+            &[123],
+            1,
+        );
+    }
+
+    #[test]
+    fn test_one_polynomial_degree_three_one_point() {
+        test_open(
+            vec![Polynomial::with_coefficients(vec![
+                from_const(12),
+                from_const(34),
+                from_const(56),
+                from_const(78),
+            ])],
+            &[123],
+            1,
+        );
+    }
+
+    #[test]
+    fn test_one_polynomial_degree_three_two_points() {
+        test_open(
+            vec![Polynomial::with_coefficients(vec![
+                from_const(12),
+                from_const(34),
+                from_const(56),
+                from_const(78),
+            ])],
+            &[123, 456],
+            1,
+        );
+    }
+
+    #[test]
+    fn test_two_polynomials_degree_three_one_point() {
+        test_open(
+            vec![
+                Polynomial::with_coefficients(vec![
+                    from_const(12),
+                    from_const(34),
+                    from_const(56),
+                    from_const(78),
+                ]),
+                Polynomial::with_coefficients(vec![
+                    from_const(42),
+                    from_const(43),
+                    from_const(44),
+                    from_const(45),
+                ]),
+            ],
+            &[123],
+            1,
+        );
+    }
+
+    #[test]
+    fn test_one_polynomial_degree_three_one_point_k2() {
+        test_open(
+            vec![Polynomial::with_coefficients(vec![
+                from_const(12),
+                from_const(34),
+                from_const(56),
+                from_const(78),
+            ])],
+            &[123],
+            2,
+        );
+    }
 }
