@@ -181,7 +181,7 @@ impl<H: Hash<Scalar>> Committer<H> {
         let index = self.trees.len();
 
         self.polynomials.extend(polynomials);
-        self.trees.push(Tree::<H>::new2(evaluations));
+        self.trees.push(Tree::<H>::new(evaluations));
 
         index
     }
