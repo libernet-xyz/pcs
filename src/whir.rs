@@ -58,7 +58,7 @@ struct LeafProof<H: Hash<Scalar>> {
 
 impl<H: Hash<Scalar>> LeafProof<H> {
     /// Returns the leaf value.
-    fn leaf(&self) -> Scalar {
+    fn value(&self) -> Scalar {
         self.value
     }
 

@@ -2,7 +2,7 @@ use crate::hash::Hash;
 use crate::utils;
 use anyhow::{Result, anyhow};
 use starkom_bluesky::Scalar;
-use starkom_ff::{Field, PrimeField};
+use starkom_ff::Field;
 use std::marker::PhantomData;
 use std::sync::LazyLock;
 
@@ -11,9 +11,6 @@ static LEAF_DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"sta
 
 /// Domain separator tag used in (internal) Merkle tree hashes.
 static TREE_DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"starkom/fri/tree"));
-
-/// Domain separator tag used when deriving the Fiat-Shamir challenge for FRI folding.
-static FOLD_DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"starkom/fri/fold"));
 
 /// Hashes a leaf of a Merkle tree.
 fn hash_leaf<H: Hash<Scalar>>(values: &[Scalar]) -> Scalar {
@@ -215,11 +212,19 @@ impl<H: Hash<Scalar>> Tree<H> {
         self.hashes[(n - 1) * 2]
     }
 
-    /// Returns a reference to the i-th leaf.
+    /// Returns a vector representing the i-th leaf.
     ///
     /// Note that the leaf contains k elements, one for every committed polynomial.
     pub(crate) fn leaf(&self, index: usize) -> Vec<Scalar> {
         self.leaves.iter().map(|values| values[index]).collect()
+    }
+
+    /// Returns the value at a given leaf for a specific polynomial.
+    ///
+    /// `polynomial_index` must be less than [`Self::num_polys()`] and `leaf_index` must be less
+    /// than [`Self::num_leaves()`].
+    pub(crate) fn leaf_value(&self, polynomial_index: usize, leaf_index: usize) -> Scalar {
+        self.leaves[polynomial_index][leaf_index]
     }
 
     /// Returns a Merkle proof for the leaf at `index`.
@@ -241,50 +246,6 @@ impl<H: Hash<Scalar>> Tree<H> {
             path,
             _data: Default::default(),
         }
-    }
-
-    /// Performs one FRI folding round, returning the new folded tree.
-    pub(crate) fn fold(&self) -> Self {
-        let num_polys = self.num_polys();
-        let n = self.num_leaves();
-        assert!(n.is_power_of_two());
-
-        let alpha = H::hash_two(*FOLD_DST, self.hashes[(n - 1) * 2], Scalar::ZERO);
-
-        let k = n.trailing_zeros() as usize;
-        let omega_inv = Scalar::ROOT_OF_UNITY_INV.pow_u64(1u64 << (Scalar::S - k));
-
-        let m = n / 2;
-        let mut omega_inv_i = Scalar::ONE;
-
-        let mut leaves = vec![vec![Scalar::ZERO; m]; num_polys];
-        for i in 0..m {
-            for j in 0..num_polys {
-                let pos = self.leaves[j][i];
-                let neg = self.leaves[j][i + m];
-                leaves[j][i] = (pos + neg + alpha * omega_inv_i * (pos - neg)) * Scalar::TWO_INV;
-            }
-            omega_inv_i *= omega_inv;
-        }
-
-        Self::new(leaves)
-    }
-
-    /// Performs `times` FRI folding and returns an array of `times+1` trees.
-    ///
-    /// The first element is `self` (N leaves), the second element is the tree from the first
-    /// folding round (N/2 leaves), the third element is the tree from the second folding round (N/4
-    /// leaves), and so on.
-    pub(crate) fn fold_all(self, times: usize) -> Vec<Self> {
-        let mut trees = Vec::with_capacity(times + 1);
-        let mut tree = self;
-        for _ in 0..times {
-            let folded = tree.fold();
-            trees.push(tree);
-            tree = folded;
-        }
-        trees.push(tree);
-        trees
     }
 }
 
@@ -410,6 +371,9 @@ mod tests {
                     .zip(evaluations.iter())
                     .all(|(&lhs, values)| lhs == values[i])
             );
+            for j in 0..k {
+                assert_eq!(tree.leaf_value(j, i), evaluations[j][i]);
+            }
         }
     }
 

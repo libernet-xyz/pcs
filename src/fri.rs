@@ -13,6 +13,58 @@ type Polynomial = starkom_poly::Polynomial<Scalar>;
 /// Domain separator tag used when deriving the Fiat-Shamir challenge for FRI folding.
 static FOLD_DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"starkom/fri/fold"));
 
+trait FoldableTree<H: Hash<Scalar>> {
+    /// Performs one FRI folding round, returning the new folded tree.
+    fn fold(&self) -> Self;
+
+    /// Performs `times` FRI folding and returns an array of `times+1` trees.
+    ///
+    /// The first element is `self` (N leaves), the second element is the tree from the first
+    /// folding round (N/2 leaves), the third element is the tree from the second folding round (N/4
+    /// leaves), and so on.
+    fn fold_all(self, times: usize) -> Vec<Tree<H>>;
+}
+
+impl<H: Hash<Scalar>> FoldableTree<H> for Tree<H> {
+    fn fold(&self) -> Self {
+        let num_polys = self.num_polys();
+        let n = self.num_leaves();
+        assert!(n.is_power_of_two());
+
+        let alpha = H::hash_two(*FOLD_DST, self.root_hash(), Scalar::ZERO);
+
+        let k = n.trailing_zeros() as usize;
+        let omega_inv = Scalar::ROOT_OF_UNITY_INV.pow_u64(1u64 << (Scalar::S - k));
+
+        let m = n / 2;
+        let mut omega_inv_i = Scalar::ONE;
+
+        let mut leaves = vec![vec![Scalar::ZERO; m]; num_polys];
+        for i in 0..m {
+            for j in 0..num_polys {
+                let pos = self.leaf_value(j, i);
+                let neg = self.leaf_value(j, i + m);
+                leaves[j][i] = (pos + neg + alpha * omega_inv_i * (pos - neg)) * Scalar::TWO_INV;
+            }
+            omega_inv_i *= omega_inv;
+        }
+
+        Self::new(leaves)
+    }
+
+    fn fold_all(self, times: usize) -> Vec<Self> {
+        let mut trees = Vec::with_capacity(times + 1);
+        let mut tree = self;
+        for _ in 0..times {
+            let folded = tree.fold();
+            trees.push(tree);
+            tree = folded;
+        }
+        trees.push(tree);
+        trees
+    }
+}
+
 /// Stores the Merkle root hashes of a FRI commitment.
 ///
 /// Note that for low-degree testing these are *less* than log2(N), with N being the number of
