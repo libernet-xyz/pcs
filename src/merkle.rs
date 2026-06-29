@@ -7,10 +7,10 @@ use std::marker::PhantomData;
 use std::sync::LazyLock;
 
 /// Domain separator tag used when hashing the leaves of a Merkle tree.
-static LEAF_DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"starkom/fri/leaf"));
+static LEAF_DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"starkom/merkle/leaf"));
 
 /// Domain separator tag used in (internal) Merkle tree hashes.
-static TREE_DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"starkom/fri/tree"));
+static TREE_DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"starkom/merkle/tree"));
 
 /// Hashes a leaf of a Merkle tree.
 fn hash_leaf<H: Hash<Scalar>>(values: &[Scalar]) -> Scalar {
@@ -282,7 +282,7 @@ mod tests {
             vec![
                 Scalar::from_const(34),
                 Scalar::from_const(56),
-                parse_scalar("0x4e92e96500d26aa6e159670815c01b01c89f3385627027e52b20c3be995d9cb4")
+                parse_scalar("0x6e6dde7078fbd8bbe07b18f91969744bc05bdc2504f64852aadea8c59668bf53")
             ]
         );
     }
@@ -297,7 +297,7 @@ mod tests {
             vec![
                 Scalar::from_const(34),
                 Scalar::from_const(56),
-                parse_scalar("0x460d694c3fc49199a27c631df8a837d5b64566c40075981ff5cb0396cf52a80b")
+                parse_scalar("0x6782206898bfba528451982fe95febe270ed7dc81db9022c33aeddc7408f2cdb")
             ]
         );
     }
@@ -319,9 +319,9 @@ mod tests {
                 Scalar::from_const(90),
                 Scalar::from_const(12),
                 Scalar::from_const(34),
-                parse_scalar("0x4ba5bb5405a8d200b4c1b2fe1240daa6be892eb58048020e0a03f5fb6e009dec"),
-                parse_scalar("0x1f4cbe6657a61b9852cb8c219f5bf3a42d6404902560ef5dd14f91a414fff307"),
-                parse_scalar("0x58d1fe70cb37a8e745391c570e3cda9e0c24e74464fb5119a29d01f2b64af357"),
+                parse_scalar("0x776db780d4c0f6ebb3393eda47e5911aaf0b6481e7d5232c1b44838b9e1692f8"),
+                parse_scalar("0x0c00cbff7075ad00160f57ba02d191f026ec3d3f354c7d9c043336805485c165"),
+                parse_scalar("0x6cb75e80dcb30850d6f389363cf63808be902debda61ccc26881341ac295dff6"),
             ]
         );
     }
@@ -343,9 +343,9 @@ mod tests {
                 Scalar::from_const(90),
                 Scalar::from_const(12),
                 Scalar::from_const(34),
-                parse_scalar("0x09c10aba0c59772b51adb65ac6780471b94bf18f63aa121901fb3a428f171064"),
-                parse_scalar("0x2786758795737449218651c7a13e09e40159eb361293bbd7526c26a110f4b733"),
-                parse_scalar("0x183ba165b9bd525fddf2be1420f9087f9ebfbf0bedbdb9e3bf4ec7a785325b13"),
+                parse_scalar("0x13916a113574c17ef27178ff2ca9be81fc1f57a00a20ab9aee4241ccad7a876c"),
+                parse_scalar("0x707ccd49074554cf443b208ee43e7fd563e45488b075fef503504384bdfa542c"),
+                parse_scalar("0x612fce227318fc205d3b8b2954eb931d92c9e0bd78defcf162b5109f7e1a9722"),
             ]
         );
     }
@@ -381,11 +381,11 @@ mod tests {
     fn test_merkle_tree_one_leaf_1() {
         test_merkle_tree::<Sha2Hash>(
             vec![vec![Scalar::from_const(12)]],
-            parse_scalar("0x563171d1d29fc71a8e64c1996982ba9391b948c0f8e53c06f49dd50a935195bd"),
+            parse_scalar("0x71169269b911f4d1c8edbd4ba3e4107b1f1017f53d21a202c6d9865d4a95cdf6"),
         );
         test_merkle_tree::<Poseidon2Hash>(
             vec![vec![Scalar::from_const(12)]],
-            parse_scalar("0x2cdc51a32dac2ed86403822d494776d4512920a3790544b4be3ebf2cbde92171"),
+            parse_scalar("0x7e1fffed4d53ef893858a7345de37e9b366f6a52961fd9722f2104217758aa2a"),
         );
     }
 
@@ -393,11 +393,11 @@ mod tests {
     fn test_merkle_tree_one_leaf_2() {
         test_merkle_tree::<Sha2Hash>(
             vec![vec![Scalar::from_const(34)]],
-            parse_scalar("0x0a6461fb4b46a4cbf7855d0f8b2221b476c8fa54d510d03c5e0f1b7add3720d6"),
+            parse_scalar("0x7c4c892249a33dccdc42c2b7002a98c54420f272f63fa886192c94944aae3374"),
         );
         test_merkle_tree::<Poseidon2Hash>(
             vec![vec![Scalar::from_const(34)]],
-            parse_scalar("0x7bd38f78c7b116426eb1c3ce88929882f997ba95fd38128105171586b32a8db0"),
+            parse_scalar("0x1fa5228af05e75ef806f5772be53106e0d91f54950d60a4759421f77a0b39095"),
         );
     }
 
@@ -405,11 +405,11 @@ mod tests {
     fn test_merkle_tree_one_leaf_two_polynomials_1() {
         test_merkle_tree::<Sha2Hash>(
             vec![vec![Scalar::from_const(12)], vec![Scalar::from_const(34)]],
-            parse_scalar("0x12bca773e3d548e97bc3c09698887d8aa79a2a224741aca93ac1f748bf9d0a76"),
+            parse_scalar("0x2abfa190025b3afd41194aa282634e633b5ffed43d522fc2d87d269dd0eb60a8"),
         );
         test_merkle_tree::<Poseidon2Hash>(
             vec![vec![Scalar::from_const(12)], vec![Scalar::from_const(34)]],
-            parse_scalar("0x7266dbf17f81908d1abfcc37f1ac92cbdbbc0ddf8ed65dd8c56c6a7d4d6d23cf"),
+            parse_scalar("0x1c6b73bec8f42fe634f5f77d8741ace13ff5ff49105b4c3e69d54c55ddc56dc7"),
         );
     }
 
@@ -417,11 +417,11 @@ mod tests {
     fn test_merkle_tree_one_leaf_two_polynomials_2() {
         test_merkle_tree::<Sha2Hash>(
             vec![vec![Scalar::from_const(34)], vec![Scalar::from_const(12)]],
-            parse_scalar("0x54ee34331f32bd339abb4fc82eb2779e696b593bf4c186ca2e993eb0cd3711c3"),
+            parse_scalar("0x48147ad111986cc8bb753677fb9c9864db281bd55443ea93be2533e22b7d0112"),
         );
         test_merkle_tree::<Poseidon2Hash>(
             vec![vec![Scalar::from_const(34)], vec![Scalar::from_const(12)]],
-            parse_scalar("0x2b81b71d5988e82d27fb48f0b4b2c8f8ff3ba99751f2449997d840d7518dc11b"),
+            parse_scalar("0x62f2c10ac158f290a9178feec675a0cce5c8c9610c393f4bf17c7838760ebe19"),
         );
     }
 
@@ -433,7 +433,7 @@ mod tests {
                 vec![Scalar::from_const(34)],
                 vec![Scalar::from_const(56)],
             ],
-            parse_scalar("0x285ebc787db855722846ffd14565aa60215c39953648ea0555d493d6d998c634"),
+            parse_scalar("0x12ce7e1aefd29256e5dfb6c1dcfed5c959cf4346e64d3b4a9c90671fb3bf7e3f"),
         );
         test_merkle_tree::<Poseidon2Hash>(
             vec![
@@ -441,7 +441,7 @@ mod tests {
                 vec![Scalar::from_const(34)],
                 vec![Scalar::from_const(56)],
             ],
-            parse_scalar("0x0c3b7d987cb1e3d95e6e0f95fcc37f64ebe76006c7d060cc88d2f6e77ac8ee9c"),
+            parse_scalar("0x363f810134655fa478c1fbc55495b9b810f0a33ba3aa87b8d43ac6f1c3f2ed75"),
         );
     }
 
@@ -453,7 +453,7 @@ mod tests {
                 vec![Scalar::from_const(12)],
                 vec![Scalar::from_const(78)],
             ],
-            parse_scalar("0x54b1edfda64b33dacfd52f04514907c6692cceb22c85737851b192e1b6fc230e"),
+            parse_scalar("0x0d19f881e2cf998e3d1fc3095b741b2b2086833550530c4e394578c94eeae3f2"),
         );
         test_merkle_tree::<Poseidon2Hash>(
             vec![
@@ -461,7 +461,7 @@ mod tests {
                 vec![Scalar::from_const(12)],
                 vec![Scalar::from_const(78)],
             ],
-            parse_scalar("0x06e1ad1622dcc06212ca8b23ca3fd56cdc4d8b065d987412a9cb9fdf1d0e155d"),
+            parse_scalar("0x6906a253c3b386890be44e5fbd6c6b613e73c8960a04ef390f6fc6a584cfcaa1"),
         );
     }
 
@@ -469,11 +469,11 @@ mod tests {
     fn test_merkle_tree_two_leaves_1() {
         test_merkle_tree::<Sha2Hash>(
             vec![vec![Scalar::from_const(12), Scalar::from_const(34)]],
-            parse_scalar("0x20e65b4345db52cd8249ed9c1797f859c4f3dff7c5d9374eb4b89118cd39b643"),
+            parse_scalar("0x661f00deed4778c0f35e3b46a50a56d52cfc628534ab4bf7526fa2b7eb64fb2d"),
         );
         test_merkle_tree::<Poseidon2Hash>(
             vec![vec![Scalar::from_const(12), Scalar::from_const(34)]],
-            parse_scalar("0x2f0c2ee238a5c8f3f9380fa9cdd59d4c1774ef7659554bf37d2e40b1bfda0f3d"),
+            parse_scalar("0x76aafc5a8995c9d435039d454a33a488898f6ef0b2622ee5b003ec8c5aa3332b"),
         );
     }
 
@@ -481,11 +481,11 @@ mod tests {
     fn test_merkle_tree_two_leaves_2() {
         test_merkle_tree::<Sha2Hash>(
             vec![vec![Scalar::from_const(34), Scalar::from_const(56)]],
-            parse_scalar("0x1cc4e046101296f69bed2fc83482ce4056cd50d36b18cb4b08920225144bcaa6"),
+            parse_scalar("0x6299bd932dd8ada9a15540b13b5ce037d9ec4c015e4182fbc05a6e3d4242b621"),
         );
         test_merkle_tree::<Poseidon2Hash>(
             vec![vec![Scalar::from_const(34), Scalar::from_const(56)]],
-            parse_scalar("0x14ff951575b5892afaf39760090ee44f2de980a45528a69700570aa0321338ab"),
+            parse_scalar("0x39635888b223cf2fa7fd3584790e86e5380da23281f53710669cc72345d0a935"),
         );
     }
 
@@ -496,14 +496,14 @@ mod tests {
                 vec![Scalar::from_const(12), Scalar::from_const(56)],
                 vec![Scalar::from_const(34), Scalar::from_const(78)],
             ],
-            parse_scalar("0x65a2f27eccdf81249652273e3df595841ac0d7398b1a866fce9bd6fe3c891dbc"),
+            parse_scalar("0x38ff40459f948d6f52e0df0e1cb2f4e4216e21765339d0c2abece6dd86b4e606"),
         );
         test_merkle_tree::<Poseidon2Hash>(
             vec![
                 vec![Scalar::from_const(12), Scalar::from_const(56)],
                 vec![Scalar::from_const(34), Scalar::from_const(78)],
             ],
-            parse_scalar("0x3233da25a14a69d02937ebb8f7ca4831e1aa53a069c14bdbddb138d0488b3827"),
+            parse_scalar("0x5d494ed90f85da6cfef7581f8134f0bb454b423a69a1e5b79aa1dd077ef918f1"),
         );
     }
 
@@ -514,14 +514,14 @@ mod tests {
                 vec![Scalar::from_const(78), Scalar::from_const(34)],
                 vec![Scalar::from_const(56), Scalar::from_const(12)],
             ],
-            parse_scalar("0x40383f40f001699d6bec77a7ef72289ed6461d28659b94c1156d3d8cad226141"),
+            parse_scalar("0x7af2c224e5681096e6e26311a34657e10dcd6d0fb2343ceca285da0f5d445150"),
         );
         test_merkle_tree::<Poseidon2Hash>(
             vec![
                 vec![Scalar::from_const(78), Scalar::from_const(34)],
                 vec![Scalar::from_const(56), Scalar::from_const(12)],
             ],
-            parse_scalar("0x73b93dac865870e7515af085294a34ebf1bb2f1d86faf619013a9855df6caebb"),
+            parse_scalar("0x3f01eb2c0ebff44e6ab56b513563247916785675f145580bfae842ddbe01c2fa"),
         );
     }
 }
