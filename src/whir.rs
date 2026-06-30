@@ -274,10 +274,9 @@ pub struct Prover<H: Hash<Scalar>> {
     blowup_log2: usize,
     /// Number of fold2 steps per WHIR round (the sumcheck depth per round).
     k: usize,
-    /// Number of shift queries per round (tuned for 128-bit security).
+    /// Number of shift queries per round and final fold-consistency queries (tuned for 128-bit
+    /// security).
     t: usize,
-    /// Number of final fold-consistency queries.
-    num_final_queries: usize,
     /// Committed polynomials, padded to `degree_bound` coefficients.
     polynomials: Vec<Polynomial>,
     /// Per-polynomial Merkle tree over the evaluation domain {ω^j : j=0,…,n−1}.
@@ -285,16 +284,14 @@ pub struct Prover<H: Hash<Scalar>> {
 }
 
 impl<H: Hash<Scalar>> Prover<H> {
-    /// Commits to a batch of polynomials with folding parameter `k`.
+    /// Commits to a batch of polynomials.
     ///
     /// All polynomials are padded to the same degree bound and evaluated on the domain
     /// `{ωʲ : j = 0, …, n-1}` where `n = degree_bound << blowup_log2`.
     ///
-    /// Requires `degree_bound` (after padding) to be at least `2^k` so that at least one WHIR
-    /// round exists.
-    pub fn new(mut polynomials: Vec<Polynomial>, blowup_log2: usize, k: usize) -> Self {
-        assert!(k >= 1, "folding parameter k must be at least 1");
-
+    /// The folding depth `k` (sumcheck sub-rounds per WHIR round) follows the paper's recommended
+    /// value of 4 (§6.2), clamped down to `m₀ = log₂(degree_bound)` for small polynomials.
+    pub fn new(mut polynomials: Vec<Polynomial>, blowup_log2: usize) -> Self {
         let degree_bound = polynomials
             .iter_mut()
             .map(|polynomial| {
@@ -306,10 +303,9 @@ impl<H: Hash<Scalar>> Prover<H> {
             .next_power_of_two();
 
         let m0 = degree_bound.trailing_zeros() as usize;
-        assert!(
-            m0 >= k,
-            "degree bound must be at least 2^k for WHIR to have at least one round"
-        );
+        assert!(m0 >= 1, "polynomials must be non-constant for WHIR");
+
+        let k = 4usize.min(m0);
 
         polynomials = polynomials
             .into_iter()
@@ -322,16 +318,13 @@ impl<H: Hash<Scalar>> Prover<H> {
         let n = degree_bound << blowup_log2;
         let poly_tree = Tree::<H>::new(polynomials.iter().map(|p| p.clone().lde2(n)).collect());
 
-        // t and num_final_queries tuned for 128-bit security against proximity testing.
         let t = 128usize.div_ceil(blowup_log2);
-        let num_final_queries = t;
 
         Self {
             degree_bound,
             blowup_log2,
             k,
             t,
-            num_final_queries,
             polynomials,
             poly_tree,
         }
@@ -357,7 +350,6 @@ impl<H: Hash<Scalar>> Prover<H> {
     pub fn open(&self, points: BTreeMap<Scalar, Vec<Scalar>>) -> Proof<H> {
         let k = self.k;
         let t = self.t;
-        let num_final_queries = self.num_final_queries;
         let m0 = self.degree_bound.trailing_zeros() as usize;
         let n0 = self.degree_bound << self.blowup_log2;
         let big_m = m0 / k; // total WHIR rounds
@@ -560,9 +552,8 @@ impl<H: Hash<Scalar>> Prover<H> {
             &fold_trees[big_m - 2]
         };
 
-        let mut final_query_proofs: Vec<Vec<merkle::Proof<H>>> =
-            Vec::with_capacity(num_final_queries);
-        for l in 0..num_final_queries {
+        let mut final_query_proofs: Vec<Vec<merkle::Proof<H>>> = Vec::with_capacity(t);
+        for l in 0..t {
             let r_hash = H::hash_many(&[*FINAL_DST, state, Scalar::from(l as u64)]);
             let r_idx = (r_hash.to_u256() % final_q_mod).low_u64() as usize;
             let proofs: Vec<merkle::Proof<H>> = (0..(1usize << k))
@@ -920,7 +911,6 @@ mod tests {
     fn test_open_impl<H: Hash<Scalar>>(
         polynomials: Vec<Polynomial>,
         points: &[u64],
-        k: usize,
         blowup_log2: usize,
     ) {
         let eval_points: BTreeMap<Scalar, Vec<Scalar>> = points
@@ -935,17 +925,17 @@ mod tests {
             })
             .collect();
 
-        let prover = Prover::<H>::new(polynomials, blowup_log2, k);
+        let prover = Prover::<H>::new(polynomials, blowup_log2);
         let commitment = prover.commit();
         let proof = prover.open(eval_points);
         assert!(proof.verify(&commitment).is_ok());
     }
 
-    fn test_open(polynomials: Vec<Polynomial>, points: &[u64], k: usize) {
-        test_open_impl::<Sha2Hash>(polynomials.clone(), points, k, 1);
-        test_open_impl::<Poseidon2Hash>(polynomials.clone(), points, k, 1);
-        test_open_impl::<Sha2Hash>(polynomials.clone(), points, k, 2);
-        test_open_impl::<Poseidon2Hash>(polynomials, points, k, 2);
+    fn test_open(polynomials: Vec<Polynomial>, points: &[u64]) {
+        test_open_impl::<Sha2Hash>(polynomials.clone(), points, 1);
+        test_open_impl::<Poseidon2Hash>(polynomials.clone(), points, 1);
+        test_open_impl::<Sha2Hash>(polynomials.clone(), points, 2);
+        test_open_impl::<Poseidon2Hash>(polynomials, points, 2);
     }
 
     #[test]
@@ -956,7 +946,6 @@ mod tests {
                 from_const(34),
             ])],
             &[123],
-            1,
         );
     }
 
@@ -970,7 +959,6 @@ mod tests {
                 from_const(78),
             ])],
             &[123],
-            1,
         );
     }
 
@@ -984,7 +972,6 @@ mod tests {
                 from_const(78),
             ])],
             &[123, 456],
-            1,
         );
     }
 
@@ -1006,21 +993,6 @@ mod tests {
                 ]),
             ],
             &[123],
-            1,
-        );
-    }
-
-    #[test]
-    fn test_one_polynomial_degree_three_one_point_k2() {
-        test_open(
-            vec![Polynomial::with_coefficients(vec![
-                from_const(12),
-                from_const(34),
-                from_const(56),
-                from_const(78),
-            ])],
-            &[123],
-            2,
         );
     }
 }
