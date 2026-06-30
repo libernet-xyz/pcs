@@ -206,8 +206,17 @@ impl<H: Hash<Scalar>> Committer<H> {
             std::iter::once(*RLC_DST)
                 .chain(std::iter::once(Scalar::from(self.trees.len() as u64)))
                 .chain(self.trees.iter().map(|tree| tree.root_hash()))
+                .chain(std::iter::once(Scalar::from(self.polynomials.len() as u64)))
                 .chain(std::iter::once(Scalar::from(points.len() as u64)))
-                .chain(points.iter().cloned())
+                .chain(points.iter().flat_map(|&z| {
+                    std::iter::once(z)
+                        .chain(
+                            self.polynomials
+                                .iter()
+                                .map(|polynomial| polynomial.evaluate(z)),
+                        )
+                        .collect::<Vec<Scalar>>()
+                }))
                 .collect::<Vec<Scalar>>()
                 .as_slice(),
         );
@@ -340,8 +349,13 @@ impl<H: Hash<Scalar>> Proof<H> {
                     commitment.tree_roots().len() as u64
                 )))
                 .chain(commitment.tree_roots().iter().cloned())
+                .chain(std::iter::once(Scalar::from(self.num_polys as u64)))
                 .chain(std::iter::once(Scalar::from(self.points.len() as u64)))
-                .chain(self.points.keys().cloned())
+                .chain(
+                    self.points
+                        .iter()
+                        .flat_map(|(&z, values)| std::iter::once(z).chain(values.iter().cloned())),
+                )
                 .collect::<Vec<Scalar>>()
                 .as_slice(),
         );
