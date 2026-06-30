@@ -102,8 +102,10 @@ impl Commitment {
 
 #[derive(Debug, Clone)]
 pub struct Query<H: Hash<Scalar>> {
-    /// The number of committed evaluations.
-    n: usize,
+    /// The degree bound of the committed polynomials (always a power of 2).
+    degree_bound: usize,
+    /// The base-2 logarithm of the blowup factor.
+    blowup_log2: usize,
     /// The index of the element we're opening (the partner index is inferred automatically).
     index: usize,
     /// Proves a pair of "partner" values at each folding round with one [`LeafProof`] pair for
@@ -115,7 +117,8 @@ pub struct Query<H: Hash<Scalar>> {
 impl<H: Hash<Scalar>> Query<H> {
     /// Returns the two opened indices.
     pub fn indices(&self) -> (usize, usize) {
-        (self.index, (self.index + self.n / 2) % self.n)
+        let n = self.degree_bound << self.blowup_log2;
+        (self.index, (self.index + n / 2) % n)
     }
 
     /// Returns the opened domain element, that is the X-coordinate of the evaluation.
@@ -128,7 +131,7 @@ impl<H: Hash<Scalar>> Query<H> {
     /// `N = degree_bound * 2^blowup_factor`. The shift consists of multiplying the actual domain
     /// element by [`Scalar::MULTIPLICATIVE_GENERATOR`], consistently with `shift_domain`.
     pub fn x(&self) -> Scalar {
-        Polynomial::coset_element2(self.index, self.n)
+        Polynomial::coset_element2(self.index, self.degree_bound << self.blowup_log2)
     }
 
     /// Returns the opened evaluations, one for every committed polynomial.
@@ -155,21 +158,22 @@ impl<H: Hash<Scalar>> Query<H> {
     /// the expected degree bound. This function only verifies the opened value pair across the
     /// folding structure.
     pub fn verify(&self, commitment: &Commitment) -> Result<()> {
-        assert!(self.n.is_power_of_two());
-        assert!(self.index < self.n);
-        let k = self.n.trailing_zeros() as usize;
+        let mut n = self.degree_bound << self.blowup_log2;
+        assert!(n.is_power_of_two());
+        assert!(self.index < n);
+
+        let k = n.trailing_zeros() as usize;
 
         let folds = self.folds.as_slice();
 
         let num_folds = folds.len();
-        if num_folds > k as usize + 1 {
+        if num_folds > self.degree_bound.trailing_zeros() as usize + 1 {
             return Err(anyhow!("invalid proof size"));
         }
         if commitment.len() != num_folds {
             return Err(anyhow!("wrong number of folding rounds"));
         }
 
-        let mut m = self.n;
         let mut index = self.index;
         let mut pos = self.folds[0].0.leaf().to_vec();
         let mut step = Scalar::ROOT_OF_UNITY_INV.pow_u64(1u64 << (Scalar::S - k));
@@ -180,28 +184,28 @@ impl<H: Hash<Scalar>> Query<H> {
             let alpha = H::hash_two(*FOLD_DST, root_hash, Scalar::ZERO);
             let neg = right.leaf();
 
-            if 1usize << left.len() != m {
+            if 1usize << left.len() != n {
                 return Err(anyhow!(
                     "invalid left-hand side Merkle proof height (got {}, want {})",
                     left.len(),
-                    m.trailing_zeros()
+                    n.trailing_zeros()
                 ));
             }
-            if 1usize << right.len() != m {
+            if 1usize << right.len() != n {
                 return Err(anyhow!(
                     "invalid right-hand side Merkle proof height (got {}, want {})",
                     right.len(),
-                    m.trailing_zeros()
+                    n.trailing_zeros()
                 ));
             }
 
             left.check_leaf(pos.as_slice())?;
             left.verify(index, root_hash)?;
-            right.verify((index + m / 2) % m, root_hash)?;
+            right.verify((index + n / 2) % n, root_hash)?;
 
             let omega_inv_i = step.pow_small(index);
-            m /= 2;
-            index %= m;
+            n /= 2;
+            index %= n;
 
             for i in 0..pos.len() {
                 pos[i] =
@@ -302,16 +306,15 @@ impl<H: Hash<Scalar>> Prover<H> {
     /// NOTE: `index` is relative to the *inflated* evaluation domain, so for example if you
     /// committed to 4 evaluations with a blowup factor of 8 the range for `index` is [0, 32).
     pub fn query(&self, index: usize) -> Query<H> {
-        let n = self.degree_bound << self.blowup_log2;
+        let mut n = self.degree_bound << self.blowup_log2;
         assert!(index < n);
 
-        let mut m = n;
         let mut i = index;
         let mut folds = vec![];
         for tree in &self.trees {
-            folds.push((tree.query(i), tree.query((i + m / 2) % m)));
-            m /= 2;
-            i %= m;
+            folds.push((tree.query(i), tree.query((i + n / 2) % n)));
+            n /= 2;
+            i %= n;
         }
 
         {
@@ -321,7 +324,8 @@ impl<H: Hash<Scalar>> Prover<H> {
         }
 
         Query {
-            n,
+            degree_bound: self.degree_bound,
+            blowup_log2: self.blowup_log2,
             index,
             folds,
             _data: Default::default(),
