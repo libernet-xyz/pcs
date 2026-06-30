@@ -931,7 +931,7 @@ mod tests {
         assert!(proof.verify(&commitment).is_ok());
     }
 
-    fn test_prover(polynomials: Vec<Polynomial>, points: &[u64], _: usize) {
+    fn test_prover(polynomials: Vec<Polynomial>, points: &[u64]) {
         test_prover_impl::<Sha2Hash>(polynomials.clone(), points, 1);
         test_prover_impl::<Poseidon2Hash>(polynomials.clone(), points, 1);
         test_prover_impl::<Sha2Hash>(polynomials.clone(), points, 2);
@@ -946,7 +946,6 @@ mod tests {
                 from_const(34),
             ])],
             &[123],
-            2,
         );
     }
 
@@ -958,7 +957,6 @@ mod tests {
                 from_const(34),
             ])],
             &[321],
-            2,
         );
     }
 
@@ -970,7 +968,6 @@ mod tests {
                 from_const(56),
             ])],
             &[123],
-            2,
         );
     }
 
@@ -982,7 +979,6 @@ mod tests {
                 from_const(34),
             ])],
             &[123, 456],
-            2,
         );
     }
 
@@ -994,7 +990,66 @@ mod tests {
                 from_const(34),
             ])],
             &[789, 456, 123],
-            2,
+        );
+    }
+
+    #[test]
+    fn test_one_polynomial_degree_two_one_point_1() {
+        test_prover(
+            vec![Polynomial::with_coefficients(vec![
+                from_const(12),
+                from_const(34),
+                from_const(56),
+            ])],
+            &[123],
+        );
+    }
+
+    #[test]
+    fn test_one_polynomial_degree_two_one_point_2() {
+        test_prover(
+            vec![Polynomial::with_coefficients(vec![
+                from_const(12),
+                from_const(34),
+                from_const(56),
+            ])],
+            &[321],
+        );
+    }
+
+    #[test]
+    fn test_one_polynomial_degree_two_one_point_3() {
+        test_prover(
+            vec![Polynomial::with_coefficients(vec![
+                from_const(34),
+                from_const(56),
+                from_const(78),
+            ])],
+            &[123],
+        );
+    }
+
+    #[test]
+    fn test_one_polynomial_degree_two_two_points() {
+        test_prover(
+            vec![Polynomial::with_coefficients(vec![
+                from_const(12),
+                from_const(34),
+                from_const(56),
+            ])],
+            &[123, 456],
+        );
+    }
+
+    #[test]
+    fn test_one_polynomial_degree_two_three_points() {
+        test_prover(
+            vec![Polynomial::with_coefficients(vec![
+                from_const(12),
+                from_const(34),
+                from_const(56),
+            ])],
+            &[789, 456, 123],
         );
     }
 
@@ -1016,7 +1071,6 @@ mod tests {
                 ]),
             ],
             &[123],
-            4,
         );
     }
 
@@ -1038,7 +1092,6 @@ mod tests {
                 ]),
             ],
             &[321],
-            4,
         );
     }
 
@@ -1060,7 +1113,6 @@ mod tests {
                 ]),
             ],
             &[123],
-            4,
         );
     }
 
@@ -1082,7 +1134,6 @@ mod tests {
                 ]),
             ],
             &[123, 456],
-            4,
         );
     }
 
@@ -1104,7 +1155,6 @@ mod tests {
                 ]),
             ],
             &[789, 456, 123],
-            4,
         );
     }
 }
