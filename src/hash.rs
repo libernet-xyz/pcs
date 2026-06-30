@@ -10,9 +10,11 @@ use std::marker::PhantomData;
 /// This trait is used for both binary Merkle trees and Fiat-Shamir challenges.
 pub trait Hash<F: PrimeField> {
     /// Hashes two input scalars with a DST.
-    fn hash_raw(dst: F, input1: F, input2: F) -> F;
+    fn hash_two(dst: F, input1: F, input2: F) -> F;
 
     /// Hashes many input scalars.
+    ///
+    /// The caller is responsible for adding a DST as needed.
     fn hash_many(inputs: &[F]) -> F;
 }
 
@@ -47,7 +49,7 @@ impl Sha2Hash<Scalar> {
 }
 
 impl Hash<Scalar> for Sha2Hash<Scalar> {
-    fn hash_raw(dst: Scalar, input1: Scalar, input2: Scalar) -> Scalar {
+    fn hash_two(dst: Scalar, input1: Scalar, input2: Scalar) -> Scalar {
         let lo = Self::hash_internal([Scalar::ZERO, dst, input1, input2]);
         let hi = Self::hash_internal([Scalar::ONE, dst, input1, input2]);
         let mut bytes = [0u8; 64];
@@ -82,7 +84,7 @@ impl Poseidon2Hash<Scalar> {
 }
 
 impl Hash<Scalar> for Poseidon2Hash<Scalar> {
-    fn hash_raw(dst: Scalar, input1: Scalar, input2: Scalar) -> Scalar {
+    fn hash_two(dst: Scalar, input1: Scalar, input2: Scalar) -> Scalar {
         Self::hash_internal(&[dst, input1, input2])
     }
 
@@ -99,7 +101,7 @@ mod tests {
     #[test]
     fn test_sha2_hash_raw() {
         assert_eq!(
-            Sha2Hash::<Scalar>::hash_raw(
+            Sha2Hash::<Scalar>::hash_two(
                 Scalar::from_const(12),
                 Scalar::from_const(34),
                 Scalar::from_const(56)
@@ -107,7 +109,7 @@ mod tests {
             parse_scalar("0x6ba46ed6f29f6a4f8e1a9d8f93b51f5e902143d00356b65b867dde9cc879a8d1")
         );
         assert_eq!(
-            Sha2Hash::<Scalar>::hash_raw(
+            Sha2Hash::<Scalar>::hash_two(
                 Scalar::from_const(56),
                 Scalar::from_const(78),
                 Scalar::from_const(90)
@@ -161,7 +163,7 @@ mod tests {
     #[test]
     fn test_poseidon2_hash_raw() {
         assert_eq!(
-            Poseidon2Hash::<Scalar>::hash_raw(
+            Poseidon2Hash::<Scalar>::hash_two(
                 Scalar::from_const(12),
                 Scalar::from_const(34),
                 Scalar::from_const(56)
@@ -169,7 +171,7 @@ mod tests {
             parse_scalar("0x236092ebefc7e6565e0e75414d8fdce1ce2e19bb59002d36b794b9c3111bb9cd")
         );
         assert_eq!(
-            Poseidon2Hash::<Scalar>::hash_raw(
+            Poseidon2Hash::<Scalar>::hash_two(
                 Scalar::from_const(56),
                 Scalar::from_const(78),
                 Scalar::from_const(90)

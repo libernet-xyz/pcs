@@ -4,9 +4,9 @@ version = 4
 
 [[package]]
 name = "anyhow"
-version = "1.0.102"
+version = "1.0.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 
 [[package]]
 name = "arrayvec"
@@ -536,7 +536,7 @@ dependencies = [
 
 [[package]]
 name = "starkom-pcs"
-version = "1.2.0"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "primitive-types",
@@ -550,9 +550,9 @@ dependencies = [
 
 [[package]]
 name = "starkom-poly"
-version = "2.0.0"
+version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81e3daa5e8ac7bc6408829e40431856a88ba012678a32c4ec8478c2a8683b369"
+checksum = "3e58f806d686963de948236c868497ab205d7f6536a637547e672b5c203a4043"
 dependencies = [
  "anyhow",
  "starkom-bluesky",
