@@ -388,8 +388,8 @@ impl<H: Hash<Scalar>> Proof<H> {
             if quotients.len() != self.points.len() {
                 return Err(anyhow!(
                     "the number of evaluation claims doesn't match the number of FRI quotients (got {}, want {})",
-                    self.points.len(),
-                    quotients.len()
+                    quotients.len(),
+                    self.points.len()
                 ));
             }
 

@@ -88,7 +88,7 @@ impl Commitment {
 
     /// Returns the Merkle roots of all folding rounds.
     ///
-    /// The returned slice has `len()` elements.
+    /// The returned slice has [`Self::len()`] elements.
     pub fn roots(&self) -> &[Scalar] {
         self.roots.as_slice()
     }
@@ -106,8 +106,8 @@ pub struct Query<H: Hash<Scalar>> {
     n: usize,
     /// The index of the element we're opening (the partner index is inferred automatically).
     index: usize,
-    /// Proves a pair of "partner" values at each folding round with one `LeafProof` pair for every
-    /// round. The pair at `folds[0]` proves the opened values (stored in `values`).
+    /// Proves a pair of "partner" values at each folding round with one [`LeafProof`] pair for
+    /// every round. The pair at `folds[0]` proves the opened values.
     folds: Vec<(LeafProof<H>, LeafProof<H>)>,
     _data: PhantomData<H>,
 }
@@ -120,13 +120,13 @@ impl<H: Hash<Scalar>> Query<H> {
 
     /// Returns the opened domain element, that is the X-coordinate of the evaluation.
     ///
-    /// This is the element corresponding to the first value returned by `indices`, while the
-    /// partner element can be obtained by simply negating this one.
+    /// This is the element corresponding to the first value returned by [`Self::indices`], while
+    /// the partner element can be obtained by simply negating this one.
     ///
-    /// Note that we use `Polynomial::shifted_lde2` when committing polynomials, so the element
+    /// Note that we use [`Polynomial::shift_domain`] before committing polynomials, so the element
     /// returned here is a shifted power of an N-th root of unity, with
     /// `N = degree_bound * 2^blowup_factor`. The shift consists of multiplying the actual domain
-    /// element by `Scalar::MULTIPLICATIVE_GENERATOR`, consistently with `shifted_lde2`.
+    /// element by [`Scalar::MULTIPLICATIVE_GENERATOR`], consistently with `shift_domain`.
     pub fn x(&self) -> Scalar {
         Polynomial::coset_element2(self.index, self.n)
     }
@@ -134,25 +134,26 @@ impl<H: Hash<Scalar>> Query<H> {
     /// Returns the opened evaluations, one for every committed polynomial.
     ///
     /// The first component of the returned tuple contains the evaluations at the first index
-    /// returned by `indices`, while the second component contains those at the second index.
+    /// returned by [`Self::indices`], while the second component contains those at the second
+    /// index.
     pub fn values(&self) -> (&[Scalar], &[Scalar]) {
         (self.folds[0].0.leaf(), self.folds[0].1.leaf())
     }
 
     /// Returns the number of folding rounds.
     ///
-    /// In general these are log2(d), with `d` being the degree bound of the committed polynomial.
+    /// In general these are log2(d)+1, with `d` being the degree bound of the committed polynomial.
     /// Note that for low-degree testing `d` is strictly less than the number of committed
     /// evaluations `N`.
     pub fn len(&self) -> usize {
-        return self.folds.len();
+        self.folds.len()
     }
 
     /// Verifies this proof against the given commitment.
     ///
-    /// NOTE: for low-degree testing you also need to check that `len()` returns the log2 of the
-    /// expected degree bound. This function only verifies the opened value pair across the folding
-    /// structure.
+    /// NOTE: for low-degree testing you also need to check that [`Self::len`] returns the log2 of
+    /// the expected degree bound. This function only verifies the opened value pair across the
+    /// folding structure.
     pub fn verify(&self, commitment: &Commitment) -> Result<()> {
         assert!(self.n.is_power_of_two());
         assert!(self.index < self.n);
@@ -160,11 +161,11 @@ impl<H: Hash<Scalar>> Query<H> {
 
         let folds = self.folds.as_slice();
 
-        let h = folds.len();
-        if h > k as usize + 1 {
+        let num_folds = folds.len();
+        if num_folds > k as usize + 1 {
             return Err(anyhow!("invalid proof size"));
         }
-        if commitment.len() != h {
+        if commitment.len() != num_folds {
             return Err(anyhow!("wrong number of folding rounds"));
         }
 
@@ -173,9 +174,9 @@ impl<H: Hash<Scalar>> Query<H> {
         let mut pos = self.folds[0].0.leaf().to_vec();
         let mut step = Scalar::ROOT_OF_UNITY_INV.pow_u64(1u64 << (Scalar::S - k));
 
-        for r in 0..h {
-            let (left, right) = &folds[r];
-            let root_hash = commitment.roots()[r];
+        for round in 0..num_folds {
+            let (left, right) = &folds[round];
+            let root_hash = commitment.roots()[round];
             let alpha = H::hash_two(*FOLD_DST, root_hash, Scalar::ZERO);
             let neg = right.leaf();
 
@@ -277,14 +278,14 @@ impl<H: Hash<Scalar>> Prover<H> {
         self.degree_bound << self.blowup_log2
     }
 
-    /// Alias for `extended_domain_size`.
+    /// Alias for [`Self::extended_domain_size`].
     pub fn size(&self) -> usize {
         self.degree_bound << self.blowup_log2
     }
 
     /// Returns the Merkle root hash of the committed polynomials.
     ///
-    /// This is equivalent to the first root stored in the commiment returned by `commit()`.
+    /// This is equivalent to the first root stored in the commiment returned by [`Self::commit`].
     pub fn root_hash(&self) -> Scalar {
         self.trees[0].root_hash()
     }
@@ -296,14 +297,11 @@ impl<H: Hash<Scalar>> Prover<H> {
         }
     }
 
-    /// Builds a FRI `Query` for the value at the specified index of the evaluation domain.
+    /// Builds a FRI [`Query`] for the value at the specified index of the evaluation domain.
     ///
     /// NOTE: `index` is relative to the *inflated* evaluation domain, so for example if you
     /// committed to 4 evaluations with a blowup factor of 8 the range for `index` is [0, 32).
     pub fn query(&self, index: usize) -> Query<H> {
-        let d = self.degree_bound;
-        assert!(d.is_power_of_two());
-
         let n = self.degree_bound << self.blowup_log2;
         assert!(index < n);
 
