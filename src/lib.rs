@@ -9,5 +9,6 @@ mod utils;
 
 pub mod fri;
 pub mod hash;
+pub mod whir;
 
 pub use deep::*;
