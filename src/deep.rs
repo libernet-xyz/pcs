@@ -499,13 +499,10 @@ impl<H: Hash<Scalar>> Prover<H> {
 mod tests {
     use super::*;
     use crate::hash;
+    use starkom_bluesky::from_const;
 
     type Sha2Hash = hash::Sha2Hash<Scalar>;
     type Poseidon2Hash = hash::Poseidon2Hash<Scalar>;
-
-    const fn from_const(value: u64) -> Scalar {
-        Scalar::from_const(value)
-    }
 
     fn test_prover_impl<H: Hash<Scalar>>(
         polynomials: Vec<Polynomial>,
