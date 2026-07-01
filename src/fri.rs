@@ -337,6 +337,7 @@ impl<H: Hash<Scalar>> Prover<H> {
 mod tests {
     use super::*;
     use crate::hash;
+    use starkom_bluesky::from_const;
 
     type Poseidon2Hash = hash::Poseidon2Hash<Scalar>;
     type Sha2Hash = hash::Sha2Hash<Scalar>;
@@ -370,22 +371,16 @@ mod tests {
 
     #[test]
     fn test_one_constant_polynomial() {
-        test_prover(
-            vec![Polynomial::with_coefficients(vec![Scalar::from_const(12)])],
-            1,
-        );
-        test_prover(
-            vec![Polynomial::with_coefficients(vec![Scalar::from_const(34)])],
-            1,
-        );
+        test_prover(vec![Polynomial::with_coefficients(vec![from_const(12)])], 1);
+        test_prover(vec![Polynomial::with_coefficients(vec![from_const(34)])], 1);
     }
 
     #[test]
     fn test_two_constant_polynomials() {
         test_prover(
             vec![
-                Polynomial::with_coefficients(vec![Scalar::from_const(12)]),
-                Polynomial::with_coefficients(vec![Scalar::from_const(34)]),
+                Polynomial::with_coefficients(vec![from_const(12)]),
+                Polynomial::with_coefficients(vec![from_const(34)]),
             ],
             1,
         );
@@ -395,9 +390,9 @@ mod tests {
     fn test_three_constant_polynomials() {
         test_prover(
             vec![
-                Polynomial::with_coefficients(vec![Scalar::from_const(34)]),
-                Polynomial::with_coefficients(vec![Scalar::from_const(56)]),
-                Polynomial::with_coefficients(vec![Scalar::from_const(78)]),
+                Polynomial::with_coefficients(vec![from_const(34)]),
+                Polynomial::with_coefficients(vec![from_const(56)]),
+                Polynomial::with_coefficients(vec![from_const(78)]),
             ],
             1,
         );
@@ -407,15 +402,15 @@ mod tests {
     fn test_one_polynomial_degree_one() {
         test_prover(
             vec![Polynomial::with_coefficients(vec![
-                Scalar::from_const(12),
-                Scalar::from_const(34),
+                from_const(12),
+                from_const(34),
             ])],
             2,
         );
         test_prover(
             vec![Polynomial::with_coefficients(vec![
-                Scalar::from_const(56),
-                Scalar::from_const(78),
+                from_const(56),
+                from_const(78),
             ])],
             2,
         );
@@ -425,8 +420,8 @@ mod tests {
     fn test_two_polynomials_degree_one() {
         test_prover(
             vec![
-                Polynomial::with_coefficients(vec![Scalar::from_const(12), Scalar::from_const(34)]),
-                Polynomial::with_coefficients(vec![Scalar::from_const(56), Scalar::from_const(78)]),
+                Polynomial::with_coefficients(vec![from_const(12), from_const(34)]),
+                Polynomial::with_coefficients(vec![from_const(56), from_const(78)]),
             ],
             2,
         );
@@ -436,9 +431,9 @@ mod tests {
     fn test_three_polynomials_degree_one() {
         test_prover(
             vec![
-                Polynomial::with_coefficients(vec![Scalar::from_const(34), Scalar::from_const(56)]),
-                Polynomial::with_coefficients(vec![Scalar::from_const(56), Scalar::from_const(78)]),
-                Polynomial::with_coefficients(vec![Scalar::from_const(78), Scalar::from_const(90)]),
+                Polynomial::with_coefficients(vec![from_const(34), from_const(56)]),
+                Polynomial::with_coefficients(vec![from_const(56), from_const(78)]),
+                Polynomial::with_coefficients(vec![from_const(78), from_const(90)]),
             ],
             2,
         );
@@ -448,19 +443,19 @@ mod tests {
     fn test_one_polynomial_degree_three() {
         test_prover(
             vec![Polynomial::with_coefficients(vec![
-                Scalar::from_const(12),
-                Scalar::from_const(34),
-                Scalar::from_const(56),
-                Scalar::from_const(78),
+                from_const(12),
+                from_const(34),
+                from_const(56),
+                from_const(78),
             ])],
             4,
         );
         test_prover(
             vec![Polynomial::with_coefficients(vec![
-                Scalar::from_const(42),
-                Scalar::from_const(43),
-                Scalar::from_const(44),
-                Scalar::from_const(45),
+                from_const(42),
+                from_const(43),
+                from_const(44),
+                from_const(45),
             ])],
             4,
         );
@@ -471,16 +466,16 @@ mod tests {
         test_prover(
             vec![
                 Polynomial::with_coefficients(vec![
-                    Scalar::from_const(12),
-                    Scalar::from_const(34),
-                    Scalar::from_const(56),
-                    Scalar::from_const(78),
+                    from_const(12),
+                    from_const(34),
+                    from_const(56),
+                    from_const(78),
                 ]),
                 Polynomial::with_coefficients(vec![
-                    Scalar::from_const(42),
-                    Scalar::from_const(43),
-                    Scalar::from_const(44),
-                    Scalar::from_const(45),
+                    from_const(42),
+                    from_const(43),
+                    from_const(44),
+                    from_const(45),
                 ]),
             ],
             4,
@@ -492,22 +487,22 @@ mod tests {
         test_prover(
             vec![
                 Polynomial::with_coefficients(vec![
-                    Scalar::from_const(42),
-                    Scalar::from_const(43),
-                    Scalar::from_const(44),
-                    Scalar::from_const(45),
+                    from_const(42),
+                    from_const(43),
+                    from_const(44),
+                    from_const(45),
                 ]),
                 Polynomial::with_coefficients(vec![
-                    Scalar::from_const(12),
-                    Scalar::from_const(34),
-                    Scalar::from_const(56),
-                    Scalar::from_const(78),
+                    from_const(12),
+                    from_const(34),
+                    from_const(56),
+                    from_const(78),
                 ]),
                 Polynomial::with_coefficients(vec![
-                    Scalar::from_const(34),
-                    Scalar::from_const(56),
-                    Scalar::from_const(78),
-                    Scalar::from_const(90),
+                    from_const(34),
+                    from_const(56),
+                    from_const(78),
+                    from_const(90),
                 ]),
             ],
             4,

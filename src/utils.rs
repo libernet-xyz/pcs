@@ -13,21 +13,10 @@ pub(crate) fn hash_to_scalar<F: PrimeField256>(message: &[u8]) -> F {
 }
 
 #[cfg(test)]
-pub(crate) mod testing {
-    use starkom_bluesky::Scalar;
-
-    /// TEST ONLY: parses a BlueSky scalar, panicking if parsing fails.
-    pub(crate) fn parse_scalar(s: &'static str) -> Scalar {
-        s.parse().unwrap()
-    }
-}
-
-#[cfg(test)]
 mod tests {
-    use super::testing::parse_scalar;
     use super::*;
     use primitive_types::U256;
-    use starkom_bluesky::Scalar;
+    use starkom_bluesky::{Scalar, parse_scalar};
     use starkom_ff::{Field, bls12_381::Scalar as BlsScalar};
 
     fn parse_bls_scalar(s: &'static str) -> BlsScalar {
