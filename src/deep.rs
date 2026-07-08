@@ -8,6 +8,7 @@ use starkom_bluesky::Scalar;
 use starkom_ff::{Field, Field256, PrimeField};
 use starkom_poly;
 use std::collections::{BTreeMap, BTreeSet};
+use std::marker::PhantomData;
 use std::sync::LazyLock;
 
 /// Re-exported type alias for polynomials over BlueSky. The current implementation only works on
@@ -16,6 +17,10 @@ pub type Polynomial = starkom_poly::Polynomial<Scalar>;
 
 /// Target security level in bits.
 pub const LAMBDA: usize = 128;
+
+/// Domain separator tag used by [`Committer::transcript_hash`].
+static TRANSCRIPT_DST: LazyLock<Scalar> =
+    LazyLock::new(|| utils::hash_to_scalar(b"starkom/deep/transcript"));
 
 /// Domain separator tag for the Fiat-Shamir challenge used to derive query indices.
 static QUERY_DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"starkom/deep/query"));
@@ -44,27 +49,46 @@ fn rlc(values: &[Scalar], alpha: Scalar) -> Scalar {
 
 /// A batched DEEP-FRI polynomial commitment (see [`Committer`] for details).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Commitment {
+pub struct Commitment<H: Hash<Scalar>> {
     /// The root hashes of the Merkle trees where the evaluations of all batched polynomials are
     /// stored. There is one root hash per polynomial batch.
     tree_roots: Vec<Scalar>,
     /// The underlying FRI commitment.
     inner: fri::Commitment,
+    _data: PhantomData<H>,
 }
 
-impl Commitment {
+impl<H: Hash<Scalar>> Commitment<H> {
     /// Returns the root hashes of the Merkle trees where all batched polynomials are stored.
     pub fn tree_roots(&self) -> &[Scalar] {
         self.tree_roots.as_slice()
     }
 
+    /// Hashes the first `batch_count` [tree roots](`Self::tree_roots`).
+    ///
+    /// The returned hash is cryptographically bound to the full transcript up to the given
+    /// polynomial batch, and can be used by a verifier to recover Fiat-Shamir challenges.
+    ///
+    /// REQUIRES: `batch_count` must be strictly greater than 0 and less than or equal to the number
+    /// of tree roots.
+    ///
+    /// The hashes returned by this method are compatible with [`Committer::transcript_hash`], which
+    /// can be used on the prover side.
+    pub fn transcript_hash(&self, batch_count: usize) -> Scalar {
+        assert!(batch_count > 0);
+        assert!(batch_count <= self.tree_roots.len());
+        H::hash_many(
+            std::iter::once(*TRANSCRIPT_DST)
+                .chain(std::iter::once(Scalar::from(batch_count as u64)))
+                .chain(self.tree_roots.iter().copied())
+                .collect::<Vec<Scalar>>()
+                .as_slice(),
+        )
+    }
+
     /// Returns the FRI query indices derived via Fiat-Shamir from the full commitment transcript
     /// (all polynomial and FRI Merkle root hashes).
-    fn get_query_indices<H: Hash<Scalar>>(
-        &self,
-        degree_bound: usize,
-        blowup_log2: usize,
-    ) -> Vec<usize> {
+    fn get_query_indices(&self, degree_bound: usize, blowup_log2: usize) -> Vec<usize> {
         let n = U256::from((degree_bound << blowup_log2) as u64);
         let k = num_queries(blowup_log2);
         let mut indices = Vec::with_capacity(k);
@@ -151,6 +175,23 @@ impl<H: Hash<Scalar>> Committer<H> {
         self.trees[index].root_hash()
     }
 
+    /// Hashes the Merkle roots of all polynomial batches accumulated so far.
+    ///
+    /// The returned hash is cryptographically bound to the full transcript so far, and can be used
+    /// by the caller to generate Fiat-Shamir challenges.
+    ///
+    /// The hashes returned by this method are compatible with [`Commitment::transcript_hash`],
+    /// which can be used on the verifier side.
+    pub fn transcript_hash(&self) -> Scalar {
+        H::hash_many(
+            std::iter::once(*TRANSCRIPT_DST)
+                .chain(std::iter::once(Scalar::from(self.trees.len() as u64)))
+                .chain(self.trees.iter().map(|tree| tree.root_hash()))
+                .collect::<Vec<Scalar>>()
+                .as_slice(),
+        )
+    }
+
     /// Adds a batch of polynomials, returning the index of the newly created batch.
     ///
     /// The returned index can be used with the [`Self::root_hash`] method to get the Merkle root
@@ -190,7 +231,7 @@ impl<H: Hash<Scalar>> Committer<H> {
     /// `points` is the set of points to open in the [`Prover`]. The contained scalars are
     /// (off-domain) X-coordinates; the corresponding Y-coordinates will be computed automatically
     /// for every batched polynomial.
-    pub fn commit(self, points: BTreeSet<Scalar>) -> (Commitment, Prover<H>) {
+    pub fn commit(self, points: BTreeSet<Scalar>) -> (Commitment<H>, Prover<H>) {
         {
             let n = self.degree_bound << self.blowup_log2;
             let g = Scalar::MULTIPLICATIVE_GENERATOR.pow_small(n);
@@ -257,6 +298,7 @@ impl<H: Hash<Scalar>> Committer<H> {
         let commitment = Commitment {
             tree_roots: self.trees.iter().map(|tree| tree.root_hash()).collect(),
             inner: inner_prover.commit(),
+            _data: Default::default(),
         };
         let prover = Prover {
             degree_bound: self.degree_bound,
@@ -320,8 +362,8 @@ impl<H: Hash<Scalar>> Proof<H> {
     }
 
     /// Verifies this proof against the given commitment.
-    pub fn verify(&self, commitment: &Commitment) -> Result<()> {
-        let indices = commitment.get_query_indices::<H>(self.degree_bound, self.blowup_log2);
+    pub fn verify(&self, commitment: &Commitment<H>) -> Result<()> {
+        let indices = commitment.get_query_indices(self.degree_bound, self.blowup_log2);
         if self.openings.len() != indices.len() {
             return Err(anyhow!(
                 "incorrect number of openings (got {}, want {})",
@@ -474,8 +516,8 @@ impl<H: Hash<Scalar>> Prover<H> {
 
     /// Makes a DEEP-FRI proof opening the committed polynomials at the points specified at
     /// commitment time (see [`Committer::commit()`]).
-    pub fn prove(&self, commitment: &Commitment) -> Proof<H> {
-        let indices = commitment.get_query_indices::<H>(self.degree_bound, self.blowup_log2);
+    pub fn prove(&self, commitment: &Commitment<H>) -> Proof<H> {
+        let indices = commitment.get_query_indices(self.degree_bound, self.blowup_log2);
         let openings = indices
             .iter()
             .map(|&index| self.trees.iter().map(|tree| tree.query(index)).collect())
@@ -521,7 +563,9 @@ mod tests {
             )
         }));
         let committer = Committer::<H>::new(degree_bound, blowup_log2, polynomials);
+        let transcript_hash = committer.transcript_hash();
         let (commitment, prover) = committer.commit(points.iter().map(|(&z, _)| z).collect());
+        assert_eq!(commitment.transcript_hash(1), transcript_hash);
         assert_eq!(prover.degree_bound(), degree_bound);
         assert_eq!(prover.extended_domain_size(), degree_bound << blowup_log2);
         assert_eq!(prover.num_polys(), num_polys);

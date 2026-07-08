@@ -1,6 +1,6 @@
 [package]
 name = "starkom-pcs"
-version = "2.0.1"
+version = "3.0.0"
 description = "The DEEP-FRI polynomial commitment scheme used in Starkom."
 license = "Apache-2.0"
 repository = "https://github.com/libernet-xyz/pcs.git"
