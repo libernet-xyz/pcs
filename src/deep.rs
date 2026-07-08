@@ -557,8 +557,9 @@ mod tests {
         let points = BTreeMap::from_iter(points.iter().cloned().map(|z| {
             (
                 Scalar::from(z),
-                polynomial_batches[0]
+                polynomial_batches
                     .iter()
+                    .flatten()
                     .map(|polynomial| polynomial.evaluate(z.into()))
                     .collect::<Vec<Scalar>>(),
             )
@@ -581,7 +582,7 @@ mod tests {
         assert_eq!(prover.degree_bound(), degree_bound);
         assert_eq!(prover.extended_domain_size(), degree_bound << blowup_log2);
         assert_eq!(prover.num_polys(), num_polys);
-        assert_eq!(prover.num_trees(), 1);
+        assert_eq!(prover.num_trees(), num_batches);
         assert_eq!(*prover.points(), points);
         let proof = prover.prove(&commitment);
         assert_eq!(proof.degree_bound(), degree_bound);
@@ -812,6 +813,58 @@ mod tests {
                 ]),
             ]],
             &[789, 456, 123],
+            4,
+        );
+    }
+
+    #[test]
+    fn test_two_batches_one_and_one() {
+        test_prover(
+            vec![
+                vec![Polynomial::with_coefficients(vec![
+                    from_const(12),
+                    from_const(34),
+                    from_const(56),
+                    from_const(78),
+                ])],
+                vec![Polynomial::with_coefficients(vec![
+                    from_const(42),
+                    from_const(43),
+                    from_const(44),
+                    from_const(45),
+                ])],
+            ],
+            &[123, 456],
+            4,
+        );
+    }
+
+    #[test]
+    fn test_two_batches_two_and_one() {
+        test_prover(
+            vec![
+                vec![
+                    Polynomial::with_coefficients(vec![
+                        from_const(12),
+                        from_const(34),
+                        from_const(56),
+                        from_const(78),
+                    ]),
+                    Polynomial::with_coefficients(vec![
+                        from_const(90),
+                        from_const(78),
+                        from_const(56),
+                        from_const(34),
+                    ]),
+                ],
+                vec![Polynomial::with_coefficients(vec![
+                    from_const(42),
+                    from_const(43),
+                    from_const(44),
+                    from_const(45),
+                ])],
+            ],
+            &[456, 789],
             4,
         );
     }
