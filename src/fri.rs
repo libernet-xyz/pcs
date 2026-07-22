@@ -1,7 +1,8 @@
-use crate::hash::Hash;
+use crate::hash::HashBackend;
 use crate::merkle::{Proof as LeafProof, Tree};
 use crate::utils;
 use anyhow::{Result, anyhow};
+use primitive_types::H256;
 use starkom_bluesky::Scalar;
 use starkom_ff::{Field, PrimeField};
 use starkom_poly;
@@ -13,7 +14,7 @@ type Polynomial = starkom_poly::Polynomial<Scalar>;
 /// Domain separator tag used when deriving the Fiat-Shamir challenge for FRI folding.
 static FOLD_DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"starkom/fri/fold"));
 
-trait FoldableTree<H: Hash<Scalar>> {
+trait FoldableTree<H: HashBackend<Scalar>> {
     /// Performs one FRI folding round, returning the new folded tree.
     fn fold(&self) -> Self;
 
@@ -25,13 +26,13 @@ trait FoldableTree<H: Hash<Scalar>> {
     fn fold_all(self, times: usize) -> Vec<Tree<H>>;
 }
 
-impl<H: Hash<Scalar>> FoldableTree<H> for Tree<H> {
+impl<H: HashBackend<Scalar>> FoldableTree<H> for Tree<H> {
     fn fold(&self) -> Self {
         let num_polys = self.num_polys();
         let n = self.num_leaves();
         assert!(n.is_power_of_two());
 
-        let alpha = H::hash_two(*FOLD_DST, self.root_hash(), Scalar::ZERO);
+        let alpha = H::challenge(*FOLD_DST, [self.root_hash()]);
 
         let k = n.trailing_zeros() as usize;
         let omega_inv = Scalar::ROOT_OF_UNITY_INV.pow_u64(1u64 << (Scalar::S - k));
@@ -75,7 +76,7 @@ pub struct Commitment {
     /// The first element in the array is the root of the main Merkle tree, the second one is the
     /// root of the Merkle tree from the first folding round, and so on until the last element which
     /// is the value of the last folding round.
-    roots: Vec<Scalar>,
+    roots: Vec<H256>,
 }
 
 impl Commitment {
@@ -89,19 +90,19 @@ impl Commitment {
     /// Returns the Merkle roots of all folding rounds.
     ///
     /// The returned slice has [`Self::len()`] elements.
-    pub fn roots(&self) -> &[Scalar] {
+    pub fn roots(&self) -> &[H256] {
         self.roots.as_slice()
     }
 
     /// Returns the Merkle root hash of the committed polynomial, which is the first hash stored in
     /// the commitment.
-    pub fn root(&self) -> Scalar {
+    pub fn root(&self) -> H256 {
         *self.roots.first().unwrap()
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct Query<H: Hash<Scalar>> {
+pub struct Query<H: HashBackend<Scalar>> {
     /// The degree bound of the committed polynomials (always a power of 2).
     degree_bound: usize,
     /// The base-2 logarithm of the blowup factor.
@@ -114,7 +115,7 @@ pub struct Query<H: Hash<Scalar>> {
     _data: PhantomData<H>,
 }
 
-impl<H: Hash<Scalar>> Query<H> {
+impl<H: HashBackend<Scalar>> Query<H> {
     /// Returns the two opened indices.
     pub fn indices(&self) -> (usize, usize) {
         let n = self.degree_bound << self.blowup_log2;
@@ -181,7 +182,7 @@ impl<H: Hash<Scalar>> Query<H> {
         for round in 0..num_folds {
             let (left, right) = &folds[round];
             let root_hash = commitment.roots()[round];
-            let alpha = H::hash_two(*FOLD_DST, root_hash, Scalar::ZERO);
+            let alpha = H::challenge(*FOLD_DST, [root_hash]);
             let neg = right.leaf();
 
             if 1usize << left.len() != n {
@@ -230,7 +231,7 @@ impl<H: Hash<Scalar>> Query<H> {
 /// folded into constant ones. Note that the final Merkle tree still has more than one leaf due to
 /// the low-degree extension.
 #[derive(Debug, Clone)]
-pub struct Prover<H: Hash<Scalar>> {
+pub struct Prover<H: HashBackend<Scalar>> {
     /// The degree bound of the committed polynomials. This is the highest degree among the
     /// committed polynomials, plus one.
     degree_bound: usize,
@@ -242,7 +243,7 @@ pub struct Prover<H: Hash<Scalar>> {
     trees: Vec<Tree<H>>,
 }
 
-impl<H: Hash<Scalar>> Prover<H> {
+impl<H: HashBackend<Scalar>> Prover<H> {
     pub fn new(polynomials: Vec<Polynomial>, degree_bound: usize, blowup_log2: usize) -> Self {
         assert!(degree_bound.is_power_of_two());
         assert!(
@@ -290,7 +291,7 @@ impl<H: Hash<Scalar>> Prover<H> {
     /// Returns the Merkle root hash of the committed polynomials.
     ///
     /// This is equivalent to the first root stored in the commiment returned by [`Self::commit`].
-    pub fn root_hash(&self) -> Scalar {
+    pub fn root_hash(&self) -> H256 {
         self.trees[0].root_hash()
     }
 
@@ -342,7 +343,7 @@ mod tests {
     type Poseidon2Hash = hash::Poseidon2Hash<Scalar>;
     type Sha2Hash = hash::Sha2Hash<Scalar>;
 
-    fn test_prover_impl<H: Hash<Scalar>>(
+    fn test_prover_impl<H: HashBackend<Scalar>>(
         polynomials: Vec<Polynomial>,
         degree_bound: usize,
         blowup_log2: usize,

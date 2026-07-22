@@ -1,9 +1,9 @@
 use crate::fri;
-use crate::hash::Hash;
+use crate::hash::HashBackend;
 use crate::merkle::{Proof as LeafProof, Tree};
 use crate::utils;
 use anyhow::{Result, anyhow};
-use primitive_types::U256;
+use primitive_types::{H256, U256};
 use starkom_bluesky::Scalar;
 use starkom_ff::{Field, Field256, PrimeField};
 use starkom_poly;
@@ -49,18 +49,18 @@ fn rlc(values: &[Scalar], alpha: Scalar) -> Scalar {
 
 /// A batched DEEP-FRI polynomial commitment (see [`Committer`] for details).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Commitment<H: Hash<Scalar>> {
+pub struct Commitment<H: HashBackend<Scalar>> {
     /// The root hashes of the Merkle trees where the evaluations of all batched polynomials are
     /// stored. There is one root hash per polynomial batch.
-    tree_roots: Vec<Scalar>,
+    tree_roots: Vec<H256>,
     /// The underlying FRI commitment.
     inner: fri::Commitment,
     _data: PhantomData<H>,
 }
 
-impl<H: Hash<Scalar>> Commitment<H> {
+impl<H: HashBackend<Scalar>> Commitment<H> {
     /// Returns the root hashes of the Merkle trees where all batched polynomials are stored.
-    pub fn tree_roots(&self) -> &[Scalar] {
+    pub fn tree_roots(&self) -> &[H256] {
         self.tree_roots.as_slice()
     }
 
@@ -74,15 +74,15 @@ impl<H: Hash<Scalar>> Commitment<H> {
     ///
     /// The hashes returned by this method are compatible with [`Committer::transcript_hash`], which
     /// can be used on the prover side.
-    pub fn transcript_hash(&self, batch_count: usize) -> Scalar {
+    pub fn transcript_hash(&self, batch_count: usize) -> H256 {
         assert!(batch_count > 0);
         assert!(batch_count <= self.tree_roots.len());
         H::hash_many(
-            std::iter::once(*TRANSCRIPT_DST)
-                .chain(std::iter::once(Scalar::from(batch_count as u64)))
-                .chain(self.tree_roots[..batch_count].iter().copied())
-                .collect::<Vec<Scalar>>()
-                .as_slice(),
+            std::iter::once(H::encode_value(*TRANSCRIPT_DST))
+                .chain(std::iter::once(H::encode_value(Scalar::from(
+                    batch_count as u64,
+                ))))
+                .chain(self.tree_roots[..batch_count].iter().copied()),
         )
     }
 
@@ -93,15 +93,15 @@ impl<H: Hash<Scalar>> Commitment<H> {
         let k = num_queries(blowup_log2);
         let mut indices = Vec::with_capacity(k);
         for i in 0..k {
-            let hash = H::hash_many(
-                std::iter::once(*QUERY_DST)
-                    .chain(std::iter::once(Scalar::from(self.tree_roots.len() as u64)))
-                    .chain(self.tree_roots.iter().cloned())
-                    .chain(std::iter::once(Scalar::from(self.inner.len() as u64)))
-                    .chain(self.inner.roots().iter().cloned())
-                    .chain(std::iter::once(Scalar::from(i as u64)))
-                    .collect::<Vec<Scalar>>()
-                    .as_slice(),
+            let hash = H::challenge(
+                *QUERY_DST,
+                std::iter::once(H::encode_value(Scalar::from(self.tree_roots.len() as u64)))
+                    .chain(self.tree_roots.iter().copied())
+                    .chain(std::iter::once(H::encode_value(Scalar::from(
+                        self.inner.len() as u64,
+                    ))))
+                    .chain(self.inner.roots().iter().copied())
+                    .chain(std::iter::once(H::encode_value(Scalar::from(i as u64)))),
             );
             let index = hash.to_u256() % n;
             indices.push(index.as_u64() as usize);
@@ -120,7 +120,7 @@ impl<H: Hash<Scalar>> Commitment<H> {
 /// polynomials before running the FRI folding argument and even before batching all polynomials, so
 /// that Fiat-Shamir challenges can be derived before any quotients are built.
 #[derive(Debug, Clone)]
-pub struct Committer<H: Hash<Scalar>> {
+pub struct Committer<H: HashBackend<Scalar>> {
     /// The proven degree bound. The degree of all batched polynomials must be strictly less than
     /// this value.
     degree_bound: usize,
@@ -134,7 +134,7 @@ pub struct Committer<H: Hash<Scalar>> {
     trees: Vec<Tree<H>>,
 }
 
-impl<H: Hash<Scalar>> Committer<H> {
+impl<H: HashBackend<Scalar>> Committer<H> {
     /// Constructs a [`Committer`] with the given degree bound, blowup factor, and first batch of
     /// polynomials.
     ///
@@ -171,7 +171,7 @@ impl<H: Hash<Scalar>> Committer<H> {
     /// [`Self::num_trees()`].
     ///
     /// This value can be used to derive Fiat-Shamir challenges.
-    pub fn root_hash(&self, index: usize) -> Scalar {
+    pub fn root_hash(&self, index: usize) -> H256 {
         self.trees[index].root_hash()
     }
 
@@ -182,13 +182,13 @@ impl<H: Hash<Scalar>> Committer<H> {
     ///
     /// The hashes returned by this method are compatible with [`Commitment::transcript_hash`],
     /// which can be used on the verifier side.
-    pub fn transcript_hash(&self) -> Scalar {
+    pub fn transcript_hash(&self) -> H256 {
         H::hash_many(
-            std::iter::once(*TRANSCRIPT_DST)
-                .chain(std::iter::once(Scalar::from(self.trees.len() as u64)))
-                .chain(self.trees.iter().map(|tree| tree.root_hash()))
-                .collect::<Vec<Scalar>>()
-                .as_slice(),
+            std::iter::once(H::encode_value(*TRANSCRIPT_DST))
+                .chain(std::iter::once(H::encode_value(Scalar::from(
+                    self.trees.len() as u64,
+                ))))
+                .chain(self.trees.iter().map(Tree::root_hash)),
         )
     }
 
@@ -241,23 +241,30 @@ impl<H: Hash<Scalar>> Committer<H> {
             }
         }
 
-        let alpha = H::hash_many(
-            std::iter::once(*RLC_DST)
-                .chain(std::iter::once(Scalar::from(self.trees.len() as u64)))
-                .chain(self.trees.iter().map(|tree| tree.root_hash()))
-                .chain(std::iter::once(Scalar::from(self.polynomials.len() as u64)))
-                .chain(std::iter::once(Scalar::from(points.len() as u64)))
-                .chain(points.iter().flat_map(|&z| {
-                    std::iter::once(z)
-                        .chain(
-                            self.polynomials
-                                .iter()
-                                .map(|polynomial| polynomial.evaluate(z)),
-                        )
-                        .collect::<Vec<Scalar>>()
-                }))
-                .collect::<Vec<Scalar>>()
-                .as_slice(),
+        let alpha = H::challenge(
+            *RLC_DST,
+            std::iter::once(H::encode_value(Scalar::from(self.trees.len() as u64)))
+                .chain(self.trees.iter().map(Tree::root_hash))
+                .chain(std::iter::once(H::encode_value(Scalar::from(
+                    self.polynomials.len() as u64,
+                ))))
+                .chain(std::iter::once(H::encode_value(Scalar::from(
+                    points.len() as u64
+                ))))
+                .chain(
+                    points
+                        .iter()
+                        .flat_map(|&z| {
+                            std::iter::once(z).chain(
+                                self.polynomials
+                                    .iter()
+                                    .map(|polynomial| polynomial.evaluate(z))
+                                    .collect::<Vec<Scalar>>()
+                                    .into_iter(),
+                            )
+                        })
+                        .map(H::encode_value),
+                ),
         );
 
         let points: BTreeMap<Scalar, Vec<Scalar>> = points
@@ -313,7 +320,7 @@ impl<H: Hash<Scalar>> Committer<H> {
 
 /// A DEEP-FRI proof.
 #[derive(Debug, Clone)]
-pub struct Proof<H: Hash<Scalar>> {
+pub struct Proof<H: HashBackend<Scalar>> {
     /// The proven degree bound. If the proof is valid the degree of all batched polynomials is
     /// guaranteed to be strictly less than this value.
     degree_bound: usize,
@@ -334,7 +341,7 @@ pub struct Proof<H: Hash<Scalar>> {
     queries: Vec<fri::Query<H>>,
 }
 
-impl<H: Hash<Scalar>> Proof<H> {
+impl<H: HashBackend<Scalar>> Proof<H> {
     /// Returns the proven degree bound.
     pub fn degree_bound(&self) -> usize {
         self.degree_bound
@@ -379,21 +386,23 @@ impl<H: Hash<Scalar>> Proof<H> {
             ));
         }
 
-        let alpha = H::hash_many(
-            std::iter::once(*RLC_DST)
-                .chain(std::iter::once(Scalar::from(
-                    commitment.tree_roots().len() as u64
-                )))
-                .chain(commitment.tree_roots().iter().cloned())
-                .chain(std::iter::once(Scalar::from(self.num_polys as u64)))
-                .chain(std::iter::once(Scalar::from(self.points.len() as u64)))
-                .chain(
-                    self.points
-                        .iter()
-                        .flat_map(|(&z, values)| std::iter::once(z).chain(values.iter().cloned())),
-                )
-                .collect::<Vec<Scalar>>()
-                .as_slice(),
+        let alpha = H::challenge(
+            *RLC_DST,
+            std::iter::once(H::encode_value(Scalar::from(
+                commitment.tree_roots().len() as u64
+            )))
+            .chain(commitment.tree_roots().iter().copied())
+            .chain(std::iter::once(H::encode_value(Scalar::from(
+                self.num_polys as u64,
+            ))))
+            .chain(std::iter::once(H::encode_value(Scalar::from(
+                self.points.len() as u64,
+            ))))
+            .chain(self.points.iter().flat_map(|(z, values)| {
+                std::iter::once(z)
+                    .chain(values.iter())
+                    .map(|&value| H::encode_value(value))
+            })),
         );
 
         for ((query, openings), &expected_index) in
@@ -462,7 +471,7 @@ impl<H: Hash<Scalar>> Proof<H> {
 ///
 /// [`Prover`]s are constructed by [`Committer::commit()`]; see that method for details.
 #[derive(Debug, Clone)]
-pub struct Prover<H: Hash<Scalar>> {
+pub struct Prover<H: HashBackend<Scalar>> {
     /// The degree bound to prove.
     degree_bound: usize,
     /// The base-2 logarithm of the blowup factor.
@@ -479,7 +488,7 @@ pub struct Prover<H: Hash<Scalar>> {
     inner_prover: fri::Prover<H>,
 }
 
-impl<H: Hash<Scalar>> Prover<H> {
+impl<H: HashBackend<Scalar>> Prover<H> {
     /// Returns the proven degree bound.
     pub fn degree_bound(&self) -> usize {
         self.degree_bound
@@ -504,7 +513,7 @@ impl<H: Hash<Scalar>> Prover<H> {
     /// [`Self::num_trees()`].
     ///
     /// This value can be used to derive Fiat-Shamir challenges.
-    pub fn root_hash(&self, index: usize) -> Scalar {
+    pub fn root_hash(&self, index: usize) -> H256 {
         self.trees[index].root_hash()
     }
 
@@ -546,7 +555,7 @@ mod tests {
     type Sha2Hash = hash::Sha2Hash<Scalar>;
     type Poseidon2Hash = hash::Poseidon2Hash<Scalar>;
 
-    fn test_prover_impl<H: Hash<Scalar>>(
+    fn test_prover_impl<H: HashBackend<Scalar>>(
         mut polynomial_batches: Vec<Vec<Polynomial>>,
         points: &[u64],
         degree_bound: usize,
@@ -566,7 +575,7 @@ mod tests {
         }));
         let first_batch = polynomial_batches.remove(0);
         let mut committer = Committer::<H>::new(degree_bound, blowup_log2, first_batch);
-        let transcript_hashes: Vec<Scalar> = std::iter::once(committer.transcript_hash())
+        let transcript_hashes: Vec<H256> = std::iter::once(committer.transcript_hash())
             .chain(polynomial_batches.into_iter().map(|batch| {
                 committer.add_batch(batch);
                 committer.transcript_hash()
@@ -576,7 +585,7 @@ mod tests {
         assert_eq!(
             (0..num_batches)
                 .map(|i| commitment.transcript_hash(i + 1))
-                .collect::<Vec<Scalar>>(),
+                .collect::<Vec<H256>>(),
             transcript_hashes
         );
         assert_eq!(prover.degree_bound(), degree_bound);

@@ -536,7 +536,7 @@ dependencies = [
 
 [[package]]
 name = "starkom-pcs"
-version = "3.1.1"
+version = "4.0.0"
 dependencies = [
  "anyhow",
  "primitive-types",
@@ -545,6 +545,7 @@ dependencies = [
  "starkom-bluesky",
  "starkom-ff",
  "starkom-poly",
+ "starkom-poseidon",
  "starkom-poseidon2",
 ]
 
@@ -560,10 +561,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "starkom-poseidon2"
-version = "3.0.4"
+name = "starkom-poseidon"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8736446c535c865de26c99e6083fdcbeb6020c1fa5cdc594d41f61544b66d815"
+checksum = "0326f77a36c1e738271190f48eabf966967dc5c11b0687dd32f3e2a95a90d429"
+dependencies = [
+ "starkom-bluesky",
+ "starkom-ff",
+]
+
+[[package]]
+name = "starkom-poseidon2"
+version = "4.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9116b1735039a3417edf1755f4fc355f160906df46c2e97a383bd975452874c"
 dependencies = [
  "starkom-bluesky",
  "starkom-ff",
