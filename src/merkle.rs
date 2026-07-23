@@ -372,178 +372,178 @@ mod tests {
         );
     }
 
-    // fn test_merkle_tree<H: Hash<Scalar>>(
-    //     evaluations: Vec<Vec<Scalar>>,
-    //     expected_root_hash: Scalar,
-    // ) {
-    //     let k = evaluations.len();
-    //     let n = evaluations[0].len();
-    //     let tree = Tree::<H>::new(evaluations.clone());
-    //     assert_eq!(tree.num_polys(), k);
-    //     assert_eq!(tree.num_leaves(), n);
-    //     assert_eq!(tree.root_hash(), expected_root_hash);
-    //     for i in 0..n {
-    //         let proof = tree.query(i);
-    //         assert!(proof.verify(i, expected_root_hash).is_ok());
-    //         assert_eq!(proof.leaf().len(), k);
-    //         assert!(
-    //             proof
-    //                 .leaf()
-    //                 .iter()
-    //                 .zip(evaluations.iter())
-    //                 .all(|(&lhs, values)| lhs == values[i])
-    //         );
-    //         for j in 0..k {
-    //             assert_eq!(tree.leaf_value(j, i), evaluations[j][i]);
-    //         }
-    //     }
-    // }
+    fn test_merkle_tree<H: HashBackend<Scalar>>(
+        evaluations: Vec<Vec<Scalar>>,
+        expected_root_hash: H256,
+    ) {
+        let k = evaluations.len();
+        let n = evaluations[0].len();
+        let tree = Tree::<H>::new(evaluations.clone());
+        assert_eq!(tree.num_polys(), k);
+        assert_eq!(tree.num_leaves(), n);
+        assert_eq!(tree.root_hash(), expected_root_hash);
+        for i in 0..n {
+            let proof = tree.query(i);
+            assert!(proof.verify(i, expected_root_hash).is_ok());
+            assert_eq!(proof.leaf().len(), k);
+            assert!(
+                proof
+                    .leaf()
+                    .iter()
+                    .zip(evaluations.iter())
+                    .all(|(&lhs, values)| lhs == values[i])
+            );
+            for j in 0..k {
+                assert_eq!(tree.leaf_value(j, i), evaluations[j][i]);
+            }
+        }
+    }
 
-    // #[test]
-    // fn test_merkle_tree_one_leaf_1() {
-    //     test_merkle_tree::<Sha2Hash>(
-    //         vec![vec![from_const(12)]],
-    //         parse_scalar("0x71169269b911f4d1c8edbd4ba3e4107b1f1017f53d21a202c6d9865d4a95cdf6"),
-    //     );
-    //     test_merkle_tree::<Poseidon2Hash>(
-    //         vec![vec![from_const(12)]],
-    //         parse_scalar("0x7e1fffed4d53ef893858a7345de37e9b366f6a52961fd9722f2104217758aa2a"),
-    //     );
-    // }
+    #[test]
+    fn test_merkle_tree_one_leaf_1() {
+        test_merkle_tree::<Sha2Hash>(
+            vec![vec![from_const(12)]],
+            parse_hash("0x0bd187bc3deea1ef6c2a9ae254cf4e493f1dbbda32c79a662fc1d8437ab7e7c6"),
+        );
+        test_merkle_tree::<Poseidon2Hash>(
+            vec![vec![from_const(12)]],
+            parse_hash("0x7e1fffed4d53ef893858a7345de37e9b366f6a52961fd9722f2104217758aa2a"),
+        );
+    }
 
-    // #[test]
-    // fn test_merkle_tree_one_leaf_2() {
-    //     test_merkle_tree::<Sha2Hash>(
-    //         vec![vec![from_const(34)]],
-    //         parse_scalar("0x7c4c892249a33dccdc42c2b7002a98c54420f272f63fa886192c94944aae3374"),
-    //     );
-    //     test_merkle_tree::<Poseidon2Hash>(
-    //         vec![vec![from_const(34)]],
-    //         parse_scalar("0x1fa5228af05e75ef806f5772be53106e0d91f54950d60a4759421f77a0b39095"),
-    //     );
-    // }
+    #[test]
+    fn test_merkle_tree_one_leaf_2() {
+        test_merkle_tree::<Sha2Hash>(
+            vec![vec![from_const(34)]],
+            parse_hash("0x825f71a1d38bedb88129450457f7943f988ee940aa1755aa89982e139e67047a"),
+        );
+        test_merkle_tree::<Poseidon2Hash>(
+            vec![vec![from_const(34)]],
+            parse_hash("0x1fa5228af05e75ef806f5772be53106e0d91f54950d60a4759421f77a0b39095"),
+        );
+    }
 
-    // #[test]
-    // fn test_merkle_tree_one_leaf_two_polynomials_1() {
-    //     test_merkle_tree::<Sha2Hash>(
-    //         vec![vec![from_const(12)], vec![from_const(34)]],
-    //         parse_scalar("0x2abfa190025b3afd41194aa282634e633b5ffed43d522fc2d87d269dd0eb60a8"),
-    //     );
-    //     test_merkle_tree::<Poseidon2Hash>(
-    //         vec![vec![from_const(12)], vec![from_const(34)]],
-    //         parse_scalar("0x1c6b73bec8f42fe634f5f77d8741ace13ff5ff49105b4c3e69d54c55ddc56dc7"),
-    //     );
-    // }
+    #[test]
+    fn test_merkle_tree_one_leaf_two_polynomials_1() {
+        test_merkle_tree::<Sha2Hash>(
+            vec![vec![from_const(12)], vec![from_const(34)]],
+            parse_hash("0x41c90ef8e7fa7e79e54b14cf8395f9707e9768a02aa79ce7f0f4e68668837c26"),
+        );
+        test_merkle_tree::<Poseidon2Hash>(
+            vec![vec![from_const(12)], vec![from_const(34)]],
+            parse_hash("0x1c6b73bec8f42fe634f5f77d8741ace13ff5ff49105b4c3e69d54c55ddc56dc7"),
+        );
+    }
 
-    // #[test]
-    // fn test_merkle_tree_one_leaf_two_polynomials_2() {
-    //     test_merkle_tree::<Sha2Hash>(
-    //         vec![vec![from_const(34)], vec![from_const(12)]],
-    //         parse_scalar("0x48147ad111986cc8bb753677fb9c9864db281bd55443ea93be2533e22b7d0112"),
-    //     );
-    //     test_merkle_tree::<Poseidon2Hash>(
-    //         vec![vec![from_const(34)], vec![from_const(12)]],
-    //         parse_scalar("0x62f2c10ac158f290a9178feec675a0cce5c8c9610c393f4bf17c7838760ebe19"),
-    //     );
-    // }
+    #[test]
+    fn test_merkle_tree_one_leaf_two_polynomials_2() {
+        test_merkle_tree::<Sha2Hash>(
+            vec![vec![from_const(34)], vec![from_const(12)]],
+            parse_hash("0xc3dbf8cc67db17f01dd3527ab16da2120af998c7ebe3d06a2d9dff445e1adaee"),
+        );
+        test_merkle_tree::<Poseidon2Hash>(
+            vec![vec![from_const(34)], vec![from_const(12)]],
+            parse_hash("0x62f2c10ac158f290a9178feec675a0cce5c8c9610c393f4bf17c7838760ebe19"),
+        );
+    }
 
-    // #[test]
-    // fn test_merkle_tree_one_leaf_three_polynomials_1() {
-    //     test_merkle_tree::<Sha2Hash>(
-    //         vec![
-    //             vec![from_const(12)],
-    //             vec![from_const(34)],
-    //             vec![from_const(56)],
-    //         ],
-    //         parse_scalar("0x12ce7e1aefd29256e5dfb6c1dcfed5c959cf4346e64d3b4a9c90671fb3bf7e3f"),
-    //     );
-    //     test_merkle_tree::<Poseidon2Hash>(
-    //         vec![
-    //             vec![from_const(12)],
-    //             vec![from_const(34)],
-    //             vec![from_const(56)],
-    //         ],
-    //         parse_scalar("0x363f810134655fa478c1fbc55495b9b810f0a33ba3aa87b8d43ac6f1c3f2ed75"),
-    //     );
-    // }
+    #[test]
+    fn test_merkle_tree_one_leaf_three_polynomials_1() {
+        test_merkle_tree::<Sha2Hash>(
+            vec![
+                vec![from_const(12)],
+                vec![from_const(34)],
+                vec![from_const(56)],
+            ],
+            parse_hash("0x9bca77d625d9a50f1807d27c273cae980f706ef734a014c00e6a97bbb77472e3"),
+        );
+        test_merkle_tree::<Poseidon2Hash>(
+            vec![
+                vec![from_const(12)],
+                vec![from_const(34)],
+                vec![from_const(56)],
+            ],
+            parse_hash("0x363f810134655fa478c1fbc55495b9b810f0a33ba3aa87b8d43ac6f1c3f2ed75"),
+        );
+    }
 
-    // #[test]
-    // fn test_merkle_tree_one_leaf_three_polynomials_2() {
-    //     test_merkle_tree::<Sha2Hash>(
-    //         vec![
-    //             vec![from_const(34)],
-    //             vec![from_const(12)],
-    //             vec![from_const(78)],
-    //         ],
-    //         parse_scalar("0x0d19f881e2cf998e3d1fc3095b741b2b2086833550530c4e394578c94eeae3f2"),
-    //     );
-    //     test_merkle_tree::<Poseidon2Hash>(
-    //         vec![
-    //             vec![from_const(34)],
-    //             vec![from_const(12)],
-    //             vec![from_const(78)],
-    //         ],
-    //         parse_scalar("0x6906a253c3b386890be44e5fbd6c6b613e73c8960a04ef390f6fc6a584cfcaa1"),
-    //     );
-    // }
+    #[test]
+    fn test_merkle_tree_one_leaf_three_polynomials_2() {
+        test_merkle_tree::<Sha2Hash>(
+            vec![
+                vec![from_const(34)],
+                vec![from_const(12)],
+                vec![from_const(78)],
+            ],
+            parse_hash("0xf48317b0be7caae4a15185cc8d0795c15c2bc98e18b8cbdc906270ada921fd25"),
+        );
+        test_merkle_tree::<Poseidon2Hash>(
+            vec![
+                vec![from_const(34)],
+                vec![from_const(12)],
+                vec![from_const(78)],
+            ],
+            parse_hash("0x6906a253c3b386890be44e5fbd6c6b613e73c8960a04ef390f6fc6a584cfcaa1"),
+        );
+    }
 
-    // #[test]
-    // fn test_merkle_tree_two_leaves_1() {
-    //     test_merkle_tree::<Sha2Hash>(
-    //         vec![vec![from_const(12), from_const(34)]],
-    //         parse_scalar("0x661f00deed4778c0f35e3b46a50a56d52cfc628534ab4bf7526fa2b7eb64fb2d"),
-    //     );
-    //     test_merkle_tree::<Poseidon2Hash>(
-    //         vec![vec![from_const(12), from_const(34)]],
-    //         parse_scalar("0x76aafc5a8995c9d435039d454a33a488898f6ef0b2622ee5b003ec8c5aa3332b"),
-    //     );
-    // }
+    #[test]
+    fn test_merkle_tree_two_leaves_1() {
+        test_merkle_tree::<Sha2Hash>(
+            vec![vec![from_const(12), from_const(34)]],
+            parse_hash("0x2624006228d517eeda393d1440f25ed1c20887664f2444021849345167aadaf4"),
+        );
+        test_merkle_tree::<Poseidon2Hash>(
+            vec![vec![from_const(12), from_const(34)]],
+            parse_hash("0x04df34feebaccfe8d6611b5d308726e8c27e94f2d3f3dfc9e68d39f917125a49"),
+        );
+    }
 
-    // #[test]
-    // fn test_merkle_tree_two_leaves_2() {
-    //     test_merkle_tree::<Sha2Hash>(
-    //         vec![vec![from_const(34), from_const(56)]],
-    //         parse_scalar("0x6299bd932dd8ada9a15540b13b5ce037d9ec4c015e4182fbc05a6e3d4242b621"),
-    //     );
-    //     test_merkle_tree::<Poseidon2Hash>(
-    //         vec![vec![from_const(34), from_const(56)]],
-    //         parse_scalar("0x39635888b223cf2fa7fd3584790e86e5380da23281f53710669cc72345d0a935"),
-    //     );
-    // }
+    #[test]
+    fn test_merkle_tree_two_leaves_2() {
+        test_merkle_tree::<Sha2Hash>(
+            vec![vec![from_const(34), from_const(56)]],
+            parse_hash("0x85d6170f1dcec468c3a42f35d24b7689733abf26ff0278a9bc1edc7a9a0a7333"),
+        );
+        test_merkle_tree::<Poseidon2Hash>(
+            vec![vec![from_const(34), from_const(56)]],
+            parse_hash("0x623c0f527bde2b6c6a152c224df77a82bd1957188908965c42d167554dc75318"),
+        );
+    }
 
-    // #[test]
-    // fn test_merkle_tree_two_leaves_two_polynomials_1() {
-    //     test_merkle_tree::<Sha2Hash>(
-    //         vec![
-    //             vec![from_const(12), from_const(56)],
-    //             vec![from_const(34), from_const(78)],
-    //         ],
-    //         parse_scalar("0x38ff40459f948d6f52e0df0e1cb2f4e4216e21765339d0c2abece6dd86b4e606"),
-    //     );
-    //     test_merkle_tree::<Poseidon2Hash>(
-    //         vec![
-    //             vec![from_const(12), from_const(56)],
-    //             vec![from_const(34), from_const(78)],
-    //         ],
-    //         parse_scalar("0x5d494ed90f85da6cfef7581f8134f0bb454b423a69a1e5b79aa1dd077ef918f1"),
-    //     );
-    // }
+    #[test]
+    fn test_merkle_tree_two_leaves_two_polynomials_1() {
+        test_merkle_tree::<Sha2Hash>(
+            vec![
+                vec![from_const(12), from_const(56)],
+                vec![from_const(34), from_const(78)],
+            ],
+            parse_hash("0xdc144d55dd7a9c48f00b495d30172b38db7d4dc71ee4a0feab99177e30a10d21"),
+        );
+        test_merkle_tree::<Poseidon2Hash>(
+            vec![
+                vec![from_const(12), from_const(56)],
+                vec![from_const(34), from_const(78)],
+            ],
+            parse_hash("0x290f8ab7fabbbf6bf79e435e2900f0eb619cfb1c3933c3dca13f89f3abd4b9de"),
+        );
+    }
 
-    // #[test]
-    // fn test_merkle_tree_two_leaves_two_polynomials_2() {
-    //     test_merkle_tree::<Sha2Hash>(
-    //         vec![
-    //             vec![from_const(78), from_const(34)],
-    //             vec![from_const(56), from_const(12)],
-    //         ],
-    //         parse_scalar("0x7af2c224e5681096e6e26311a34657e10dcd6d0fb2343ceca285da0f5d445150"),
-    //     );
-    //     test_merkle_tree::<Poseidon2Hash>(
-    //         vec![
-    //             vec![from_const(78), from_const(34)],
-    //             vec![from_const(56), from_const(12)],
-    //         ],
-    //         parse_scalar("0x3f01eb2c0ebff44e6ab56b513563247916785675f145580bfae842ddbe01c2fa"),
-    //     );
-    // }
+    #[test]
+    fn test_merkle_tree_two_leaves_two_polynomials_2() {
+        test_merkle_tree::<Sha2Hash>(
+            vec![
+                vec![from_const(78), from_const(34)],
+                vec![from_const(56), from_const(12)],
+            ],
+            parse_hash("0xfb5a002c9ef7dad6d9b4edc690f323f4c302c665926c085dd5d8681496c937c6"),
+        );
+        test_merkle_tree::<Poseidon2Hash>(
+            vec![
+                vec![from_const(78), from_const(34)],
+                vec![from_const(56), from_const(12)],
+            ],
+            parse_hash("0x494da394aee5068da56b511142feb6ca060b4f9dddbeab2c7d74d2b5d58c6813"),
+        );
+    }
 }
