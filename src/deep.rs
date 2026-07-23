@@ -78,10 +78,8 @@ impl<H: HashBackend<Scalar>> Commitment<H> {
         assert!(batch_count > 0);
         assert!(batch_count <= self.tree_roots.len());
         H::hash_many(
-            std::iter::once(H::encode_value(*TRANSCRIPT_DST))
-                .chain(std::iter::once(H::encode_value(Scalar::from(
-                    batch_count as u64,
-                ))))
+            std::iter::once(H::encode_scalar(*TRANSCRIPT_DST))
+                .chain(std::iter::once(H::encode_usize(batch_count)))
                 .chain(self.tree_roots[..batch_count].iter().copied()),
         )
     }
@@ -95,13 +93,11 @@ impl<H: HashBackend<Scalar>> Commitment<H> {
         for i in 0..k {
             let hash = H::challenge(
                 *QUERY_DST,
-                std::iter::once(H::encode_value(Scalar::from(self.tree_roots.len() as u64)))
+                std::iter::once(H::encode_usize(self.tree_roots.len()))
                     .chain(self.tree_roots.iter().copied())
-                    .chain(std::iter::once(H::encode_value(Scalar::from(
-                        self.inner.len() as u64,
-                    ))))
+                    .chain(std::iter::once(H::encode_usize(self.inner.len())))
                     .chain(self.inner.roots().iter().copied())
-                    .chain(std::iter::once(H::encode_value(Scalar::from(i as u64)))),
+                    .chain(std::iter::once(H::encode_usize(i))),
             );
             let index = hash.to_u256() % n;
             indices.push(index.as_u64() as usize);
@@ -184,10 +180,8 @@ impl<H: HashBackend<Scalar>> Committer<H> {
     /// which can be used on the verifier side.
     pub fn transcript_hash(&self) -> H256 {
         H::hash_many(
-            std::iter::once(H::encode_value(*TRANSCRIPT_DST))
-                .chain(std::iter::once(H::encode_value(Scalar::from(
-                    self.trees.len() as u64,
-                ))))
+            std::iter::once(H::encode_scalar(*TRANSCRIPT_DST))
+                .chain(std::iter::once(H::encode_usize(self.trees.len())))
                 .chain(self.trees.iter().map(Tree::root_hash)),
         )
     }
@@ -243,14 +237,10 @@ impl<H: HashBackend<Scalar>> Committer<H> {
 
         let alpha = H::challenge(
             *RLC_DST,
-            std::iter::once(H::encode_value(Scalar::from(self.trees.len() as u64)))
+            std::iter::once(H::encode_usize(self.trees.len()))
                 .chain(self.trees.iter().map(Tree::root_hash))
-                .chain(std::iter::once(H::encode_value(Scalar::from(
-                    self.polynomials.len() as u64,
-                ))))
-                .chain(std::iter::once(H::encode_value(Scalar::from(
-                    points.len() as u64
-                ))))
+                .chain(std::iter::once(H::encode_usize(self.polynomials.len())))
+                .chain(std::iter::once(H::encode_usize(points.len())))
                 .chain(
                     points
                         .iter()
@@ -263,7 +253,7 @@ impl<H: HashBackend<Scalar>> Committer<H> {
                                     .into_iter(),
                             )
                         })
-                        .map(H::encode_value),
+                        .map(H::encode_scalar),
                 ),
         );
 
@@ -388,21 +378,15 @@ impl<H: HashBackend<Scalar>> Proof<H> {
 
         let alpha = H::challenge(
             *RLC_DST,
-            std::iter::once(H::encode_value(Scalar::from(
-                commitment.tree_roots().len() as u64
-            )))
-            .chain(commitment.tree_roots().iter().copied())
-            .chain(std::iter::once(H::encode_value(Scalar::from(
-                self.num_polys as u64,
-            ))))
-            .chain(std::iter::once(H::encode_value(Scalar::from(
-                self.points.len() as u64,
-            ))))
-            .chain(self.points.iter().flat_map(|(z, values)| {
-                std::iter::once(z)
-                    .chain(values.iter())
-                    .map(|&value| H::encode_value(value))
-            })),
+            std::iter::once(H::encode_usize(commitment.tree_roots().len()))
+                .chain(commitment.tree_roots().iter().copied())
+                .chain(std::iter::once(H::encode_usize(self.num_polys)))
+                .chain(std::iter::once(H::encode_usize(self.points.len())))
+                .chain(self.points.iter().flat_map(|(z, values)| {
+                    std::iter::once(z)
+                        .chain(values.iter())
+                        .map(|&value| H::encode_scalar(value))
+                })),
         );
 
         for ((query, openings), &expected_index) in

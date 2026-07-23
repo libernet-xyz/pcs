@@ -45,11 +45,19 @@ pub trait Hash<V> {
 pub trait HashBackend<F: PrimeField>: Hash<F> + Hash<H256> {
     /// Encodes a field value into an `H256` so that it can be used as an input to `Hash<H256>`
     /// functions.
-    fn encode_value(value: F) -> H256
+    fn encode_scalar(value: F) -> H256
     where
         F: PrimeField256,
     {
         H256::from_slice(&value.to_be_bytes())
+    }
+
+    /// Encodes a `u64` into an `H256` so that it can be used as an input to `Hash<H256>` functions.
+    fn encode_usize(value: usize) -> H256
+    where
+        F: PrimeField256,
+    {
+        H256::from_slice(&Scalar::from(value as u64).to_be_bytes())
     }
 
     /// Derives a Fiat-Shamir challenge from a set of transcript hashes.
@@ -122,10 +130,8 @@ impl HashBackend<Scalar> for Sha2Hash<Scalar> {
         let transcript_hash = {
             let transcript_hashes: Vec<H256> = transcript_hashes.into_iter().collect();
             Self::hash_many(
-                std::iter::once(Self::encode_value(dst))
-                    .chain(std::iter::once(Self::encode_value(Scalar::from(
-                        transcript_hashes.len() as u64,
-                    ))))
+                std::iter::once(Self::encode_scalar(dst))
+                    .chain(std::iter::once(Self::encode_usize(transcript_hashes.len())))
                     .chain(transcript_hashes.into_iter()),
             )
         };
@@ -217,10 +223,8 @@ impl HashBackend<Scalar> for Poseidon2Hash<Scalar> {
         let transcript_hash = {
             let transcript_hashes: Vec<H256> = transcript_hashes.into_iter().collect();
             Self::hash_many(
-                std::iter::once(Self::encode_value(dst))
-                    .chain(std::iter::once(Self::encode_value(Scalar::from(
-                        transcript_hashes.len() as u64,
-                    ))))
+                std::iter::once(Self::encode_scalar(dst))
+                    .chain(std::iter::once(Self::encode_usize(transcript_hashes.len())))
                     .chain(transcript_hashes.into_iter()),
             )
         };
@@ -237,77 +241,227 @@ mod tests {
         s.parse().unwrap()
     }
 
+    fn h256(value: usize) -> H256 {
+        H256::from_slice(&Scalar::from(value as u64).to_be_bytes())
+    }
+
     #[test]
-    fn test_sha2_hash_two() {
+    fn test_sha2_hash_two_scalars() {
         assert_eq!(
-            Sha2Hash::<Scalar>::hash_two(
-                parse_hash("0x1044afe93d345c2684c255f163ed652762e1bba7dc6e8db68202d51a6d254290"),
-                parse_hash("0x64e4ccfe9bc729a3b91f03d78d17b2b316f5a609a8e0e979b7bd942be15933bd")
-            ),
-            parse_hash("0xbcf1306c5a7313bdd7db6e5be9c01e9a27a1267c986c10df0cbfcab322ca11da")
+            Sha2Hash::<Scalar>::hash_two(from_const(12), from_const(34)),
+            parse_hash("0xe7148fa58812b9dc9041188cf631e333ed79b8e203992fbfcf7beb201c7c13f7")
         );
         assert_eq!(
-            Sha2Hash::<Scalar>::hash_two(
-                parse_hash("0x11bd2fc4575a048f2d30ef6ad146b40824bd01857d5b9a18af908f641c59f8af"),
-                parse_hash("0x0ffc2de1f75079dfed3a2f6a1a0656e513f06f8d523c93ae35c0ef0cb86d034e")
-            ),
-            parse_hash("0x8a0c4152789dedaf0965032de1ccff5b57ac11ca9b14df6bb421c6189c842a6c")
+            Sha2Hash::<Scalar>::hash_two(from_const(12), from_const(56)),
+            parse_hash("0x36f7f77cbfe046d965d34cc3bd42d86b2e0ac42fc902196cdd3ac8810f02e5f0")
+        );
+        assert_eq!(
+            Sha2Hash::<Scalar>::hash_two(from_const(56), from_const(78)),
+            parse_hash("0x7a83016495e114903621dc328b4bcfbf65aee3df18968ba278f8fc96283a2d92")
         );
     }
 
-    // #[test]
-    // fn test_sha2_hash_many() {
-    //     assert_eq!(
-    //         Sha2Hash::<Scalar>::hash_many([from_const(12)]),
-    //         parse_hash("0x70f2261a2a020a7ae1fe4cd2a47244115f5243bebb22dc002adfc597e24a436a"),
-    //     );
-    //     assert_eq!(
-    //         Sha2Hash::<Scalar>::hash_many([from_const(12), from_const(34)]),
-    //         parse_hash("0x614eaeb45d6c697d7cf720c4c7c604efe3e2d7ee733caa3a67a951975bcfd1c7"),
-    //     );
-    //     assert_eq!(
-    //         Sha2Hash::<Scalar>::hash_many([
-    //             from_const(56),
-    //             from_const(78),
-    //             from_const(90),
-    //             from_const(12),
-    //             from_const(34)
-    //         ]),
-    //         parse_hash("0x76493ab96fdfde689a3e4d9c5576e4006cbaabd96170b2207e8f837cc798266c"),
-    //     );
-    // }
+    #[test]
+    fn test_sha2_hash_two_hashes() {
+        assert_eq!(
+            Sha2Hash::<Scalar>::hash_two(h256(12), h256(34)),
+            parse_hash("0xe7148fa58812b9dc9041188cf631e333ed79b8e203992fbfcf7beb201c7c13f7")
+        );
+        assert_eq!(
+            Sha2Hash::<Scalar>::hash_two(h256(12), h256(56)),
+            parse_hash("0x36f7f77cbfe046d965d34cc3bd42d86b2e0ac42fc902196cdd3ac8810f02e5f0")
+        );
+        assert_eq!(
+            Sha2Hash::<Scalar>::hash_two(h256(56), h256(78)),
+            parse_hash("0x7a83016495e114903621dc328b4bcfbf65aee3df18968ba278f8fc96283a2d92")
+        );
+    }
 
-    // #[test]
-    // fn test_poseidon2_hash_two() {
-    //     assert_eq!(
-    //         Poseidon2Hash::<Scalar>::hash_two(from_const(12), from_const(34), from_const(56)),
-    //         parse_scalar("0x236092ebefc7e6565e0e75414d8fdce1ce2e19bb59002d36b794b9c3111bb9cd")
-    //     );
-    //     assert_eq!(
-    //         Poseidon2Hash::<Scalar>::hash_two(from_const(56), from_const(78), from_const(90)),
-    //         parse_scalar("0x2fa39a3a76d0cf8220bd6f9899b209110ad1cca7b0bdc2b340661fa7063f2ba0")
-    //     );
-    // }
+    #[test]
+    fn test_sha2_hash_three_scalars() {
+        assert_eq!(
+            Sha2Hash::<Scalar>::hash_three(from_const(12), from_const(34), from_const(56)),
+            parse_hash("0xbd08c4c9e298576ab0486eec6348a32b299de885ae958e995a4b517f2697b842")
+        );
+        assert_eq!(
+            Sha2Hash::<Scalar>::hash_three(from_const(12), from_const(56), from_const(34)),
+            parse_hash("0xba4e56fdf167d335b75d22469b2e24407a8efbdb4c8112546aa1519d9175b7f9")
+        );
+        assert_eq!(
+            Sha2Hash::<Scalar>::hash_three(from_const(56), from_const(78), from_const(90)),
+            parse_hash("0x83b5d2c73f322fe3c806514e7cbb7009796e4b9ed15b4766ac6dc04a24533647")
+        );
+    }
 
-    // #[test]
-    // fn test_poseidon2_hash_many() {
-    //     assert_eq!(
-    //         Poseidon2Hash::<Scalar>::hash_many(&[from_const(12)]),
-    //         parse_hash("0x45782306ba3302ebe2f07eacbf5d0c36a5f307dc1cde4f3f9e8196ef498eddf2"),
-    //     );
-    //     assert_eq!(
-    //         Poseidon2Hash::<Scalar>::hash_many(&[from_const(12), from_const(34)]),
-    //         parse_hash("0x08802dc1d5eaf75680808adb1d19bb420f34f5e786f09e05ffa5d41fb2bdfe6d"),
-    //     );
-    //     assert_eq!(
-    //         Poseidon2Hash::<Scalar>::hash_many(&[
-    //             from_const(56),
-    //             from_const(78),
-    //             from_const(90),
-    //             from_const(12),
-    //             from_const(34)
-    //         ]),
-    //         parse_hash("0x7499d072269d7c32ad0477050bacd7cc84009b845c016280d679bc7849ed845a"),
-    //     );
-    // }
+    #[test]
+    fn test_sha2_hash_three_hashes() {
+        assert_eq!(
+            Sha2Hash::<Scalar>::hash_three(h256(12), h256(34), h256(56)),
+            parse_hash("0xbd08c4c9e298576ab0486eec6348a32b299de885ae958e995a4b517f2697b842")
+        );
+        assert_eq!(
+            Sha2Hash::<Scalar>::hash_three(h256(12), h256(56), h256(34)),
+            parse_hash("0xba4e56fdf167d335b75d22469b2e24407a8efbdb4c8112546aa1519d9175b7f9")
+        );
+        assert_eq!(
+            Sha2Hash::<Scalar>::hash_three(h256(56), h256(78), h256(90)),
+            parse_hash("0x83b5d2c73f322fe3c806514e7cbb7009796e4b9ed15b4766ac6dc04a24533647")
+        );
+    }
+
+    #[test]
+    fn test_sha2_hash_many_scalars() {
+        assert_eq!(
+            Sha2Hash::<Scalar>::hash_many([from_const(12)]),
+            parse_hash("0xa82872b96246dac512ddf0515f5da862a92ecebebcb92537b6e3e73199694c45"),
+        );
+        assert_eq!(
+            Sha2Hash::<Scalar>::hash_many([from_const(12), from_const(34)]),
+            parse_hash("0xe7148fa58812b9dc9041188cf631e333ed79b8e203992fbfcf7beb201c7c13f7"),
+        );
+        assert_eq!(
+            Sha2Hash::<Scalar>::hash_many([from_const(12), from_const(34), from_const(56)]),
+            parse_hash("0xbd08c4c9e298576ab0486eec6348a32b299de885ae958e995a4b517f2697b842"),
+        );
+        assert_eq!(
+            Sha2Hash::<Scalar>::hash_many([
+                from_const(56),
+                from_const(78),
+                from_const(90),
+                from_const(12),
+                from_const(34)
+            ]),
+            parse_hash("0x4e8b5c5fe411c82f0449cead9ef8ae232d5dbb6bf91fefa0686f18062cc8f50e"),
+        );
+    }
+
+    #[test]
+    fn test_sha2_hash_many_hashes() {
+        assert_eq!(
+            Sha2Hash::<Scalar>::hash_many([h256(12)]),
+            parse_hash("0xa82872b96246dac512ddf0515f5da862a92ecebebcb92537b6e3e73199694c45"),
+        );
+        assert_eq!(
+            Sha2Hash::<Scalar>::hash_many([h256(12), h256(34)]),
+            parse_hash("0xe7148fa58812b9dc9041188cf631e333ed79b8e203992fbfcf7beb201c7c13f7"),
+        );
+        assert_eq!(
+            Sha2Hash::<Scalar>::hash_many([h256(12), h256(34), h256(56)]),
+            parse_hash("0xbd08c4c9e298576ab0486eec6348a32b299de885ae958e995a4b517f2697b842"),
+        );
+        assert_eq!(
+            Sha2Hash::<Scalar>::hash_many([h256(56), h256(78), h256(90), h256(12), h256(34)]),
+            parse_hash("0x4e8b5c5fe411c82f0449cead9ef8ae232d5dbb6bf91fefa0686f18062cc8f50e"),
+        );
+    }
+
+    #[test]
+    fn test_poseidon2_hash_two_scalars() {
+        assert_eq!(
+            Poseidon2Hash::<Scalar>::hash_two(from_const(12), from_const(34)),
+            parse_hash("0x165e74be18ef4be6de5e232cd3480dcc38176807ac918b904576964612c5b6de")
+        );
+        assert_eq!(
+            Poseidon2Hash::<Scalar>::hash_two(from_const(12), from_const(56)),
+            parse_hash("0x5ad01fd39362490ad40fa8a2692c0f90ffed1c29bdc394366d9b54489d9df2d3")
+        );
+        assert_eq!(
+            Poseidon2Hash::<Scalar>::hash_two(from_const(56), from_const(78)),
+            parse_hash("0x38e7bb7b6ccae0c74031423877db058f4ab3a284964e2d91bf97497851eca5db")
+        );
+    }
+
+    #[test]
+    fn test_poseidon2_hash_two_hashes() {
+        assert_eq!(
+            Poseidon2Hash::<Scalar>::hash_two(h256(12), h256(34)),
+            parse_hash("0x165e74be18ef4be6de5e232cd3480dcc38176807ac918b904576964612c5b6de")
+        );
+        assert_eq!(
+            Poseidon2Hash::<Scalar>::hash_two(h256(12), h256(56)),
+            parse_hash("0x5ad01fd39362490ad40fa8a2692c0f90ffed1c29bdc394366d9b54489d9df2d3")
+        );
+        assert_eq!(
+            Poseidon2Hash::<Scalar>::hash_two(h256(56), h256(78)),
+            parse_hash("0x38e7bb7b6ccae0c74031423877db058f4ab3a284964e2d91bf97497851eca5db")
+        );
+    }
+
+    #[test]
+    fn test_poseidon2_hash_three_scalars() {
+        assert_eq!(
+            Poseidon2Hash::<Scalar>::hash_three(from_const(12), from_const(34), from_const(56)),
+            parse_hash("0x236092ebefc7e6565e0e75414d8fdce1ce2e19bb59002d36b794b9c3111bb9cd")
+        );
+        assert_eq!(
+            Poseidon2Hash::<Scalar>::hash_three(from_const(12), from_const(56), from_const(34)),
+            parse_hash("0x0ae96711384158467002a664233e687ce6f3c0f27ac41ea97ac378c72ad4077e")
+        );
+        assert_eq!(
+            Poseidon2Hash::<Scalar>::hash_three(from_const(56), from_const(78), from_const(90)),
+            parse_hash("0x2fa39a3a76d0cf8220bd6f9899b209110ad1cca7b0bdc2b340661fa7063f2ba0")
+        );
+    }
+
+    #[test]
+    fn test_poseidon2_hash_three_hashes() {
+        assert_eq!(
+            Poseidon2Hash::<Scalar>::hash_three(h256(12), h256(34), h256(56)),
+            parse_hash("0x236092ebefc7e6565e0e75414d8fdce1ce2e19bb59002d36b794b9c3111bb9cd")
+        );
+        assert_eq!(
+            Poseidon2Hash::<Scalar>::hash_three(h256(12), h256(56), h256(34)),
+            parse_hash("0x0ae96711384158467002a664233e687ce6f3c0f27ac41ea97ac378c72ad4077e")
+        );
+        assert_eq!(
+            Poseidon2Hash::<Scalar>::hash_three(h256(56), h256(78), h256(90)),
+            parse_hash("0x2fa39a3a76d0cf8220bd6f9899b209110ad1cca7b0bdc2b340661fa7063f2ba0")
+        );
+    }
+
+    #[test]
+    fn test_poseidon2_hash_many_scalars() {
+        assert_eq!(
+            Poseidon2Hash::<Scalar>::hash_many([from_const(12)]),
+            parse_hash("0x45782306ba3302ebe2f07eacbf5d0c36a5f307dc1cde4f3f9e8196ef498eddf2"),
+        );
+        assert_eq!(
+            Poseidon2Hash::<Scalar>::hash_many([from_const(12), from_const(34)]),
+            parse_hash("0x08802dc1d5eaf75680808adb1d19bb420f34f5e786f09e05ffa5d41fb2bdfe6d"),
+        );
+        assert_eq!(
+            Poseidon2Hash::<Scalar>::hash_many([from_const(12), from_const(34), from_const(56)]),
+            parse_hash("0x236092ebefc7e6565e0e75414d8fdce1ce2e19bb59002d36b794b9c3111bb9cd"),
+        );
+        assert_eq!(
+            Poseidon2Hash::<Scalar>::hash_many([
+                from_const(56),
+                from_const(78),
+                from_const(90),
+                from_const(12),
+                from_const(34)
+            ]),
+            parse_hash("0x7499d072269d7c32ad0477050bacd7cc84009b845c016280d679bc7849ed845a"),
+        );
+    }
+
+    #[test]
+    fn test_poseidon2_hash_many_hashes() {
+        assert_eq!(
+            Poseidon2Hash::<Scalar>::hash_many([h256(12)]),
+            parse_hash("0x45782306ba3302ebe2f07eacbf5d0c36a5f307dc1cde4f3f9e8196ef498eddf2"),
+        );
+        assert_eq!(
+            Poseidon2Hash::<Scalar>::hash_many([h256(12), h256(34)]),
+            parse_hash("0x08802dc1d5eaf75680808adb1d19bb420f34f5e786f09e05ffa5d41fb2bdfe6d"),
+        );
+        assert_eq!(
+            Poseidon2Hash::<Scalar>::hash_many([h256(12), h256(34), h256(56)]),
+            parse_hash("0x236092ebefc7e6565e0e75414d8fdce1ce2e19bb59002d36b794b9c3111bb9cd"),
+        );
+        assert_eq!(
+            Poseidon2Hash::<Scalar>::hash_many([h256(56), h256(78), h256(90), h256(12), h256(34)]),
+            parse_hash("0x7499d072269d7c32ad0477050bacd7cc84009b845c016280d679bc7849ed845a"),
+        );
+    }
 }

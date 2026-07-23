@@ -3,7 +3,6 @@ use crate::utils;
 use anyhow::{Result, anyhow};
 use primitive_types::H256;
 use starkom_bluesky::Scalar;
-use starkom_ff::Field;
 use std::marker::PhantomData;
 use std::sync::LazyLock;
 
