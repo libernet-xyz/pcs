@@ -251,6 +251,7 @@ mod tests {
     use super::*;
     use crate::hash;
     use starkom_bluesky::{from_const, parse_scalar};
+    use starkom_ff::Field;
 
     type Poseidon2Hash = hash::Poseidon2Hash<Scalar>;
     type Sha2Hash = hash::Sha2Hash<Scalar>;
@@ -262,101 +263,114 @@ mod tests {
     #[test]
     fn test_merklify_one_sha2() {
         let mut hashes = vec![parse_hash(
-            "0x57f9d25fa1364456276058c3ef030b43986cddc08941af3b672b1b62145217e0",
+            "0x1fe9e33b7ff790473e13eb6384d61d6abb32d2e50b30a382c9767b5347f5846b",
         )];
         merklify::<Sha2Hash>(&mut hashes, 1);
         assert_eq!(
             hashes,
             vec![parse_hash(
-                "0x57f9d25fa1364456276058c3ef030b43986cddc08941af3b672b1b62145217e0"
+                "0x1fe9e33b7ff790473e13eb6384d61d6abb32d2e50b30a382c9767b5347f5846b"
             )]
         );
     }
 
-    // #[test]
-    // fn test_merklify_one_poseidon2() {
-    //     let mut values = vec![from_const(12)];
-    //     merklify::<Poseidon2Hash>(&mut values, 1);
-    //     assert_eq!(values, vec![from_const(12)]);
-    // }
+    #[test]
+    fn test_merklify_one_poseidon2() {
+        let mut hashes = vec![parse_hash(
+            "0x1fe9e33b7ff790473e13eb6384d61d6abb32d2e50b30a382c9767b5347f5846b",
+        )];
+        merklify::<Poseidon2Hash>(&mut hashes, 1);
+        assert_eq!(
+            hashes,
+            vec![parse_hash(
+                "0x1fe9e33b7ff790473e13eb6384d61d6abb32d2e50b30a382c9767b5347f5846b"
+            )]
+        );
+    }
 
-    // #[test]
-    // fn test_merklify_two_sha2() {
-    //     let mut values = vec![from_const(34), from_const(56)];
-    //     values.resize(3, from_const(0));
-    //     merklify::<Sha2Hash>(&mut values, 2);
-    //     assert_eq!(
-    //         values,
-    //         vec![
-    //             from_const(34),
-    //             from_const(56),
-    //             parse_scalar("0x6e6dde7078fbd8bbe07b18f91969744bc05bdc2504f64852aadea8c59668bf53")
-    //         ]
-    //     );
-    // }
+    #[test]
+    fn test_merklify_two_sha2() {
+        let mut hashes = vec![
+            parse_hash("0x0cbb1061e55efef40fae3c8e34d301c9940889146f816edd475052fc45caf060"),
+            parse_hash("0x2d8257d72c4b6e6bfa3a21a22c053d02d1d52b4b5e6097acfd0ed45f827d6ba4"),
+        ];
+        hashes.resize(3, H256::default());
+        merklify::<Sha2Hash>(&mut hashes, 2);
+        assert_eq!(
+            hashes,
+            vec![
+                parse_hash("0x0cbb1061e55efef40fae3c8e34d301c9940889146f816edd475052fc45caf060"),
+                parse_hash("0x2d8257d72c4b6e6bfa3a21a22c053d02d1d52b4b5e6097acfd0ed45f827d6ba4"),
+                parse_hash("0x3af448b6612ac9931b7413ecca5d209187cd808ae2d3647099aa99fada16c955")
+            ]
+        );
+    }
 
-    // #[test]
-    // fn test_merklify_two_poseidon2() {
-    //     let mut values = vec![from_const(34), from_const(56)];
-    //     values.resize(3, from_const(0));
-    //     merklify::<Poseidon2Hash>(&mut values, 2);
-    //     assert_eq!(
-    //         values,
-    //         vec![
-    //             from_const(34),
-    //             from_const(56),
-    //             parse_scalar("0x6782206898bfba528451982fe95febe270ed7dc81db9022c33aeddc7408f2cdb")
-    //         ]
-    //     );
-    // }
+    #[test]
+    fn test_merklify_two_poseidon2() {
+        let mut hashes = vec![
+            parse_hash("0x0cbb1061e55efef40fae3c8e34d301c9940889146f816edd475052fc45caf060"),
+            parse_hash("0x2d8257d72c4b6e6bfa3a21a22c053d02d1d52b4b5e6097acfd0ed45f827d6ba4"),
+        ];
+        hashes.resize(3, H256::default());
+        merklify::<Poseidon2Hash>(&mut hashes, 2);
+        assert_eq!(
+            hashes,
+            vec![
+                parse_hash("0x0cbb1061e55efef40fae3c8e34d301c9940889146f816edd475052fc45caf060"),
+                parse_hash("0x2d8257d72c4b6e6bfa3a21a22c053d02d1d52b4b5e6097acfd0ed45f827d6ba4"),
+                parse_hash("0x3ff95fb9aa3d97ddb2483415494484499bf4f06b1dfdb5e74e0475c2f6c0c6c8")
+            ]
+        );
+    }
 
-    // #[test]
-    // fn test_merklify_four_sha2() {
-    //     let mut values = vec![
-    //         from_const(78),
-    //         from_const(90),
-    //         from_const(12),
-    //         from_const(34),
-    //     ];
-    //     values.resize(7, from_const(0));
-    //     merklify::<Sha2Hash>(&mut values, 4);
-    //     assert_eq!(
-    //         values,
-    //         vec![
-    //             from_const(78),
-    //             from_const(90),
-    //             from_const(12),
-    //             from_const(34),
-    //             parse_scalar("0x776db780d4c0f6ebb3393eda47e5911aaf0b6481e7d5232c1b44838b9e1692f8"),
-    //             parse_scalar("0x0c00cbff7075ad00160f57ba02d191f026ec3d3f354c7d9c043336805485c165"),
-    //             parse_scalar("0x6cb75e80dcb30850d6f389363cf63808be902debda61ccc26881341ac295dff6"),
-    //         ]
-    //     );
-    // }
+    #[test]
+    fn test_merklify_four_sha2() {
+        let mut hashes = vec![
+            parse_hash("0x034acf2cced8e9744784ec9c3c626fa83f6f8ddd83faed9d5caa5ad72c91eb1c"),
+            parse_hash("0x39dce95a2271a57f999981eef6917f3df8ad25d116c98d809a3b7da5d54805a3"),
+            parse_hash("0x435246f701f1483adcb7037fa64b3fa027c41e13a52d1e6c502e9b71dea3ca81"),
+            parse_hash("0x7952ed41c4062f594b53b8c548874b41a7a7f05593d7a5a313ed82c2fe1c62d7"),
+        ];
+        hashes.resize(7, H256::default());
+        merklify::<Sha2Hash>(&mut hashes, 4);
+        assert_eq!(
+            hashes,
+            vec![
+                parse_hash("0x034acf2cced8e9744784ec9c3c626fa83f6f8ddd83faed9d5caa5ad72c91eb1c"),
+                parse_hash("0x39dce95a2271a57f999981eef6917f3df8ad25d116c98d809a3b7da5d54805a3"),
+                parse_hash("0x435246f701f1483adcb7037fa64b3fa027c41e13a52d1e6c502e9b71dea3ca81"),
+                parse_hash("0x7952ed41c4062f594b53b8c548874b41a7a7f05593d7a5a313ed82c2fe1c62d7"),
+                parse_hash("0x3d139c65859969e86db444ccc0d36ffd0456b3f92d3dfb34fa10c8c07f5ada06"),
+                parse_hash("0xdc3dd313db4b53f2720fcfe6373d286a9c40911546e1c434fa24ab650a75b586"),
+                parse_hash("0xed171c6bd6876b93f4fc8914e0b2a8db53d7204048ad9fdff6e7127c077ca072"),
+            ]
+        );
+    }
 
-    // #[test]
-    // fn test_merklify_four_poseidon2() {
-    //     let mut values = vec![
-    //         from_const(78),
-    //         from_const(90),
-    //         from_const(12),
-    //         from_const(34),
-    //     ];
-    //     values.resize(7, from_const(0));
-    //     merklify::<Poseidon2Hash>(&mut values, 4);
-    //     assert_eq!(
-    //         values,
-    //         vec![
-    //             from_const(78),
-    //             from_const(90),
-    //             from_const(12),
-    //             from_const(34),
-    //             parse_scalar("0x13916a113574c17ef27178ff2ca9be81fc1f57a00a20ab9aee4241ccad7a876c"),
-    //             parse_scalar("0x707ccd49074554cf443b208ee43e7fd563e45488b075fef503504384bdfa542c"),
-    //             parse_scalar("0x612fce227318fc205d3b8b2954eb931d92c9e0bd78defcf162b5109f7e1a9722"),
-    //         ]
-    //     );
-    // }
+    #[test]
+    fn test_merklify_four_poseidon2() {
+        let mut hashes = vec![
+            parse_hash("0x034acf2cced8e9744784ec9c3c626fa83f6f8ddd83faed9d5caa5ad72c91eb1c"),
+            parse_hash("0x39dce95a2271a57f999981eef6917f3df8ad25d116c98d809a3b7da5d54805a3"),
+            parse_hash("0x435246f701f1483adcb7037fa64b3fa027c41e13a52d1e6c502e9b71dea3ca81"),
+            parse_hash("0x7952ed41c4062f594b53b8c548874b41a7a7f05593d7a5a313ed82c2fe1c62d7"),
+        ];
+        hashes.resize(7, H256::default());
+        merklify::<Poseidon2Hash>(&mut hashes, 4);
+        assert_eq!(
+            hashes,
+            vec![
+                parse_hash("0x034acf2cced8e9744784ec9c3c626fa83f6f8ddd83faed9d5caa5ad72c91eb1c"),
+                parse_hash("0x39dce95a2271a57f999981eef6917f3df8ad25d116c98d809a3b7da5d54805a3"),
+                parse_hash("0x435246f701f1483adcb7037fa64b3fa027c41e13a52d1e6c502e9b71dea3ca81"),
+                parse_hash("0x7952ed41c4062f594b53b8c548874b41a7a7f05593d7a5a313ed82c2fe1c62d7"),
+                parse_hash("0x5d405b8c4875e7509085d43c8130b10a3b034b88e9f3c413a0a4460be077858b"),
+                parse_hash("0x0346e1fa000ed1aa3dbde3cef3996f9a532e4f4486dd72bfbfd836a9c6079d90"),
+                parse_hash("0x1681bb07015f5c6413ee62486871b6c95feb5ad89f62638998f6e599fa11193d"),
+            ]
+        );
+    }
 
     // fn test_merkle_tree<H: Hash<Scalar>>(
     //     evaluations: Vec<Vec<Scalar>>,
