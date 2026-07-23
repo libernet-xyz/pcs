@@ -2,6 +2,7 @@ use primitive_types::{H256, U512};
 use sha2::{self, Digest};
 use starkom_bluesky::Scalar;
 use starkom_ff::{Field, Field256, PrimeField, PrimeField256};
+use starkom_poseidon as poseidon1;
 use starkom_poseidon2 as poseidon2;
 use std::marker::PhantomData;
 
@@ -156,6 +157,81 @@ impl HashBackend<Scalar> for Sha2Hash<Scalar> {
     }
 }
 
+/// Poseidon2 hash backend.
+#[derive(Debug, Default, Copy, Clone)]
+pub struct Poseidon1Hash<F: PrimeField> {
+    _data: PhantomData<F>,
+}
+
+impl Poseidon1Hash<Scalar> {
+    fn extract_scalar(h256: H256) -> Scalar {
+        Scalar::try_from_be_bytes(h256.as_bytes()).unwrap()
+    }
+
+    fn hash_t3<I: IntoIterator<Item = Scalar>>(inputs: I) -> Scalar {
+        poseidon1::hash0::<poseidon1::BlueSkyConfig3, Scalar, 3, 2, 1>(
+            inputs.into_iter().collect::<Vec<Scalar>>().as_slice(),
+        )
+    }
+
+    fn hash_t4<I: IntoIterator<Item = Scalar>>(inputs: I) -> Scalar {
+        poseidon1::hash0::<poseidon1::BlueSkyConfig4, Scalar, 4, 3, 1>(
+            inputs.into_iter().collect::<Vec<Scalar>>().as_slice(),
+        )
+    }
+}
+
+impl Hash<Scalar> for Poseidon1Hash<Scalar> {
+    fn hash_two(input1: Scalar, input2: Scalar) -> H256 {
+        let hash = Self::hash_t3([input1, input2]);
+        H256::from_slice(&hash.to_be_bytes())
+    }
+
+    fn hash_three(input1: Scalar, input2: Scalar, input3: Scalar) -> H256 {
+        let hash = Self::hash_t4([input1, input2, input3]);
+        H256::from_slice(&hash.to_be_bytes())
+    }
+
+    fn hash_many<I: IntoIterator<Item = Scalar>>(inputs: I) -> H256 {
+        let hash = Self::hash_t4(inputs);
+        H256::from_slice(&hash.to_be_bytes())
+    }
+}
+
+impl Hash<H256> for Poseidon1Hash<Scalar> {
+    fn hash_two(input1: H256, input2: H256) -> H256 {
+        let hash = Self::hash_t3([Self::extract_scalar(input1), Self::extract_scalar(input2)]);
+        H256::from_slice(&hash.to_be_bytes())
+    }
+
+    fn hash_three(input1: H256, input2: H256, input3: H256) -> H256 {
+        let hash = Self::hash_t4([
+            Self::extract_scalar(input1),
+            Self::extract_scalar(input2),
+            Self::extract_scalar(input3),
+        ]);
+        H256::from_slice(&hash.to_be_bytes())
+    }
+
+    fn hash_many<I: IntoIterator<Item = H256>>(inputs: I) -> H256 {
+        let hash = Self::hash_t4(inputs.into_iter().map(Self::extract_scalar));
+        H256::from_slice(&hash.to_be_bytes())
+    }
+}
+
+impl HashBackend<Scalar> for Poseidon1Hash<Scalar> {
+    fn challenge<I: IntoIterator<Item = H256>>(dst: Scalar, transcript_hashes: I) -> Scalar {
+        let transcript_hash = {
+            let transcript_hashes: Vec<H256> = transcript_hashes.into_iter().collect();
+            Self::hash_many(
+                std::iter::once(Self::encode_scalar(dst))
+                    .chain(std::iter::once(Self::encode_usize(transcript_hashes.len())))
+                    .chain(transcript_hashes.into_iter()),
+            )
+        };
+        Self::hash_t3([dst, Self::extract_scalar(transcript_hash)])
+    }
+}
 /// Poseidon2 hash backend.
 #[derive(Debug, Default, Copy, Clone)]
 pub struct Poseidon2Hash<F: PrimeField> {
@@ -352,6 +428,116 @@ mod tests {
         assert_eq!(
             Sha2Hash::<Scalar>::hash_many([h256(56), h256(78), h256(90), h256(12), h256(34)]),
             parse_hash("0x4e8b5c5fe411c82f0449cead9ef8ae232d5dbb6bf91fefa0686f18062cc8f50e"),
+        );
+    }
+
+    #[test]
+    fn test_poseidon1_hash_two_scalars() {
+        assert_eq!(
+            Poseidon1Hash::<Scalar>::hash_two(from_const(12), from_const(34)),
+            parse_hash("0x45470d74563e5e49fe3bd2a161b36116e3c6a6a2f9c105bfe8c2599ff6116b06")
+        );
+        assert_eq!(
+            Poseidon1Hash::<Scalar>::hash_two(from_const(12), from_const(56)),
+            parse_hash("0x517c153fb7badd9aa6ac42a9528e58b48fb550f0d57d5aecdb2c09d355deb80d")
+        );
+        assert_eq!(
+            Poseidon1Hash::<Scalar>::hash_two(from_const(56), from_const(78)),
+            parse_hash("0x1ba4c686a3529d3bfc13890b2e1438b7adf780e2978cb2cabdd47653f402e8fe")
+        );
+    }
+
+    #[test]
+    fn test_poseidon1_hash_two_hashes() {
+        assert_eq!(
+            Poseidon1Hash::<Scalar>::hash_two(h256(12), h256(34)),
+            parse_hash("0x45470d74563e5e49fe3bd2a161b36116e3c6a6a2f9c105bfe8c2599ff6116b06")
+        );
+        assert_eq!(
+            Poseidon1Hash::<Scalar>::hash_two(h256(12), h256(56)),
+            parse_hash("0x517c153fb7badd9aa6ac42a9528e58b48fb550f0d57d5aecdb2c09d355deb80d")
+        );
+        assert_eq!(
+            Poseidon1Hash::<Scalar>::hash_two(h256(56), h256(78)),
+            parse_hash("0x1ba4c686a3529d3bfc13890b2e1438b7adf780e2978cb2cabdd47653f402e8fe")
+        );
+    }
+
+    #[test]
+    fn test_poseidon1_hash_three_scalars() {
+        assert_eq!(
+            Poseidon1Hash::<Scalar>::hash_three(from_const(12), from_const(34), from_const(56)),
+            parse_hash("0x1125d1d7bcc64d065695f306f08db087abc90d214fd982461296e607de7d4d49")
+        );
+        assert_eq!(
+            Poseidon1Hash::<Scalar>::hash_three(from_const(12), from_const(56), from_const(34)),
+            parse_hash("0x71c3d9b1e8a0e5102b7c56a20d1bc7a838f90881529e4132798df25f18980546")
+        );
+        assert_eq!(
+            Poseidon1Hash::<Scalar>::hash_three(from_const(56), from_const(78), from_const(90)),
+            parse_hash("0x516b43041b6e111a7be5670972354589d8686593fbd2a994e14c53e55bb803cd")
+        );
+    }
+
+    #[test]
+    fn test_poseidon1_hash_three_hashes() {
+        assert_eq!(
+            Poseidon1Hash::<Scalar>::hash_three(h256(12), h256(34), h256(56)),
+            parse_hash("0x1125d1d7bcc64d065695f306f08db087abc90d214fd982461296e607de7d4d49")
+        );
+        assert_eq!(
+            Poseidon1Hash::<Scalar>::hash_three(h256(12), h256(56), h256(34)),
+            parse_hash("0x71c3d9b1e8a0e5102b7c56a20d1bc7a838f90881529e4132798df25f18980546")
+        );
+        assert_eq!(
+            Poseidon1Hash::<Scalar>::hash_three(h256(56), h256(78), h256(90)),
+            parse_hash("0x516b43041b6e111a7be5670972354589d8686593fbd2a994e14c53e55bb803cd")
+        );
+    }
+
+    #[test]
+    fn test_poseidon1_hash_many_scalars() {
+        assert_eq!(
+            Poseidon1Hash::<Scalar>::hash_many([from_const(12)]),
+            parse_hash("0x7c8412cec3a535ff1ceb3ed699e7a26f4bfdb11008ab52acdda94d8908e94232"),
+        );
+        assert_eq!(
+            Poseidon1Hash::<Scalar>::hash_many([from_const(12), from_const(34)]),
+            parse_hash("0x6fda95845c8b151a4ec3317c5023a03da1e4d8404d1d8442897978cf7597cedb"),
+        );
+        assert_eq!(
+            Poseidon1Hash::<Scalar>::hash_many([from_const(12), from_const(34), from_const(56)]),
+            parse_hash("0x1125d1d7bcc64d065695f306f08db087abc90d214fd982461296e607de7d4d49"),
+        );
+        assert_eq!(
+            Poseidon1Hash::<Scalar>::hash_many([
+                from_const(56),
+                from_const(78),
+                from_const(90),
+                from_const(12),
+                from_const(34)
+            ]),
+            parse_hash("0x7f11ea73b86da117580a88152e63526cce28e51a7b2f4603307d2404a19dc663"),
+        );
+    }
+
+    #[test]
+    fn test_poseidon1_hash_many_hashes() {
+        assert_eq!(
+            Poseidon1Hash::<Scalar>::hash_many([h256(12)]),
+            parse_hash("0x7c8412cec3a535ff1ceb3ed699e7a26f4bfdb11008ab52acdda94d8908e94232"),
+        );
+        assert_eq!(
+            Poseidon1Hash::<Scalar>::hash_many([h256(12), h256(34)]),
+            parse_hash("0x6fda95845c8b151a4ec3317c5023a03da1e4d8404d1d8442897978cf7597cedb"),
+        );
+        assert_eq!(
+            Poseidon1Hash::<Scalar>::hash_many([h256(12), h256(34), h256(56)]),
+            parse_hash("0x1125d1d7bcc64d065695f306f08db087abc90d214fd982461296e607de7d4d49"),
+        );
+        assert_eq!(
+            Poseidon1Hash::<Scalar>::hash_many([h256(56), h256(78), h256(90), h256(12), h256(34)]),
+            parse_hash("0x7f11ea73b86da117580a88152e63526cce28e51a7b2f4603307d2404a19dc663"),
         );
     }
 
