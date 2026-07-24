@@ -32,7 +32,9 @@ impl<H: HashBackend<Scalar>> FoldableTree<H> for Tree<H> {
         let n = self.num_leaves();
         assert!(n.is_power_of_two());
 
-        let alpha = H::challenge(*FOLD_DST, [self.root_hash()]);
+        // Okay to unwrap here because folding only happens in prover code, so all hashes are
+        // guaranteed to be in range.
+        let alpha = H::challenge(*FOLD_DST, [self.root_hash()]).unwrap();
 
         let k = n.trailing_zeros() as usize;
         let omega_inv = Scalar::ROOT_OF_UNITY_INV.pow_u64(1u64 << (Scalar::S - k));
@@ -182,7 +184,7 @@ impl<H: HashBackend<Scalar>> Query<H> {
         for round in 0..num_folds {
             let (left, right) = &folds[round];
             let root_hash = commitment.roots()[round];
-            let alpha = H::challenge(*FOLD_DST, [root_hash]);
+            let alpha = H::challenge(*FOLD_DST, [root_hash])?;
             let neg = right.leaf();
 
             if 1usize << left.len() != n {
@@ -216,7 +218,7 @@ impl<H: HashBackend<Scalar>> Query<H> {
         }
 
         let (left, right) = folds.last().unwrap();
-        if !left.is_constant() || !right.is_constant() {
+        if !left.is_constant()? || !right.is_constant()? {
             return Err(anyhow!("final folded polynomial is not constant"));
         }
 
@@ -321,8 +323,8 @@ impl<H: HashBackend<Scalar>> Prover<H> {
 
         {
             let (left, right) = folds.last().unwrap();
-            assert!(left.is_constant());
-            assert!(right.is_constant());
+            assert!(left.is_constant().unwrap());
+            assert!(right.is_constant().unwrap());
         }
 
         Query {

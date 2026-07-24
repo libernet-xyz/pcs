@@ -77,11 +77,12 @@ impl<H: HashBackend<Scalar>> Commitment<H> {
     pub fn transcript_hash(&self, batch_count: usize) -> H256 {
         assert!(batch_count > 0);
         assert!(batch_count <= self.tree_roots.len());
-        H::hash_many(
-            std::iter::once(H::encode_scalar(*TRANSCRIPT_DST))
+        H::hash_many_words(
+            std::iter::once(H::encode_scalar256(*TRANSCRIPT_DST))
                 .chain(std::iter::once(H::encode_usize(batch_count)))
                 .chain(self.tree_roots[..batch_count].iter().copied()),
         )
+        .unwrap()
     }
 
     /// Returns the FRI query indices derived via Fiat-Shamir from the full commitment transcript
@@ -98,7 +99,8 @@ impl<H: HashBackend<Scalar>> Commitment<H> {
                     .chain(std::iter::once(H::encode_usize(self.inner.len())))
                     .chain(self.inner.roots().iter().copied())
                     .chain(std::iter::once(H::encode_usize(i))),
-            );
+            )
+            .unwrap();
             let index = hash.to_u256() % n;
             indices.push(index.as_u64() as usize);
         }
@@ -185,11 +187,12 @@ impl<H: HashBackend<Scalar>> Committer<H> {
     /// The hashes returned by this method are compatible with [`Commitment::transcript_hash`],
     /// which can be used on the verifier side.
     pub fn transcript_hash(&self) -> H256 {
-        H::hash_many(
-            std::iter::once(H::encode_scalar(*TRANSCRIPT_DST))
+        H::hash_many_words(
+            std::iter::once(H::encode_scalar256(*TRANSCRIPT_DST))
                 .chain(std::iter::once(H::encode_usize(self.trees.len())))
                 .chain(self.trees.iter().map(Tree::root_hash)),
         )
+        .unwrap()
     }
 
     /// Adds a batch of polynomials, returning the index of the newly created batch.
@@ -259,9 +262,10 @@ impl<H: HashBackend<Scalar>> Committer<H> {
                                     .into_iter(),
                             )
                         })
-                        .map(H::encode_scalar),
+                        .map(H::encode_scalar256),
                 ),
-        );
+        )
+        .unwrap();
 
         let points: BTreeMap<Scalar, Vec<Scalar>> = points
             .iter()
@@ -391,9 +395,10 @@ impl<H: HashBackend<Scalar>> Proof<H> {
                 .chain(self.points.iter().flat_map(|(z, values)| {
                     std::iter::once(z)
                         .chain(values.iter())
-                        .map(|&value| H::encode_scalar(value))
+                        .map(|&value| H::encode_scalar256(value))
                 })),
-        );
+        )
+        .unwrap();
 
         for ((query, openings), &expected_index) in
             (self.queries.iter().zip(self.openings.iter())).zip(indices.iter())
