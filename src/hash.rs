@@ -27,6 +27,13 @@ pub trait ScalarHash<F: PrimeField> {
 }
 
 /// Generic cryptographic hash functions working on 256-bit input words.
+///
+/// The functions provided by this trait are fallible because some implementors (namely the
+/// algebraic ones, ie. [`Poseidon1Hash`] and [`Poseidon2Hash`]) make assumptions about the range
+/// and/or layout of the input words and fail if those assumptions don't hold. For example, when
+/// running on the BlueSky field all input words must be BlueSky scalars in big-endian order, and
+/// when running on Goldilocks all input words must be 4-ples of Goldilocks scalars (aka
+/// Goldilocks^4) in big-endian order.
 pub trait HashH256 {
     /// Hashes two input values.
     fn hash_two_words(input1: H256, input2: H256) -> Result<H256>;
@@ -183,22 +190,23 @@ impl HashBackend<Scalar> for Sha2Hash<Scalar> {
     }
 }
 
-/// Poseidon2 hash backend.
+/// Raw T=3 and T=4 Poseidon instances, for internal use.
+///
+/// Do not use this trait directly, refer to [`Poseidon1Hash`] and [`Poseidon2Hash`] instead.
+pub trait PoseidonHasher<F: PrimeField> {
+    fn hash_t3<I: IntoIterator<Item = F>>(inputs: I) -> F;
+    fn hash_t4<I: IntoIterator<Item = F>>(inputs: I) -> F;
+}
+
+/// Implements [`Poseidon1Hasher`] with the Poseidon1 permutation.
+///
+/// For internal use. Do not use directly, refer to [`Poseidon1Hash`] instead.
 #[derive(Debug, Default, Copy, Clone)]
-pub struct Poseidon1Hash<F: PrimeField> {
+pub struct Poseidon1Hasher<F: PrimeField> {
     _data: PhantomData<F>,
 }
 
-impl Poseidon1Hash<Scalar> {
-    fn extract_scalar(h256: H256) -> Result<Scalar> {
-        Scalar::try_from_be_bytes(h256.as_bytes())
-            .into_option()
-            .context(format!(
-                "invalid hash: {} is outside the BlueSky range",
-                h256
-            ))
-    }
-
+impl PoseidonHasher<Scalar> for Poseidon1Hasher<Scalar> {
     fn hash_t3<I: IntoIterator<Item = Scalar>>(inputs: I) -> Scalar {
         poseidon1::hash0::<poseidon1::BlueSkyConfig3, Scalar, 3, 2, 1>(inputs)
     }
@@ -208,84 +216,15 @@ impl Poseidon1Hash<Scalar> {
     }
 }
 
-impl ScalarHash<Scalar> for Poseidon1Hash<Scalar> {
-    fn hash_two_scalars(input1: Scalar, input2: Scalar) -> H256 {
-        let hash = Self::hash_t3([input1, input2]);
-        H256::from_slice(&hash.to_be_bytes())
-    }
-
-    fn hash_three_scalars(input1: Scalar, input2: Scalar, input3: Scalar) -> H256 {
-        let hash = Self::hash_t4([input1, input2, input3]);
-        H256::from_slice(&hash.to_be_bytes())
-    }
-
-    fn hash_many_scalars<I: IntoIterator<Item = Scalar>>(inputs: I) -> H256 {
-        let hash = Self::hash_t4(inputs);
-        H256::from_slice(&hash.to_be_bytes())
-    }
-}
-
-impl HashH256 for Poseidon1Hash<Scalar> {
-    fn hash_two_words(input1: H256, input2: H256) -> Result<H256> {
-        let hash = Self::hash_t3([Self::extract_scalar(input1)?, Self::extract_scalar(input2)?]);
-        Ok(H256::from_slice(&hash.to_be_bytes()))
-    }
-
-    fn hash_three_words(input1: H256, input2: H256, input3: H256) -> Result<H256> {
-        let hash = Self::hash_t4([
-            Self::extract_scalar(input1)?,
-            Self::extract_scalar(input2)?,
-            Self::extract_scalar(input3)?,
-        ]);
-        Ok(H256::from_slice(&hash.to_be_bytes()))
-    }
-
-    fn hash_many_words<I: IntoIterator<Item = H256>>(inputs: I) -> Result<H256> {
-        let inputs: Vec<Scalar> = inputs
-            .into_iter()
-            .map(Self::extract_scalar)
-            .collect::<Result<_>>()?;
-        let hash = Self::hash_t4(inputs);
-        Ok(H256::from_slice(&hash.to_be_bytes()))
-    }
-}
-
-impl HashBackend<Scalar> for Poseidon1Hash<Scalar> {
-    fn challenge<I: IntoIterator<Item = H256>>(
-        dst: Scalar,
-        transcript_hashes: I,
-    ) -> Result<Scalar> {
-        let transcript_hashes: Vec<Scalar> = transcript_hashes
-            .into_iter()
-            .map(Self::extract_scalar)
-            .collect::<Result<_>>()?;
-        let transcript_hash = Self::hash_many_scalars(
-            std::iter::once(dst)
-                .chain(std::iter::once(
-                    Scalar::from(transcript_hashes.len() as u64),
-                ))
-                .chain(transcript_hashes),
-        );
-        Ok(Self::hash_t3([dst, Self::extract_scalar(transcript_hash)?]))
-    }
-}
-
-/// Poseidon2 hash backend.
+/// Implements [`Poseidon1Hasher`] with the Poseidon2 permutation.
+///
+/// For internal use. Do not use directly, refer to [`Poseidon2Hash`] instead.
 #[derive(Debug, Default, Copy, Clone)]
-pub struct Poseidon2Hash<F: PrimeField> {
+pub struct Poseidon2Hasher<F: PrimeField> {
     _data: PhantomData<F>,
 }
 
-impl Poseidon2Hash<Scalar> {
-    fn extract_scalar(h256: H256) -> Result<Scalar> {
-        Scalar::try_from_be_bytes(h256.as_bytes())
-            .into_option()
-            .context(format!(
-                "invalid hash: {} is outside the BlueSky range",
-                h256
-            ))
-    }
-
+impl PoseidonHasher<Scalar> for Poseidon2Hasher<Scalar> {
     fn hash_t3<I: IntoIterator<Item = Scalar>>(inputs: I) -> Scalar {
         poseidon2::hash0::<poseidon2::BlueSkyConfig3, Scalar, 3, 2, 1>(inputs)
     }
@@ -295,31 +234,48 @@ impl Poseidon2Hash<Scalar> {
     }
 }
 
-impl ScalarHash<Scalar> for Poseidon2Hash<Scalar> {
+/// Poseidon2 hash backend.
+#[derive(Debug, Default, Copy, Clone)]
+pub struct PoseidonHash<F: PrimeField, H: PoseidonHasher<F>> {
+    _data: PhantomData<(F, H)>,
+}
+
+impl<H: PoseidonHasher<Scalar>> PoseidonHash<Scalar, H> {
+    fn extract_scalar(h256: H256) -> Result<Scalar> {
+        Scalar::try_from_be_bytes(h256.as_bytes())
+            .into_option()
+            .context(format!(
+                "invalid hash: {} is outside the BlueSky range",
+                h256
+            ))
+    }
+}
+
+impl<H: PoseidonHasher<Scalar>> ScalarHash<Scalar> for PoseidonHash<Scalar, H> {
     fn hash_two_scalars(input1: Scalar, input2: Scalar) -> H256 {
-        let hash = Self::hash_t3([input1, input2]);
+        let hash = H::hash_t3([input1, input2]);
         H256::from_slice(&hash.to_be_bytes())
     }
 
     fn hash_three_scalars(input1: Scalar, input2: Scalar, input3: Scalar) -> H256 {
-        let hash = Self::hash_t4([input1, input2, input3]);
+        let hash = H::hash_t4([input1, input2, input3]);
         H256::from_slice(&hash.to_be_bytes())
     }
 
     fn hash_many_scalars<I: IntoIterator<Item = Scalar>>(inputs: I) -> H256 {
-        let hash = Self::hash_t4(inputs);
+        let hash = H::hash_t4(inputs);
         H256::from_slice(&hash.to_be_bytes())
     }
 }
 
-impl HashH256 for Poseidon2Hash<Scalar> {
+impl<H: PoseidonHasher<Scalar>> HashH256 for PoseidonHash<Scalar, H> {
     fn hash_two_words(input1: H256, input2: H256) -> Result<H256> {
-        let hash = Self::hash_t3([Self::extract_scalar(input1)?, Self::extract_scalar(input2)?]);
+        let hash = H::hash_t3([Self::extract_scalar(input1)?, Self::extract_scalar(input2)?]);
         Ok(H256::from_slice(&hash.to_be_bytes()))
     }
 
     fn hash_three_words(input1: H256, input2: H256, input3: H256) -> Result<H256> {
-        let hash = Self::hash_t4([
+        let hash = H::hash_t4([
             Self::extract_scalar(input1)?,
             Self::extract_scalar(input2)?,
             Self::extract_scalar(input3)?,
@@ -332,12 +288,12 @@ impl HashH256 for Poseidon2Hash<Scalar> {
             .into_iter()
             .map(Self::extract_scalar)
             .collect::<Result<_>>()?;
-        let hash = Self::hash_t4(inputs);
+        let hash = H::hash_t4(inputs);
         Ok(H256::from_slice(&hash.to_be_bytes()))
     }
 }
 
-impl HashBackend<Scalar> for Poseidon2Hash<Scalar> {
+impl<H: PoseidonHasher<Scalar>> HashBackend<Scalar> for PoseidonHash<Scalar, H> {
     fn challenge<I: IntoIterator<Item = H256>>(
         dst: Scalar,
         transcript_hashes: I,
@@ -353,9 +309,12 @@ impl HashBackend<Scalar> for Poseidon2Hash<Scalar> {
                 ))
                 .chain(transcript_hashes),
         );
-        Ok(Self::hash_t3([dst, Self::extract_scalar(transcript_hash)?]))
+        Ok(H::hash_t3([dst, Self::extract_scalar(transcript_hash)?]))
     }
 }
+
+pub type Poseidon1Hash<F> = PoseidonHash<F, Poseidon1Hasher<F>>;
+pub type Poseidon2Hash<F> = PoseidonHash<F, Poseidon2Hasher<F>>;
 
 #[cfg(test)]
 mod tests {
