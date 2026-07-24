@@ -1,4 +1,4 @@
-use crate::hash::{HashBackend, HashH256, ScalarHash};
+use crate::hash::{Hash, HashBackend};
 use crate::utils;
 use anyhow::{Result, anyhow};
 use primitive_types::H256;
@@ -14,8 +14,8 @@ static LEAF_DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"sta
 /// Our Merkle trees have vectors of values as leaves (there's one element for every committed
 /// polynomial so that we can commit multiple polynomials into the same tree), so the input `values`
 /// parameter is a slice of scalar values.
-fn hash_leaf<H: ScalarHash<Scalar>>(values: &[Scalar]) -> H256 {
-    H::hash_many_scalars(
+fn hash_leaf<H: Hash<Scalar>>(values: &[Scalar]) -> H256 {
+    H::hash_many(
         std::iter::once(*LEAF_DST)
             .chain(std::iter::once(Scalar::from(values.len() as u64)))
             .chain(values.iter().cloned()),
@@ -39,14 +39,12 @@ fn hash_leaf<H: ScalarHash<Scalar>>(values: &[Scalar]) -> H256 {
 /// the full tree can be stored.
 ///
 /// Note that the Merkle root will be at index `(n - 1) * 2`.
-pub(crate) fn merklify<H: HashH256>(mut hashes: &mut [H256], mut n: usize) {
+pub(crate) fn merklify<H: Hash<H256>>(mut hashes: &mut [H256], mut n: usize) {
     assert!(n.is_power_of_two());
     while n > 1 {
         let m = n / 2;
         for j in 0..m {
-            // Okay to unwrap here because merklification only happens in prover code, so all hashes
-            // are guaranteed to be in range.
-            hashes[n + j] = H::hash_two_words(hashes[j * 2], hashes[j * 2 + 1]).unwrap();
+            hashes[n + j] = H::hash_two(hashes[j * 2], hashes[j * 2 + 1]);
         }
         hashes = &mut hashes[n..];
         n = m;
@@ -102,9 +100,9 @@ impl<H: HashBackend<Scalar>> Proof<H> {
         let mut hash = hash_leaf::<H>(self.leaf.as_slice());
         for &sibling in &self.path {
             hash = if index & 1 != 0 {
-                H::hash_two_words(sibling, hash)?
+                H::hash_two(sibling, hash)
             } else {
-                H::hash_two_words(hash, sibling)?
+                H::hash_two(hash, sibling)
             };
             index >>= 1;
         }
@@ -123,7 +121,7 @@ impl<H: HashBackend<Scalar>> Proof<H> {
 
     /// Returns a boolean indicating whether or not the committed polynomials are constant.
     ///
-    /// An error is returned if one or more hashes in the proof are out of range; see [`HashH256`]
+    /// An error is returned if one or more hashes in the proof are out of range; see [`Hash<H256>`]
     /// for details.
     ///
     /// This function is used in low degree testing to check when the folding process collapses to
@@ -137,7 +135,7 @@ impl<H: HashBackend<Scalar>> Proof<H> {
             if sibling != hash {
                 return Ok(false);
             }
-            hash = H::hash_two_words(hash, hash)?;
+            hash = H::hash_two(hash, hash);
         }
         Ok(true)
     }

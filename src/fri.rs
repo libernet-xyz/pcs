@@ -32,9 +32,7 @@ impl<H: HashBackend<Scalar>> FoldableTree<H> for Tree<H> {
         let n = self.num_leaves();
         assert!(n.is_power_of_two());
 
-        // Okay to unwrap here because folding only happens in prover code, so all hashes are
-        // guaranteed to be in range.
-        let alpha = H::challenge(*FOLD_DST, [self.root_hash()]).unwrap();
+        let alpha = H::challenge(*FOLD_DST, [self.root_hash()]);
 
         let k = n.trailing_zeros() as usize;
         let omega_inv = Scalar::ROOT_OF_UNITY_INV.pow_u64(1u64 << (Scalar::S - k));
@@ -184,7 +182,7 @@ impl<H: HashBackend<Scalar>> Query<H> {
         for round in 0..num_folds {
             let (left, right) = &folds[round];
             let root_hash = commitment.roots()[round];
-            let alpha = H::challenge(*FOLD_DST, [root_hash])?;
+            let alpha = H::challenge(*FOLD_DST, [root_hash]);
             let neg = right.leaf();
 
             if 1usize << left.len() != n {
