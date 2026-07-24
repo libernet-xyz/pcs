@@ -169,15 +169,11 @@ impl Poseidon1Hash<Scalar> {
     }
 
     fn hash_t3<I: IntoIterator<Item = Scalar>>(inputs: I) -> Scalar {
-        poseidon1::hash0::<poseidon1::BlueSkyConfig3, Scalar, 3, 2, 1>(
-            inputs.into_iter().collect::<Vec<Scalar>>().as_slice(),
-        )
+        poseidon1::hash0::<poseidon1::BlueSkyConfig3, Scalar, 3, 2, 1>(inputs)
     }
 
     fn hash_t4<I: IntoIterator<Item = Scalar>>(inputs: I) -> Scalar {
-        poseidon1::hash0::<poseidon1::BlueSkyConfig4, Scalar, 4, 3, 1>(
-            inputs.into_iter().collect::<Vec<Scalar>>().as_slice(),
-        )
+        poseidon1::hash0::<poseidon1::BlueSkyConfig4, Scalar, 4, 3, 1>(inputs)
     }
 }
 
@@ -244,15 +240,11 @@ impl Poseidon2Hash<Scalar> {
     }
 
     fn hash_t3<I: IntoIterator<Item = Scalar>>(inputs: I) -> Scalar {
-        poseidon2::hash0::<poseidon2::BlueSkyConfig3, Scalar, 3, 2, 1>(
-            inputs.into_iter().collect::<Vec<Scalar>>().as_slice(),
-        )
+        poseidon2::hash0::<poseidon2::BlueSkyConfig3, Scalar, 3, 2, 1>(inputs)
     }
 
     fn hash_t4<I: IntoIterator<Item = Scalar>>(inputs: I) -> Scalar {
-        poseidon2::hash0::<poseidon2::BlueSkyConfig4, Scalar, 4, 3, 1>(
-            inputs.into_iter().collect::<Vec<Scalar>>().as_slice(),
-        )
+        poseidon2::hash0::<poseidon2::BlueSkyConfig4, Scalar, 4, 3, 1>(inputs)
     }
 }
 
