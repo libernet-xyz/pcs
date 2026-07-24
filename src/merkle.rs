@@ -1,55 +1,52 @@
-use crate::hash::Hash;
+use crate::hash::{Hash, HashBackend};
 use crate::utils;
 use anyhow::{Result, anyhow};
+use primitive_types::H256;
 use starkom_bluesky::Scalar;
-use starkom_ff::Field;
 use std::marker::PhantomData;
 use std::sync::LazyLock;
 
 /// Domain separator tag used when hashing the leaves of a Merkle tree.
 static LEAF_DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"starkom/merkle/leaf"));
 
-/// Domain separator tag used in (internal) Merkle tree hashes.
-static TREE_DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"starkom/merkle/tree"));
-
 /// Hashes a leaf of a Merkle tree.
-fn hash_leaf<H: Hash<Scalar>>(values: &[Scalar]) -> Scalar {
+///
+/// Our Merkle trees have vectors of values as leaves (there's one element for every committed
+/// polynomial so that we can commit multiple polynomials into the same tree), so the input `values`
+/// parameter is a slice of scalar values.
+fn hash_leaf<H: Hash<Scalar>>(values: &[Scalar]) -> H256 {
     H::hash_many(
         std::iter::once(*LEAF_DST)
             .chain(std::iter::once(Scalar::from(values.len() as u64)))
-            .chain(values.iter().cloned())
-            .collect::<Vec<Scalar>>()
-            .as_slice(),
+            .chain(values.iter().cloned()),
     )
 }
 
-/// Computes all Merkle hashes of a vector of values up to the root.
+/// Computes the internal nodes of a binary Merkle tree up to the root.
 ///
-/// `n` is the number of values and must be a power of two.
+/// `n` is the number of leaves and must be a power of two. The specified array already contains `n`
+/// leaf hashes plus `n-1` empty slots; `merklify` fills the latter with the internal node hashes.
 ///
-/// The full Merkle tree is stored inline in the `values` vector as follows:
+/// The full Merkle tree is stored inline in the `hashes` array as follows:
 ///
-///   * the first `n` elements are the values of the original vector,
+///   * the first `n` elements are the caller-provided leaf hashes,
 ///   * the next `n / 2` elements are the hashes of the second-last layer of the tree,
 ///   * the next `n / 4` elements are the hashes of the third-last layer of the tree,
 ///   * ...
 ///   * the last stored element is the Merkle root.
 ///
-/// It's the caller's responsibility to ensure the `values` array has at least `n * 2 - 1` slots so
-/// that the full tree can be stored.
+/// It's the caller's responsibility to ensure that `hashes` has at least `n * 2 - 1` slots so that
+/// the full tree can be stored.
 ///
 /// Note that the Merkle root will be at index `(n - 1) * 2`.
-///
-/// Note about usage: the Merkle trees we use in this module have scalar *vectors* for leaves, not
-/// just scalars.
-pub(crate) fn merklify<H: Hash<Scalar>>(mut values: &mut [Scalar], mut n: usize) {
+pub(crate) fn merklify<H: Hash<H256>>(mut hashes: &mut [H256], mut n: usize) {
     assert!(n.is_power_of_two());
     while n > 1 {
         let m = n / 2;
         for j in 0..m {
-            values[n + j] = H::hash_two(*TREE_DST, values[j * 2], values[j * 2 + 1]);
+            hashes[n + j] = H::hash_two(hashes[j * 2], hashes[j * 2 + 1]);
         }
-        values = &mut values[n..];
+        hashes = &mut hashes[n..];
         n = m;
     }
 }
@@ -64,13 +61,13 @@ pub(crate) fn merklify<H: Hash<Scalar>>(mut values: &mut [Scalar], mut n: usize)
 /// are reconstructed separately during the verification of a whole `Query`. In particular, all root
 /// hashes are stored in the `Commitment`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Proof<H: Hash<Scalar>> {
+pub(crate) struct Proof<H: HashBackend<Scalar>> {
     leaf: Vec<Scalar>,
-    path: Vec<Scalar>,
+    path: Vec<H256>,
     _data: PhantomData<H>,
 }
 
-impl<H: Hash<Scalar>> Proof<H> {
+impl<H: HashBackend<Scalar>> Proof<H> {
     /// Returns a reference to the leaf values (one for every committed polynomial).
     pub(crate) fn leaf(&self) -> &[Scalar] {
         self.leaf.as_slice()
@@ -99,13 +96,13 @@ impl<H: Hash<Scalar>> Proof<H> {
     }
 
     /// Verifies the proof against the given root hash.
-    pub(crate) fn verify(&self, mut index: usize, root_hash: Scalar) -> Result<()> {
+    pub(crate) fn verify(&self, mut index: usize, root_hash: H256) -> Result<()> {
         let mut hash = hash_leaf::<H>(self.leaf.as_slice());
-        for sibling in &self.path {
+        for &sibling in &self.path {
             hash = if index & 1 != 0 {
-                H::hash_two(*TREE_DST, *sibling, hash)
+                H::hash_two(sibling, hash)
             } else {
-                H::hash_two(*TREE_DST, hash, *sibling)
+                H::hash_two(hash, sibling)
             };
             index >>= 1;
         }
@@ -122,22 +119,25 @@ impl<H: Hash<Scalar>> Proof<H> {
         Ok(())
     }
 
-    /// Indicates whether or not the committed polynomials are constant.
+    /// Returns a boolean indicating whether or not the committed polynomials are constant.
     ///
-    /// This is used in low degree testing to check when the folding process collapses to degree-0
-    /// polynomials.
+    /// An error is returned if one or more hashes in the proof are out of range; see [`Hash<H256>`]
+    /// for details.
+    ///
+    /// This function is used in low degree testing to check when the folding process collapses to
+    /// degree-0 polynomials.
     ///
     /// Note that some polynomials may collapse earlier than others, and this function returns false
     /// if one or more haven't collapsed yet. So it returns true if and only if all have collapsed.
-    pub(crate) fn is_constant(&self) -> bool {
+    pub(crate) fn is_constant(&self) -> Result<bool> {
         let mut hash = hash_leaf::<H>(self.leaf.as_slice());
         for &sibling in &self.path {
             if sibling != hash {
-                return false;
+                return Ok(false);
             }
-            hash = H::hash_two(*TREE_DST, hash, hash);
+            hash = H::hash_two(hash, hash);
         }
-        true
+        Ok(true)
     }
 }
 
@@ -148,18 +148,18 @@ impl<H: Hash<Scalar>> Proof<H> {
 ///
 /// The internal nodes are single hashes.
 #[derive(Debug, Clone)]
-pub(crate) struct Tree<H: Hash<Scalar>> {
+pub(crate) struct Tree<H: HashBackend<Scalar>> {
     /// The polynomial evaluations committed in the tree. The outer array has K entries, one for
     /// every committed polynomial, and the inner array has N entries, one for every evaluation of a
     /// polynomial.
     leaves: Vec<Vec<Scalar>>,
     /// The internal nodes of the tree. There are 2*N-1 nodes in this array, with N = number of
     /// leaves. The nodes of the bottom layer are the hashes of the corresponding leaves.
-    hashes: Vec<Scalar>,
+    hashes: Vec<H256>,
     _data: PhantomData<H>,
 }
 
-impl<H: Hash<Scalar>> Tree<H> {
+impl<H: HashBackend<Scalar>> Tree<H> {
     /// Constructs a Merkle tree from a matrix of polynomial evaluations.
     ///
     /// The outer array of `polynomials` contains one entry per committed polynomial, and each of
@@ -175,7 +175,7 @@ impl<H: Hash<Scalar>> Tree<H> {
         assert!(num_polys > 0);
         let n = polynomials[0].len();
         assert!(n.is_power_of_two());
-        let mut hashes = vec![Scalar::ZERO; n * 2 - 1];
+        let mut hashes = vec![H256::default(); n * 2 - 1];
         for i in 0..n {
             hashes[i] = hash_leaf::<H>(
                 polynomials
@@ -207,7 +207,7 @@ impl<H: Hash<Scalar>> Tree<H> {
     }
 
     /// Returns the root hash of the Merkle tree.
-    pub(crate) fn root_hash(&self) -> Scalar {
+    pub(crate) fn root_hash(&self) -> H256 {
         let n = self.num_leaves();
         self.hashes[(n - 1) * 2]
     }
@@ -253,106 +253,130 @@ impl<H: Hash<Scalar>> Tree<H> {
 mod tests {
     use super::*;
     use crate::hash;
-    use starkom_bluesky::{from_const, parse_scalar};
+    use starkom_bluesky::from_const;
 
     type Poseidon2Hash = hash::Poseidon2Hash<Scalar>;
     type Sha2Hash = hash::Sha2Hash<Scalar>;
 
+    fn parse_hash(s: &'static str) -> H256 {
+        s.parse().unwrap()
+    }
+
     #[test]
     fn test_merklify_one_sha2() {
-        let mut values = vec![from_const(12)];
-        merklify::<Sha2Hash>(&mut values, 1);
-        assert_eq!(values, vec![from_const(12)]);
+        let mut hashes = vec![parse_hash(
+            "0x1fe9e33b7ff790473e13eb6384d61d6abb32d2e50b30a382c9767b5347f5846b",
+        )];
+        merklify::<Sha2Hash>(&mut hashes, 1);
+        assert_eq!(
+            hashes,
+            vec![parse_hash(
+                "0x1fe9e33b7ff790473e13eb6384d61d6abb32d2e50b30a382c9767b5347f5846b"
+            )]
+        );
     }
 
     #[test]
     fn test_merklify_one_poseidon2() {
-        let mut values = vec![from_const(12)];
-        merklify::<Poseidon2Hash>(&mut values, 1);
-        assert_eq!(values, vec![from_const(12)]);
+        let mut hashes = vec![parse_hash(
+            "0x1fe9e33b7ff790473e13eb6384d61d6abb32d2e50b30a382c9767b5347f5846b",
+        )];
+        merklify::<Poseidon2Hash>(&mut hashes, 1);
+        assert_eq!(
+            hashes,
+            vec![parse_hash(
+                "0x1fe9e33b7ff790473e13eb6384d61d6abb32d2e50b30a382c9767b5347f5846b"
+            )]
+        );
     }
 
     #[test]
     fn test_merklify_two_sha2() {
-        let mut values = vec![from_const(34), from_const(56)];
-        values.resize(3, from_const(0));
-        merklify::<Sha2Hash>(&mut values, 2);
+        let mut hashes = vec![
+            parse_hash("0x0cbb1061e55efef40fae3c8e34d301c9940889146f816edd475052fc45caf060"),
+            parse_hash("0x2d8257d72c4b6e6bfa3a21a22c053d02d1d52b4b5e6097acfd0ed45f827d6ba4"),
+        ];
+        hashes.resize(3, H256::default());
+        merklify::<Sha2Hash>(&mut hashes, 2);
         assert_eq!(
-            values,
+            hashes,
             vec![
-                from_const(34),
-                from_const(56),
-                parse_scalar("0x6e6dde7078fbd8bbe07b18f91969744bc05bdc2504f64852aadea8c59668bf53")
+                parse_hash("0x0cbb1061e55efef40fae3c8e34d301c9940889146f816edd475052fc45caf060"),
+                parse_hash("0x2d8257d72c4b6e6bfa3a21a22c053d02d1d52b4b5e6097acfd0ed45f827d6ba4"),
+                parse_hash("0x3af448b6612ac9931b7413ecca5d209187cd808ae2d3647099aa99fada16c955")
             ]
         );
     }
 
     #[test]
     fn test_merklify_two_poseidon2() {
-        let mut values = vec![from_const(34), from_const(56)];
-        values.resize(3, from_const(0));
-        merklify::<Poseidon2Hash>(&mut values, 2);
+        let mut hashes = vec![
+            parse_hash("0x0cbb1061e55efef40fae3c8e34d301c9940889146f816edd475052fc45caf060"),
+            parse_hash("0x2d8257d72c4b6e6bfa3a21a22c053d02d1d52b4b5e6097acfd0ed45f827d6ba4"),
+        ];
+        hashes.resize(3, H256::default());
+        merklify::<Poseidon2Hash>(&mut hashes, 2);
         assert_eq!(
-            values,
+            hashes,
             vec![
-                from_const(34),
-                from_const(56),
-                parse_scalar("0x6782206898bfba528451982fe95febe270ed7dc81db9022c33aeddc7408f2cdb")
+                parse_hash("0x0cbb1061e55efef40fae3c8e34d301c9940889146f816edd475052fc45caf060"),
+                parse_hash("0x2d8257d72c4b6e6bfa3a21a22c053d02d1d52b4b5e6097acfd0ed45f827d6ba4"),
+                parse_hash("0x3ff95fb9aa3d97ddb2483415494484499bf4f06b1dfdb5e74e0475c2f6c0c6c8")
             ]
         );
     }
 
     #[test]
     fn test_merklify_four_sha2() {
-        let mut values = vec![
-            from_const(78),
-            from_const(90),
-            from_const(12),
-            from_const(34),
+        let mut hashes = vec![
+            parse_hash("0x034acf2cced8e9744784ec9c3c626fa83f6f8ddd83faed9d5caa5ad72c91eb1c"),
+            parse_hash("0x39dce95a2271a57f999981eef6917f3df8ad25d116c98d809a3b7da5d54805a3"),
+            parse_hash("0x435246f701f1483adcb7037fa64b3fa027c41e13a52d1e6c502e9b71dea3ca81"),
+            parse_hash("0x7952ed41c4062f594b53b8c548874b41a7a7f05593d7a5a313ed82c2fe1c62d7"),
         ];
-        values.resize(7, from_const(0));
-        merklify::<Sha2Hash>(&mut values, 4);
+        hashes.resize(7, H256::default());
+        merklify::<Sha2Hash>(&mut hashes, 4);
         assert_eq!(
-            values,
+            hashes,
             vec![
-                from_const(78),
-                from_const(90),
-                from_const(12),
-                from_const(34),
-                parse_scalar("0x776db780d4c0f6ebb3393eda47e5911aaf0b6481e7d5232c1b44838b9e1692f8"),
-                parse_scalar("0x0c00cbff7075ad00160f57ba02d191f026ec3d3f354c7d9c043336805485c165"),
-                parse_scalar("0x6cb75e80dcb30850d6f389363cf63808be902debda61ccc26881341ac295dff6"),
+                parse_hash("0x034acf2cced8e9744784ec9c3c626fa83f6f8ddd83faed9d5caa5ad72c91eb1c"),
+                parse_hash("0x39dce95a2271a57f999981eef6917f3df8ad25d116c98d809a3b7da5d54805a3"),
+                parse_hash("0x435246f701f1483adcb7037fa64b3fa027c41e13a52d1e6c502e9b71dea3ca81"),
+                parse_hash("0x7952ed41c4062f594b53b8c548874b41a7a7f05593d7a5a313ed82c2fe1c62d7"),
+                parse_hash("0x3d139c65859969e86db444ccc0d36ffd0456b3f92d3dfb34fa10c8c07f5ada06"),
+                parse_hash("0xdc3dd313db4b53f2720fcfe6373d286a9c40911546e1c434fa24ab650a75b586"),
+                parse_hash("0xed171c6bd6876b93f4fc8914e0b2a8db53d7204048ad9fdff6e7127c077ca072"),
             ]
         );
     }
 
     #[test]
     fn test_merklify_four_poseidon2() {
-        let mut values = vec![
-            from_const(78),
-            from_const(90),
-            from_const(12),
-            from_const(34),
+        let mut hashes = vec![
+            parse_hash("0x034acf2cced8e9744784ec9c3c626fa83f6f8ddd83faed9d5caa5ad72c91eb1c"),
+            parse_hash("0x39dce95a2271a57f999981eef6917f3df8ad25d116c98d809a3b7da5d54805a3"),
+            parse_hash("0x435246f701f1483adcb7037fa64b3fa027c41e13a52d1e6c502e9b71dea3ca81"),
+            parse_hash("0x7952ed41c4062f594b53b8c548874b41a7a7f05593d7a5a313ed82c2fe1c62d7"),
         ];
-        values.resize(7, from_const(0));
-        merklify::<Poseidon2Hash>(&mut values, 4);
+        hashes.resize(7, H256::default());
+        merklify::<Poseidon2Hash>(&mut hashes, 4);
         assert_eq!(
-            values,
+            hashes,
             vec![
-                from_const(78),
-                from_const(90),
-                from_const(12),
-                from_const(34),
-                parse_scalar("0x13916a113574c17ef27178ff2ca9be81fc1f57a00a20ab9aee4241ccad7a876c"),
-                parse_scalar("0x707ccd49074554cf443b208ee43e7fd563e45488b075fef503504384bdfa542c"),
-                parse_scalar("0x612fce227318fc205d3b8b2954eb931d92c9e0bd78defcf162b5109f7e1a9722"),
+                parse_hash("0x034acf2cced8e9744784ec9c3c626fa83f6f8ddd83faed9d5caa5ad72c91eb1c"),
+                parse_hash("0x39dce95a2271a57f999981eef6917f3df8ad25d116c98d809a3b7da5d54805a3"),
+                parse_hash("0x435246f701f1483adcb7037fa64b3fa027c41e13a52d1e6c502e9b71dea3ca81"),
+                parse_hash("0x7952ed41c4062f594b53b8c548874b41a7a7f05593d7a5a313ed82c2fe1c62d7"),
+                parse_hash("0x5d405b8c4875e7509085d43c8130b10a3b034b88e9f3c413a0a4460be077858b"),
+                parse_hash("0x0346e1fa000ed1aa3dbde3cef3996f9a532e4f4486dd72bfbfd836a9c6079d90"),
+                parse_hash("0x1681bb07015f5c6413ee62486871b6c95feb5ad89f62638998f6e599fa11193d"),
             ]
         );
     }
 
-    fn test_merkle_tree<H: Hash<Scalar>>(
+    fn test_merkle_tree<H: HashBackend<Scalar>>(
         evaluations: Vec<Vec<Scalar>>,
-        expected_root_hash: Scalar,
+        expected_root_hash: H256,
     ) {
         let k = evaluations.len();
         let n = evaluations[0].len();
@@ -381,11 +405,11 @@ mod tests {
     fn test_merkle_tree_one_leaf_1() {
         test_merkle_tree::<Sha2Hash>(
             vec![vec![from_const(12)]],
-            parse_scalar("0x71169269b911f4d1c8edbd4ba3e4107b1f1017f53d21a202c6d9865d4a95cdf6"),
+            parse_hash("0x0bd187bc3deea1ef6c2a9ae254cf4e493f1dbbda32c79a662fc1d8437ab7e7c6"),
         );
         test_merkle_tree::<Poseidon2Hash>(
             vec![vec![from_const(12)]],
-            parse_scalar("0x7e1fffed4d53ef893858a7345de37e9b366f6a52961fd9722f2104217758aa2a"),
+            parse_hash("0x7e1fffed4d53ef893858a7345de37e9b366f6a52961fd9722f2104217758aa2a"),
         );
     }
 
@@ -393,11 +417,11 @@ mod tests {
     fn test_merkle_tree_one_leaf_2() {
         test_merkle_tree::<Sha2Hash>(
             vec![vec![from_const(34)]],
-            parse_scalar("0x7c4c892249a33dccdc42c2b7002a98c54420f272f63fa886192c94944aae3374"),
+            parse_hash("0x825f71a1d38bedb88129450457f7943f988ee940aa1755aa89982e139e67047a"),
         );
         test_merkle_tree::<Poseidon2Hash>(
             vec![vec![from_const(34)]],
-            parse_scalar("0x1fa5228af05e75ef806f5772be53106e0d91f54950d60a4759421f77a0b39095"),
+            parse_hash("0x1fa5228af05e75ef806f5772be53106e0d91f54950d60a4759421f77a0b39095"),
         );
     }
 
@@ -405,11 +429,11 @@ mod tests {
     fn test_merkle_tree_one_leaf_two_polynomials_1() {
         test_merkle_tree::<Sha2Hash>(
             vec![vec![from_const(12)], vec![from_const(34)]],
-            parse_scalar("0x2abfa190025b3afd41194aa282634e633b5ffed43d522fc2d87d269dd0eb60a8"),
+            parse_hash("0x41c90ef8e7fa7e79e54b14cf8395f9707e9768a02aa79ce7f0f4e68668837c26"),
         );
         test_merkle_tree::<Poseidon2Hash>(
             vec![vec![from_const(12)], vec![from_const(34)]],
-            parse_scalar("0x1c6b73bec8f42fe634f5f77d8741ace13ff5ff49105b4c3e69d54c55ddc56dc7"),
+            parse_hash("0x1c6b73bec8f42fe634f5f77d8741ace13ff5ff49105b4c3e69d54c55ddc56dc7"),
         );
     }
 
@@ -417,11 +441,11 @@ mod tests {
     fn test_merkle_tree_one_leaf_two_polynomials_2() {
         test_merkle_tree::<Sha2Hash>(
             vec![vec![from_const(34)], vec![from_const(12)]],
-            parse_scalar("0x48147ad111986cc8bb753677fb9c9864db281bd55443ea93be2533e22b7d0112"),
+            parse_hash("0xc3dbf8cc67db17f01dd3527ab16da2120af998c7ebe3d06a2d9dff445e1adaee"),
         );
         test_merkle_tree::<Poseidon2Hash>(
             vec![vec![from_const(34)], vec![from_const(12)]],
-            parse_scalar("0x62f2c10ac158f290a9178feec675a0cce5c8c9610c393f4bf17c7838760ebe19"),
+            parse_hash("0x62f2c10ac158f290a9178feec675a0cce5c8c9610c393f4bf17c7838760ebe19"),
         );
     }
 
@@ -433,7 +457,7 @@ mod tests {
                 vec![from_const(34)],
                 vec![from_const(56)],
             ],
-            parse_scalar("0x12ce7e1aefd29256e5dfb6c1dcfed5c959cf4346e64d3b4a9c90671fb3bf7e3f"),
+            parse_hash("0x9bca77d625d9a50f1807d27c273cae980f706ef734a014c00e6a97bbb77472e3"),
         );
         test_merkle_tree::<Poseidon2Hash>(
             vec![
@@ -441,7 +465,7 @@ mod tests {
                 vec![from_const(34)],
                 vec![from_const(56)],
             ],
-            parse_scalar("0x363f810134655fa478c1fbc55495b9b810f0a33ba3aa87b8d43ac6f1c3f2ed75"),
+            parse_hash("0x363f810134655fa478c1fbc55495b9b810f0a33ba3aa87b8d43ac6f1c3f2ed75"),
         );
     }
 
@@ -453,7 +477,7 @@ mod tests {
                 vec![from_const(12)],
                 vec![from_const(78)],
             ],
-            parse_scalar("0x0d19f881e2cf998e3d1fc3095b741b2b2086833550530c4e394578c94eeae3f2"),
+            parse_hash("0xf48317b0be7caae4a15185cc8d0795c15c2bc98e18b8cbdc906270ada921fd25"),
         );
         test_merkle_tree::<Poseidon2Hash>(
             vec![
@@ -461,7 +485,7 @@ mod tests {
                 vec![from_const(12)],
                 vec![from_const(78)],
             ],
-            parse_scalar("0x6906a253c3b386890be44e5fbd6c6b613e73c8960a04ef390f6fc6a584cfcaa1"),
+            parse_hash("0x6906a253c3b386890be44e5fbd6c6b613e73c8960a04ef390f6fc6a584cfcaa1"),
         );
     }
 
@@ -469,11 +493,11 @@ mod tests {
     fn test_merkle_tree_two_leaves_1() {
         test_merkle_tree::<Sha2Hash>(
             vec![vec![from_const(12), from_const(34)]],
-            parse_scalar("0x661f00deed4778c0f35e3b46a50a56d52cfc628534ab4bf7526fa2b7eb64fb2d"),
+            parse_hash("0x2624006228d517eeda393d1440f25ed1c20887664f2444021849345167aadaf4"),
         );
         test_merkle_tree::<Poseidon2Hash>(
             vec![vec![from_const(12), from_const(34)]],
-            parse_scalar("0x76aafc5a8995c9d435039d454a33a488898f6ef0b2622ee5b003ec8c5aa3332b"),
+            parse_hash("0x04df34feebaccfe8d6611b5d308726e8c27e94f2d3f3dfc9e68d39f917125a49"),
         );
     }
 
@@ -481,11 +505,11 @@ mod tests {
     fn test_merkle_tree_two_leaves_2() {
         test_merkle_tree::<Sha2Hash>(
             vec![vec![from_const(34), from_const(56)]],
-            parse_scalar("0x6299bd932dd8ada9a15540b13b5ce037d9ec4c015e4182fbc05a6e3d4242b621"),
+            parse_hash("0x85d6170f1dcec468c3a42f35d24b7689733abf26ff0278a9bc1edc7a9a0a7333"),
         );
         test_merkle_tree::<Poseidon2Hash>(
             vec![vec![from_const(34), from_const(56)]],
-            parse_scalar("0x39635888b223cf2fa7fd3584790e86e5380da23281f53710669cc72345d0a935"),
+            parse_hash("0x623c0f527bde2b6c6a152c224df77a82bd1957188908965c42d167554dc75318"),
         );
     }
 
@@ -496,14 +520,14 @@ mod tests {
                 vec![from_const(12), from_const(56)],
                 vec![from_const(34), from_const(78)],
             ],
-            parse_scalar("0x38ff40459f948d6f52e0df0e1cb2f4e4216e21765339d0c2abece6dd86b4e606"),
+            parse_hash("0xdc144d55dd7a9c48f00b495d30172b38db7d4dc71ee4a0feab99177e30a10d21"),
         );
         test_merkle_tree::<Poseidon2Hash>(
             vec![
                 vec![from_const(12), from_const(56)],
                 vec![from_const(34), from_const(78)],
             ],
-            parse_scalar("0x5d494ed90f85da6cfef7581f8134f0bb454b423a69a1e5b79aa1dd077ef918f1"),
+            parse_hash("0x290f8ab7fabbbf6bf79e435e2900f0eb619cfb1c3933c3dca13f89f3abd4b9de"),
         );
     }
 
@@ -514,14 +538,14 @@ mod tests {
                 vec![from_const(78), from_const(34)],
                 vec![from_const(56), from_const(12)],
             ],
-            parse_scalar("0x7af2c224e5681096e6e26311a34657e10dcd6d0fb2343ceca285da0f5d445150"),
+            parse_hash("0xfb5a002c9ef7dad6d9b4edc690f323f4c302c665926c085dd5d8681496c937c6"),
         );
         test_merkle_tree::<Poseidon2Hash>(
             vec![
                 vec![from_const(78), from_const(34)],
                 vec![from_const(56), from_const(12)],
             ],
-            parse_scalar("0x3f01eb2c0ebff44e6ab56b513563247916785675f145580bfae842ddbe01c2fa"),
+            parse_hash("0x494da394aee5068da56b511142feb6ca060b4f9dddbeab2c7d74d2b5d58c6813"),
         );
     }
 }
