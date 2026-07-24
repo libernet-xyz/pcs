@@ -54,10 +54,7 @@ pub trait HashBackend<F: PrimeField>: Hash<F> + Hash<H256> {
     }
 
     /// Encodes a `u64` into an `H256` so that it can be used as an input to `Hash<H256>` functions.
-    fn encode_usize(value: usize) -> H256
-    where
-        F: PrimeField256,
-    {
+    fn encode_usize(value: usize) -> H256 {
         H256::from_slice(&Scalar::from(value as u64).to_be_bytes())
     }
 

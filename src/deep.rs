@@ -537,6 +537,7 @@ mod tests {
     use starkom_bluesky::from_const;
 
     type Sha2Hash = hash::Sha2Hash<Scalar>;
+    type Poseidon1Hash = hash::Poseidon1Hash<Scalar>;
     type Poseidon2Hash = hash::Poseidon2Hash<Scalar>;
 
     fn test_prover_impl<H: HashBackend<Scalar>>(
@@ -588,10 +589,13 @@ mod tests {
 
     fn test_prover(polynomial_batches: Vec<Vec<Polynomial>>, points: &[u64], degree_bound: usize) {
         test_prover_impl::<Sha2Hash>(polynomial_batches.clone(), points, degree_bound, 1);
+        test_prover_impl::<Poseidon1Hash>(polynomial_batches.clone(), points, degree_bound, 1);
         test_prover_impl::<Poseidon2Hash>(polynomial_batches.clone(), points, degree_bound, 1);
         test_prover_impl::<Sha2Hash>(polynomial_batches.clone(), points, degree_bound, 2);
+        test_prover_impl::<Poseidon1Hash>(polynomial_batches.clone(), points, degree_bound, 2);
         test_prover_impl::<Poseidon2Hash>(polynomial_batches.clone(), points, degree_bound, 2);
         test_prover_impl::<Sha2Hash>(polynomial_batches.clone(), points, degree_bound, 3);
+        test_prover_impl::<Poseidon1Hash>(polynomial_batches.clone(), points, degree_bound, 3);
         test_prover_impl::<Poseidon2Hash>(polynomial_batches, points, degree_bound, 3);
     }
 
