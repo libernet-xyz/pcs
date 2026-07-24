@@ -6,7 +6,7 @@ use starkom_poseidon as poseidon1;
 use starkom_poseidon2 as poseidon2;
 use std::marker::PhantomData;
 
-/// Generic cryptographic hash functions working on scalar inputs.
+/// Generic cryptographic hash functions.
 pub trait Hash<V> {
     /// Hashes two input values.
     fn hash_two(input1: V, input2: V) -> H256;
@@ -43,6 +43,8 @@ pub trait Hash<V> {
 pub trait HashBackend<F: PrimeField>: Hash<F> + Hash<H256> {
     /// Encodes a field value into an `H256` so that it can be used as an input to `Hash<H256>`
     /// functions.
+    ///
+    /// This version is for 64-bit fields such as Goldilocks.
     fn encode_scalar64(value: F) -> H256
     where
         F: PrimeField64,
@@ -52,6 +54,8 @@ pub trait HashBackend<F: PrimeField>: Hash<F> + Hash<H256> {
 
     /// Encodes a field value into an `H256` so that it can be used as an input to `Hash<H256>`
     /// functions.
+    ///
+    /// This version is for 256-bit fields such as BlueSky.
     fn encode_scalar256(value: F) -> H256
     where
         F: PrimeField256,
@@ -59,7 +63,8 @@ pub trait HashBackend<F: PrimeField>: Hash<F> + Hash<H256> {
         H256::from_slice(&value.to_be_bytes())
     }
 
-    /// Encodes a `u64` into an `H256` so that it can be used as an input to `Hash<H256>` functions.
+    /// Encodes a `usize` into an `H256` so that it can be used as an input to `Hash<H256>`
+    /// functions.
     fn encode_usize(value: usize) -> H256 {
         H256::from_slice(&Scalar::from(value as u64).to_be_bytes())
     }
@@ -168,7 +173,7 @@ pub trait PoseidonHasher<F: PrimeField> {
     fn hash_t4<I: IntoIterator<Item = F>>(inputs: I) -> F;
 }
 
-/// Implements [`Poseidon1Hasher`] with the Poseidon1 permutation.
+/// Implements [`PoseidonHasher`] with the Poseidon1 permutation.
 ///
 /// For internal use. Do not use directly, refer to [`Poseidon1Hash`] instead.
 #[derive(Debug, Default, Copy, Clone)]
@@ -186,7 +191,7 @@ impl PoseidonHasher<Scalar> for Poseidon1Hasher<Scalar> {
     }
 }
 
-/// Implements [`Poseidon1Hasher`] with the Poseidon2 permutation.
+/// Implements [`PoseidonHasher`] with the Poseidon2 permutation.
 ///
 /// For internal use. Do not use directly, refer to [`Poseidon2Hash`] instead.
 #[derive(Debug, Default, Copy, Clone)]
@@ -204,7 +209,10 @@ impl PoseidonHasher<Scalar> for Poseidon2Hasher<Scalar> {
     }
 }
 
-/// Poseidon2 hash backend.
+/// Generic Poseidon hash backend.
+///
+/// Do not use this directly, refer to the [`Poseidon1Hash`] and [`Poseidon2Hash`] instantiations
+/// instead.
 #[derive(Debug, Default, Copy, Clone)]
 pub struct PoseidonHash<F: PrimeField, H: PoseidonHasher<F>> {
     _data: PhantomData<(F, H)>,
@@ -272,7 +280,10 @@ impl<H: PoseidonHasher<Scalar>> HashBackend<Scalar> for PoseidonHash<Scalar, H> 
     }
 }
 
+/// Poseidon1 hash backend.
 pub type Poseidon1Hash<F> = PoseidonHash<F, Poseidon1Hasher<F>>;
+
+/// Poseidon2 hash backend.
 pub type Poseidon2Hash<F> = PoseidonHash<F, Poseidon2Hasher<F>>;
 
 #[cfg(test)]
