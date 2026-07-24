@@ -37,10 +37,10 @@ fn num_queries(blowup_log2: usize) -> usize {
 /// Computes a random linear combination of a list of values.
 ///
 /// `alpha` is a Fiat-Shamir challenge of some sort.
-fn rlc(values: &[Scalar], alpha: Scalar) -> Scalar {
+fn rlc(values: impl IntoIterator<Item = Scalar>, alpha: Scalar) -> Scalar {
     let mut rlc = Scalar::ZERO;
     let mut pow = Scalar::ONE;
-    for &value in values {
+    for value in values.into_iter() {
         rlc += value * pow;
         pow *= alpha;
     }
@@ -247,20 +247,16 @@ impl<H: HashBackend<Scalar>> Committer<H> {
                 .chain(self.trees.iter().map(Tree::root_hash))
                 .chain(std::iter::once(H::encode_usize(self.polynomials.len())))
                 .chain(std::iter::once(H::encode_usize(points.len())))
-                .chain(
-                    points
-                        .iter()
-                        .flat_map(|&z| {
-                            std::iter::once(z).chain(
-                                self.polynomials
-                                    .iter()
-                                    .map(|polynomial| polynomial.evaluate(z))
-                                    .collect::<Vec<Scalar>>()
-                                    .into_iter(),
-                            )
-                        })
-                        .map(H::encode_scalar256),
-                ),
+                .chain(points.iter().flat_map(|&z| {
+                    std::iter::once(z)
+                        .chain(
+                            self.polynomials
+                                .iter()
+                                .map(|polynomial| polynomial.evaluate(z)),
+                        )
+                        .map(H::encode_scalar256)
+                        .collect::<Vec<H256>>()
+                })),
         );
 
         let points: BTreeMap<Scalar, Vec<Scalar>> = points
@@ -289,7 +285,7 @@ impl<H: HashBackend<Scalar>> Committer<H> {
         let quotients = points
             .iter()
             .map(|(&z, values)| {
-                let value = rlc(values.as_slice(), alpha);
+                let value = rlc(values.iter().copied(), alpha);
                 let (quotient, remainder) = (combined.clone() - value).horner(z);
                 assert_eq!(remainder, Scalar::ZERO);
                 quotient
@@ -427,9 +423,7 @@ impl<H: HashBackend<Scalar>> Proof<H> {
             let combined = rlc(
                 openings
                     .iter()
-                    .flat_map(|proof| proof.leaf().iter().cloned())
-                    .collect::<Vec<Scalar>>()
-                    .as_slice(),
+                    .flat_map(|proof| proof.leaf().iter().cloned()),
                 alpha,
             );
 
@@ -444,7 +438,7 @@ impl<H: HashBackend<Scalar>> Proof<H> {
 
             let x = query.x();
             for ((&z, values), &quotient) in self.points.iter().zip(quotients.iter()) {
-                let v = rlc(values.as_slice(), alpha);
+                let v = rlc(values.iter().copied(), alpha);
                 let numerator = combined - v;
                 let denominator = x - z;
                 if quotient * denominator != numerator {
