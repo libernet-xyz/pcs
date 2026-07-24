@@ -136,7 +136,13 @@ impl<H: HashBackend<Scalar>> Committer<H> {
     ///
     /// We require specifying the first batch because our DEEP-FRI protocol requires at least one
     /// committed polynomial to work.
+    ///
+    /// `degree_bound` must be a power of 2 less than or equal to 2^[`Scalar::S`], and `blowup_log2`
+    /// must not be zero.
     pub fn new(degree_bound: usize, blowup_log2: usize, polynomials: Vec<Polynomial>) -> Self {
+        assert!(degree_bound.is_power_of_two());
+        assert!(blowup_log2 > 0);
+        assert!(!polynomials.is_empty());
         let mut committer = Self {
             degree_bound,
             blowup_log2,
@@ -860,6 +866,36 @@ mod tests {
                     from_const(44),
                     from_const(45),
                 ])],
+            ],
+            &[456, 789],
+            4,
+        );
+    }
+
+    #[test]
+    fn test_two_batches_one_and_two() {
+        test_prover(
+            vec![
+                vec![Polynomial::with_coefficients(vec![
+                    from_const(90),
+                    from_const(78),
+                    from_const(56),
+                    from_const(34),
+                ])],
+                vec![
+                    Polynomial::with_coefficients(vec![
+                        from_const(12),
+                        from_const(34),
+                        from_const(56),
+                        from_const(78),
+                    ]),
+                    Polynomial::with_coefficients(vec![
+                        from_const(42),
+                        from_const(43),
+                        from_const(44),
+                        from_const(45),
+                    ]),
+                ],
             ],
             &[456, 789],
             4,

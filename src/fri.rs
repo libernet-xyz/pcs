@@ -251,6 +251,7 @@ impl<H: HashBackend<Scalar>> Prover<H> {
                 .iter()
                 .all(|polynomial| degree_bound >= polynomial.degree_bound())
         );
+        assert!(blowup_log2 > 0);
 
         let n = degree_bound << blowup_log2;
         assert!(n as u64 <= 1u64 << Scalar::S);
@@ -511,6 +512,97 @@ mod tests {
                 ]),
             ],
             4,
+        );
+    }
+
+    #[test]
+    fn test_one_polynomial_degree_seven() {
+        test_prover(
+            vec![Polynomial::with_coefficients(vec![
+                from_const(12),
+                from_const(34),
+                from_const(56),
+                from_const(78),
+                from_const(90),
+                from_const(12),
+                from_const(34),
+            ])],
+            8,
+        );
+        test_prover(
+            vec![Polynomial::with_coefficients(vec![
+                from_const(42),
+                from_const(43),
+                from_const(44),
+                from_const(45),
+                from_const(46),
+                from_const(47),
+                from_const(48),
+            ])],
+            8,
+        );
+    }
+
+    #[test]
+    fn test_two_polynomials_degree_seven() {
+        test_prover(
+            vec![
+                Polynomial::with_coefficients(vec![
+                    from_const(12),
+                    from_const(34),
+                    from_const(56),
+                    from_const(78),
+                    from_const(90),
+                    from_const(12),
+                    from_const(34),
+                ]),
+                Polynomial::with_coefficients(vec![
+                    from_const(42),
+                    from_const(43),
+                    from_const(44),
+                    from_const(45),
+                    from_const(46),
+                    from_const(47),
+                    from_const(48),
+                ]),
+            ],
+            8,
+        );
+    }
+
+    #[test]
+    fn test_three_polynomials_degree_seven() {
+        test_prover(
+            vec![
+                Polynomial::with_coefficients(vec![
+                    from_const(42),
+                    from_const(43),
+                    from_const(44),
+                    from_const(45),
+                    from_const(46),
+                    from_const(47),
+                    from_const(48),
+                ]),
+                Polynomial::with_coefficients(vec![
+                    from_const(12),
+                    from_const(34),
+                    from_const(56),
+                    from_const(78),
+                    from_const(90),
+                    from_const(12),
+                    from_const(34),
+                ]),
+                Polynomial::with_coefficients(vec![
+                    from_const(34),
+                    from_const(56),
+                    from_const(78),
+                    from_const(90),
+                    from_const(78),
+                    from_const(56),
+                    from_const(34),
+                ]),
+            ],
+            8,
         );
     }
 }
