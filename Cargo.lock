@@ -551,9 +551,9 @@ dependencies = [
 
 [[package]]
 name = "starkom-poly"
-version = "3.1.0"
+version = "4.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3226f7581ed0365a8171ab29ef37b0871864c348d3f3e9f61370fb90addf2ab2"
+checksum = "2cd7755de7dcd7c461ef0abceb38c54e144138ee16369382e29bf391bbfa6575"
 dependencies = [
  "anyhow",
  "starkom-bluesky",
