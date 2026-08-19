@@ -21,5 +21,5 @@ sha3 = "0.12.0"
 starkom-bluesky = "3.3.0"
 starkom-ff = "2.4.0"
 starkom-poly = "4.3.0"
-starkom-poseidon = "3.3.0"
-starkom-poseidon2 = "6.3.0"
+starkom-poseidon = { version = "3.2.2", features = ["bluesky"] }
+starkom-poseidon2 = { version = "6.3.0", features = ["bluesky"] }
