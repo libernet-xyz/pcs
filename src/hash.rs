@@ -36,10 +36,10 @@ pub trait Hash<V> {
 ///
 /// NOTE: it is guaranteed that all `H256` hashes flowing through the program are always generated
 /// by the `HashBackend` in use, so implementors are allowed to make assumptions about the content
-/// of any `H256` input parameters. For example, a Poseidon implementatiopn over the BlueSky field
-/// can assume that all `H256` values wrap BlueSky scalars with a certain endianness, while a
-/// Poseidon implementation based on Goldilocks can assume that all `H256`s wrap four Goldilocks
-/// scalars with a certain layout.
+/// of `H256` input parameters. For example, a Poseidon implementatiopn over the BlueSky field can
+/// assume that all `H256` values wrap BlueSky scalars with a certain endianness, while a Poseidon
+/// implementation based on Goldilocks can assume that all `H256`s wrap four Goldilocks scalars
+/// with a certain layout.
 pub trait HashBackend<F: PrimeField>: Hash<F> + Hash<H256> {
     /// Encodes a field value into an `H256` so that it can be used as an input to `Hash<H256>`
     /// functions.

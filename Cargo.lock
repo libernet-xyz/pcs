@@ -536,7 +536,7 @@ dependencies = [
 
 [[package]]
 name = "starkom-pcs"
-version = "4.2.2"
+version = "5.0.0"
 dependencies = [
  "anyhow",
  "primitive-types",
