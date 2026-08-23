@@ -241,5 +241,58 @@ mod tests {
         test_keccak256_hash_binary_impl::<GL4>();
     }
 
+    fn test_sha2_hash_ternary_impl<F: Field256>() {
+        eprintln!("{}", BS::random_default());
+        eprintln!("{}", BS::random_default());
+        eprintln!("{}", BS::random_default());
+        assert_eq!(
+            Sha2Hash::<F>::hash_ternary([
+                parse_hash("0x7148a9186844710414337e2a454e082f5bc45a823187142bf8519d48153bb3d7"),
+                parse_hash("0x6b3cdb310e6ba5e984fb0ff3722a1968d6b22ce0cdad6b1683167ccdb2b3a75a"),
+                parse_hash("0x239f4553fa744a1b2a49af348cf9412fe105c3bc0accb23030a40bfe59d7fa2b"),
+            ]),
+            parse_hash("0xea2a6de526a3b32de298db973d5cbc604d816eeae526beef5a089bd2ae7ca3eb")
+        );
+        assert_eq!(
+            Sha2Hash::<F>::hash_ternary([
+                parse_hash("0x73b6d673e9b67cbca809416002ed33ddeb704d58ce0101a6555531e63426383b"),
+                parse_hash("0x5b68318ce7baa6d9a0b6e67cee81b1a730dc7f68c34b7f806fd70ec4614f2096"),
+                parse_hash("0x5829d1d7b55ee4345afa69b4acf18d722f6962d0e61447a2711b5851b77d1c2b"),
+            ]),
+            parse_hash("0xcb8497f1c9898641ec978cfe347ff1ccc43cc9a15f9e741f15e18dc0660d50bf")
+        );
+    }
+
+    #[test]
+    fn test_sha2_hash_ternary() {
+        test_sha2_hash_ternary_impl::<BS>();
+        test_sha2_hash_ternary_impl::<GL4>();
+    }
+
+    fn test_keccak256_hash_ternary_impl<F: Field256>() {
+        assert_eq!(
+            Keccak256Hash::<F>::hash_ternary([
+                parse_hash("0x7148a9186844710414337e2a454e082f5bc45a823187142bf8519d48153bb3d7"),
+                parse_hash("0x6b3cdb310e6ba5e984fb0ff3722a1968d6b22ce0cdad6b1683167ccdb2b3a75a"),
+                parse_hash("0x239f4553fa744a1b2a49af348cf9412fe105c3bc0accb23030a40bfe59d7fa2b"),
+            ]),
+            parse_hash("0x2153695c5a08dcffb4189075c974db1faddcd9005c493937120b80eeaf3602fb")
+        );
+        assert_eq!(
+            Keccak256Hash::<F>::hash_ternary([
+                parse_hash("0x73b6d673e9b67cbca809416002ed33ddeb704d58ce0101a6555531e63426383b"),
+                parse_hash("0x5b68318ce7baa6d9a0b6e67cee81b1a730dc7f68c34b7f806fd70ec4614f2096"),
+                parse_hash("0x5829d1d7b55ee4345afa69b4acf18d722f6962d0e61447a2711b5851b77d1c2b"),
+            ]),
+            parse_hash("0x45b7f5b14de8d4ccf714a72bc733123c271484bdfe449b55d892f9ad1a26ea3a")
+        );
+    }
+
+    #[test]
+    fn test_keccak256_hash_ternary() {
+        test_keccak256_hash_ternary_impl::<BS>();
+        test_keccak256_hash_ternary_impl::<GL4>();
+    }
+
     // TODO
 }
