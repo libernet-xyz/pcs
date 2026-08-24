@@ -20,7 +20,7 @@ pub trait MerkleHasher {
 /// 256-bit fields. If the arithmetization process uses a smaller field such as Goldilocks, all
 /// scalar values must be embedded into a 256-bit field such as Goldilocks^4 before they can be
 /// committed.
-pub trait FieldHasher<F: Field256>: MerkleHasher {
+pub trait Hasher<F: Field256>: MerkleHasher {
     /// Hashes the provided field elements.
     ///
     /// NOTE: this is a raw hash, it doesn't automatically prepend any DSTs or element count; the
@@ -108,7 +108,7 @@ mod internal {
         }
     }
 
-    impl<H: LowLevelHash, F: Field256> FieldHasher<F> for HasherImpl<H, F> {
+    impl<H: LowLevelHash, F: Field256> Hasher<F> for HasherImpl<H, F> {
         fn hash(inputs: impl IntoIterator<Item = F>) -> H256 {
             let mut hasher = H::default();
             for input in inputs {

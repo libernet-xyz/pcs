@@ -1,4 +1,4 @@
-use crate::hash::{FieldHasher, MerkleHasher};
+use crate::hash::{Hasher, MerkleHasher};
 use primitive_types::H256;
 use starkom_ff::{Field, Field256};
 use std::marker::PhantomData;
@@ -8,9 +8,7 @@ use std::marker::PhantomData;
 /// Our Merkle trees have vectors of values as leaves (there's one element for every committed
 /// polynomial so that we can commit multiple polynomials into the same tree), so the input `values`
 /// parameter is a slice of scalar values.
-fn hash_leaf<F: Field + From<usize>, G: Field256 + From<F>, H: FieldHasher<G>>(
-    values: &[F],
-) -> H256 {
+fn hash_leaf<F: Field + From<usize>, G: Field256 + From<F>, H: Hasher<G>>(values: &[F]) -> H256 {
     H::hash(
         std::iter::once(F::ZERO) // TODO: DST
             .chain(std::iter::once(F::from(values.len())))
@@ -58,8 +56,8 @@ pub(crate) fn merklify<H: MerkleHasher>(mut hashes: &mut [H256], mut n: usize) {
 /// are reconstructed separately during the verification of a whole `Query`. In particular, all root
 /// hashes are stored in the `Commitment`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Proof<F: Field, H: MerkleHasher> {
+pub(crate) struct Proof<F: Field, G: Field256 + From<F>, H: Hasher<G>> {
     leaf: Vec<F>,
     path: Vec<H256>,
-    _data: PhantomData<H>,
+    _data: PhantomData<(G, H)>,
 }
