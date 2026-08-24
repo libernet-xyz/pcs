@@ -537,5 +537,127 @@ mod tests {
         );
     }
 
-    // TODO
+    #[test]
+    fn test_merkle_tree_one_leaf_two_polynomials_1() {
+        test_merkle_tree::<BS, BS, Sha2Hash<BS>>(
+            vec![vec![from_const(12)], vec![from_const(34)]],
+            parse("0x41c90ef8e7fa7e79e54b14cf8395f9707e9768a02aa79ce7f0f4e68668837c26"),
+        );
+        test_merkle_tree::<BS, BS, Keccak256Hash<BS>>(
+            vec![vec![from_const(12)], vec![from_const(34)]],
+            parse("0x8a39979b1cf9df3dd02d420608cb73a92423a9ef2e44afb1118f5d62a1e35b59"),
+        );
+    }
+
+    #[test]
+    fn test_merkle_tree_one_leaf_two_polynomials_2() {
+        test_merkle_tree::<BS, BS, Sha2Hash<BS>>(
+            vec![vec![from_const(34)], vec![from_const(12)]],
+            parse("0xc3dbf8cc67db17f01dd3527ab16da2120af998c7ebe3d06a2d9dff445e1adaee"),
+        );
+        test_merkle_tree::<BS, BS, Keccak256Hash<BS>>(
+            vec![vec![from_const(34)], vec![from_const(12)]],
+            parse("0xa8f2b055d24c330298c32a0ed891a91378af0a495403fd5f95eca566e34a1c39"),
+        );
+    }
+
+    #[test]
+    fn test_merkle_tree_one_leaf_three_polynomials_1() {
+        test_merkle_tree::<BS, BS, Sha2Hash<BS>>(
+            vec![
+                vec![from_const(12)],
+                vec![from_const(34)],
+                vec![from_const(56)],
+            ],
+            parse("0x9bca77d625d9a50f1807d27c273cae980f706ef734a014c00e6a97bbb77472e3"),
+        );
+        test_merkle_tree::<BS, BS, Keccak256Hash<BS>>(
+            vec![
+                vec![from_const(12)],
+                vec![from_const(34)],
+                vec![from_const(56)],
+            ],
+            parse("0x11e4b3b9246b3678b751e40aac1ceb433a51be72a6c3560a49e0954d04689017"),
+        );
+    }
+
+    #[test]
+    fn test_merkle_tree_one_leaf_three_polynomials_2() {
+        test_merkle_tree::<BS, BS, Sha2Hash<BS>>(
+            vec![
+                vec![from_const(34)],
+                vec![from_const(12)],
+                vec![from_const(78)],
+            ],
+            parse("0xf48317b0be7caae4a15185cc8d0795c15c2bc98e18b8cbdc906270ada921fd25"),
+        );
+        test_merkle_tree::<BS, BS, Keccak256Hash<BS>>(
+            vec![
+                vec![from_const(34)],
+                vec![from_const(12)],
+                vec![from_const(78)],
+            ],
+            parse("0xf3f5da8d03ec645ab1624876b7515f440d6dbbb5366e9e2da5218f9c603e990d"),
+        );
+    }
+
+    #[test]
+    fn test_merkle_tree_two_leaves_1() {
+        test_merkle_tree::<BS, BS, Sha2Hash<BS>>(
+            vec![vec![from_const(12), from_const(34)]],
+            parse("0x2624006228d517eeda393d1440f25ed1c20887664f2444021849345167aadaf4"),
+        );
+        test_merkle_tree::<BS, BS, Keccak256Hash<BS>>(
+            vec![vec![from_const(12), from_const(34)]],
+            parse("0xc781424ee41551ea0e56431b57519317a836b94c193ee898b39d058507217ee4"),
+        );
+    }
+
+    #[test]
+    fn test_merkle_tree_two_leaves_2() {
+        test_merkle_tree::<BS, BS, Sha2Hash<BS>>(
+            vec![vec![from_const(34), from_const(56)]],
+            parse("0x85d6170f1dcec468c3a42f35d24b7689733abf26ff0278a9bc1edc7a9a0a7333"),
+        );
+        test_merkle_tree::<BS, BS, Keccak256Hash<BS>>(
+            vec![vec![from_const(34), from_const(56)]],
+            parse("0x00526855bdd13b55968dd71bddfca2409e77ee8c75cdc17fcdb641673558ae51"),
+        );
+    }
+
+    #[test]
+    fn test_merkle_tree_two_leaves_two_polynomials_1() {
+        test_merkle_tree::<BS, BS, Sha2Hash<BS>>(
+            vec![
+                vec![from_const(12), from_const(56)],
+                vec![from_const(34), from_const(78)],
+            ],
+            parse("0xdc144d55dd7a9c48f00b495d30172b38db7d4dc71ee4a0feab99177e30a10d21"),
+        );
+        test_merkle_tree::<BS, BS, Keccak256Hash<BS>>(
+            vec![
+                vec![from_const(12), from_const(56)],
+                vec![from_const(34), from_const(78)],
+            ],
+            parse("0x086ff3e1257cbff588f5d01ce891ea152e15863c5e0d4407d4c3564d354b0614"),
+        );
+    }
+
+    #[test]
+    fn test_merkle_tree_two_leaves_two_polynomials_2() {
+        test_merkle_tree::<BS, BS, Sha2Hash<BS>>(
+            vec![
+                vec![from_const(78), from_const(34)],
+                vec![from_const(56), from_const(12)],
+            ],
+            parse("0xfb5a002c9ef7dad6d9b4edc690f323f4c302c665926c085dd5d8681496c937c6"),
+        );
+        test_merkle_tree::<BS, BS, Keccak256Hash<BS>>(
+            vec![
+                vec![from_const(78), from_const(34)],
+                vec![from_const(56), from_const(12)],
+            ],
+            parse("0xb18e697b08221e2f411826d3c17c80bff6e06e90a55bcd5cc191ad67f1eb657a"),
+        );
+    }
 }
