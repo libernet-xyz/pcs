@@ -160,7 +160,114 @@ impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> Proof<F, G, H> {
     }
 }
 
-// TODO
+/// A Merkle tree whose leaves are multiple polynomial evaluations.
+///
+/// The tree has N leaves in total, with N being the size of the extended domain, and each leaf has
+/// K polynomial evaluations, with K being the number of committed polynomials.
+///
+/// The internal nodes are single hashes.
+#[derive(Debug, Clone)]
+pub(crate) struct Tree<F: Field, G: Field256 + From<F>, H: Hasher<G>> {
+    /// The polynomial evaluations committed in the tree. The outer array has K entries, one for
+    /// every committed polynomial, and the inner array has N entries, one for every evaluation of a
+    /// polynomial.
+    leaves: Vec<Vec<F>>,
+    /// The internal nodes of the tree. There are 2*N-1 nodes in this array, with N = number of
+    /// leaves. The nodes of the bottom layer are the hashes of the corresponding leaves.
+    hashes: Vec<H256>,
+    _data: PhantomData<(G, H)>,
+}
+
+impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> Tree<F, G, H> {
+    /// Constructs a Merkle tree from a matrix of polynomial evaluations.
+    ///
+    /// The outer array of `polynomials` contains one entry per committed polynomial, and each of
+    /// the inner arrays represents the evaluations of a polynomial.
+    ///
+    /// The outer array must have at least 1 element (at least 1 polynomial must be committed) and
+    /// all inner arrays must have the same size N which must be the size of the (extended)
+    /// evaluation domain (always a power of 2).
+    ///
+    /// Neither the outer array nor the inner arrays can be empty.
+    pub(crate) fn new(polynomials: Vec<Vec<F>>) -> Self {
+        let num_polys = polynomials.len();
+        assert!(num_polys > 0);
+        let n = polynomials[0].len();
+        assert!(n.is_power_of_two());
+        assert!(polynomials.iter().all(|polynomial| polynomial.len() == n));
+        let mut hashes = vec![H256::default(); n * 2 - 1];
+        for i in 0..n {
+            hashes[i] = hash_leaf::<F, G, H>(
+                polynomials
+                    .iter()
+                    .map(|polynomial| polynomial[i])
+                    .collect::<Vec<F>>()
+                    .as_slice(),
+            );
+        }
+        merklify::<H>(hashes.as_mut_slice(), n);
+        Self {
+            leaves: polynomials,
+            hashes,
+            _data: Default::default(),
+        }
+    }
+
+    /// Returns the number of polynomials stored in the tree.
+    ///
+    /// Each leaf of the tree has this number of values.
+    pub(crate) fn num_polys(&self) -> usize {
+        self.leaves.len()
+    }
+
+    /// Returns the number of leaves in the tree, corresponding to the size of the evaluation domain
+    /// (always a power of 2).
+    pub(crate) fn num_leaves(&self) -> usize {
+        self.leaves[0].len()
+    }
+
+    /// Returns the root hash of the Merkle tree.
+    pub(crate) fn root_hash(&self) -> H256 {
+        let n = self.num_leaves();
+        self.hashes[(n - 1) * 2]
+    }
+
+    /// Returns a vector representing the i-th leaf.
+    ///
+    /// Note that the leaf contains k elements, one for every committed polynomial.
+    pub(crate) fn leaf(&self, index: usize) -> Vec<F> {
+        self.leaves.iter().map(|values| values[index]).collect()
+    }
+
+    /// Returns the value at a given leaf for a specific polynomial.
+    ///
+    /// `polynomial_index` must be less than [`Self::num_polys()`] and `leaf_index` must be less
+    /// than [`Self::num_leaves()`].
+    pub(crate) fn leaf_value(&self, polynomial_index: usize, leaf_index: usize) -> F {
+        self.leaves[polynomial_index][leaf_index]
+    }
+
+    /// Returns a Merkle proof for the leaf at `index`.
+    pub(crate) fn query(&self, mut index: usize) -> Proof<F, G, H> {
+        let mut n = self.num_leaves();
+        assert!(n.is_power_of_two());
+        assert!(index < n);
+        let leaf = self.leaf(index);
+        let mut path = Vec::with_capacity(n.trailing_zeros() as usize);
+        let mut hashes = self.hashes.as_slice();
+        while n > 1 {
+            path.push(hashes[index ^ 1]);
+            hashes = &hashes[n..];
+            n /= 2;
+            index >>= 1;
+        }
+        Proof {
+            leaf,
+            path,
+            _data: Default::default(),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -360,6 +467,73 @@ mod tests {
                 parse("0x31354bf6d6ca07dbde80395609890a558ff35587ddc2b5c72ccde2b4e15d114f"),
                 parse("0xbd82b7f4f83de57b73e00aa0924a5fc4dfaf959bd252aa3fda8abdaf87713dc0"),
             ]
+        );
+    }
+
+    fn test_merkle_tree<F: Field, G: Field256 + From<F>, H: Hasher<G>>(
+        evaluations: Vec<Vec<F>>,
+        expected_root_hash: H256,
+    ) {
+        let k = evaluations.len();
+        let n = evaluations[0].len();
+        let tree = Tree::<F, G, H>::new(evaluations.clone());
+        assert_eq!(tree.num_polys(), k);
+        assert_eq!(tree.num_leaves(), n);
+        assert_eq!(tree.root_hash(), expected_root_hash);
+        for i in 0..n {
+            let proof = tree.query(i);
+            assert!(proof.verify(i, expected_root_hash).is_ok());
+            assert_eq!(proof.leaf().len(), k);
+            assert!(
+                proof
+                    .leaf()
+                    .iter()
+                    .zip(evaluations.iter())
+                    .all(|(&lhs, values)| lhs == values[i])
+            );
+            for j in 0..k {
+                assert_eq!(tree.leaf_value(j, i), evaluations[j][i]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_merkle_tree_one_leaf_1() {
+        test_merkle_tree::<BS, BS, Sha2Hash<BS>>(
+            vec![vec![from_const(12)]],
+            parse("0x0bd187bc3deea1ef6c2a9ae254cf4e493f1dbbda32c79a662fc1d8437ab7e7c6"),
+        );
+        test_merkle_tree::<GL, GL4, Sha2Hash<GL4>>(
+            vec![vec![from_const(12)]],
+            parse("0xa76cc2edc0687213f2f6ae0352cdae9bb437a5589d51d863458e3f94fdcf1a1f"),
+        );
+        test_merkle_tree::<BS, BS, Keccak256Hash<BS>>(
+            vec![vec![from_const(12)]],
+            parse("0x5e70242e081756f445b5f3048611464568002e68800238dcfef718504de01782"),
+        );
+        test_merkle_tree::<GL, GL4, Keccak256Hash<GL4>>(
+            vec![vec![from_const(12)]],
+            parse("0xf8766a3ad2ed6d5bd215b3ed0531bde06e7a31e218a17d494a99fa8ba255ba2c"),
+        );
+    }
+
+    #[test]
+    fn test_merkle_tree_one_leaf_2() {
+        test_merkle_tree::<BS, BS, Sha2Hash<BS>>(
+            vec![vec![from_const(34)]],
+            parse("0x825f71a1d38bedb88129450457f7943f988ee940aa1755aa89982e139e67047a"),
+        );
+        test_merkle_tree::<GL, GL4, Sha2Hash<GL4>>(
+            vec![vec![from_const(34)]],
+            parse("0x538de22f49a0422afebfcb7768d1ee33f5a2fbb21b694fb3c521390e8334b6df"),
+        );
+        test_merkle_tree::<BS, BS, Keccak256Hash<BS>>(
+            vec![vec![from_const(34)]],
+            parse("0xe6b7d9bb7fab250037d1ede2453bf936d350c03d028048fa491663a8d4a070ae"),
+        );
+        test_merkle_tree::<GL, GL4, Keccak256Hash<GL4>>(
+            vec![vec![from_const(34)]],
+            parse("0xf778d7b3ce8b27a68b7d5749eb2460ef7b3d0a478ee275558fd811afea4b7397"),
         );
     }
 
