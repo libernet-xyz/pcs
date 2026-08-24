@@ -543,9 +543,17 @@ mod tests {
             vec![vec![from_const(12)], vec![from_const(34)]],
             parse("0x41c90ef8e7fa7e79e54b14cf8395f9707e9768a02aa79ce7f0f4e68668837c26"),
         );
+        test_merkle_tree::<GL, GL4, Sha2Hash<GL4>>(
+            vec![vec![from_const(12)], vec![from_const(34)]],
+            parse("0x6825e5d46e04f4177259dd4d64883ae16ae2f74d3d30ac2deadd4f9e33776847"),
+        );
         test_merkle_tree::<BS, BS, Keccak256Hash<BS>>(
             vec![vec![from_const(12)], vec![from_const(34)]],
             parse("0x8a39979b1cf9df3dd02d420608cb73a92423a9ef2e44afb1118f5d62a1e35b59"),
+        );
+        test_merkle_tree::<GL, GL4, Keccak256Hash<GL4>>(
+            vec![vec![from_const(12)], vec![from_const(34)]],
+            parse("0xb310dbe74714244344ee38a8f4c937578719cff53cc084e4a40147310244b377"),
         );
     }
 
@@ -555,9 +563,17 @@ mod tests {
             vec![vec![from_const(34)], vec![from_const(12)]],
             parse("0xc3dbf8cc67db17f01dd3527ab16da2120af998c7ebe3d06a2d9dff445e1adaee"),
         );
+        test_merkle_tree::<GL, GL4, Sha2Hash<GL4>>(
+            vec![vec![from_const(34)], vec![from_const(12)]],
+            parse("0xf53c731e056686bea4d706dd4db1a713710dac4ece17bb548704901915d5f94d"),
+        );
         test_merkle_tree::<BS, BS, Keccak256Hash<BS>>(
             vec![vec![from_const(34)], vec![from_const(12)]],
             parse("0xa8f2b055d24c330298c32a0ed891a91378af0a495403fd5f95eca566e34a1c39"),
+        );
+        test_merkle_tree::<GL, GL4, Keccak256Hash<GL4>>(
+            vec![vec![from_const(34)], vec![from_const(12)]],
+            parse("0x5cb70e1b45235d85eff0628e3642fb30b36867d38b2410f263fd7bc01598bdea"),
         );
     }
 
@@ -571,6 +587,14 @@ mod tests {
             ],
             parse("0x9bca77d625d9a50f1807d27c273cae980f706ef734a014c00e6a97bbb77472e3"),
         );
+        test_merkle_tree::<GL, GL4, Sha2Hash<GL4>>(
+            vec![
+                vec![from_const(12)],
+                vec![from_const(34)],
+                vec![from_const(56)],
+            ],
+            parse("0x6cbeda0560df214b07ce7d13c3602659ff7d74f621e2c68623c0aad94ede5d46"),
+        );
         test_merkle_tree::<BS, BS, Keccak256Hash<BS>>(
             vec![
                 vec![from_const(12)],
@@ -578,6 +602,14 @@ mod tests {
                 vec![from_const(56)],
             ],
             parse("0x11e4b3b9246b3678b751e40aac1ceb433a51be72a6c3560a49e0954d04689017"),
+        );
+        test_merkle_tree::<GL, GL4, Keccak256Hash<GL4>>(
+            vec![
+                vec![from_const(12)],
+                vec![from_const(34)],
+                vec![from_const(56)],
+            ],
+            parse("0x20986d98839fac785d61cbf2121807e408e565c64ff3f033a0b752b0bedd3cc3"),
         );
     }
 
@@ -591,6 +623,14 @@ mod tests {
             ],
             parse("0xf48317b0be7caae4a15185cc8d0795c15c2bc98e18b8cbdc906270ada921fd25"),
         );
+        test_merkle_tree::<GL, GL4, Sha2Hash<GL4>>(
+            vec![
+                vec![from_const(34)],
+                vec![from_const(12)],
+                vec![from_const(78)],
+            ],
+            parse("0x9ddecf7894d55cf1509ce47a6532e610366362bea31727429fe8538054893bfe"),
+        );
         test_merkle_tree::<BS, BS, Keccak256Hash<BS>>(
             vec![
                 vec![from_const(34)],
@@ -598,6 +638,14 @@ mod tests {
                 vec![from_const(78)],
             ],
             parse("0xf3f5da8d03ec645ab1624876b7515f440d6dbbb5366e9e2da5218f9c603e990d"),
+        );
+        test_merkle_tree::<GL, GL4, Keccak256Hash<GL4>>(
+            vec![
+                vec![from_const(34)],
+                vec![from_const(12)],
+                vec![from_const(78)],
+            ],
+            parse("0xc13c7933afc11a827a307cbbfff174eca8ce0e9abc79a130f5c586c1e73a4404"),
         );
     }
 
@@ -607,9 +655,17 @@ mod tests {
             vec![vec![from_const(12), from_const(34)]],
             parse("0x2624006228d517eeda393d1440f25ed1c20887664f2444021849345167aadaf4"),
         );
+        test_merkle_tree::<GL, GL4, Sha2Hash<GL4>>(
+            vec![vec![from_const(12), from_const(34)]],
+            parse("0x8f8d5f408b0d875c2e0e913c0129f973262b00bbdaefee701af33f368f434e07"),
+        );
         test_merkle_tree::<BS, BS, Keccak256Hash<BS>>(
             vec![vec![from_const(12), from_const(34)]],
             parse("0xc781424ee41551ea0e56431b57519317a836b94c193ee898b39d058507217ee4"),
+        );
+        test_merkle_tree::<GL, GL4, Keccak256Hash<GL4>>(
+            vec![vec![from_const(12), from_const(34)]],
+            parse("0x379024f592268f303e1222ff41084f5c6782f59efd15b58be49dcc1cae6d4a95"),
         );
     }
 
@@ -619,9 +675,17 @@ mod tests {
             vec![vec![from_const(34), from_const(56)]],
             parse("0x85d6170f1dcec468c3a42f35d24b7689733abf26ff0278a9bc1edc7a9a0a7333"),
         );
+        test_merkle_tree::<GL, GL4, Sha2Hash<GL4>>(
+            vec![vec![from_const(34), from_const(56)]],
+            parse("0xed7bf3e4c440f10f7d3de6c0e41e0d325e0f3ffe24e4187fb782b2714e580968"),
+        );
         test_merkle_tree::<BS, BS, Keccak256Hash<BS>>(
             vec![vec![from_const(34), from_const(56)]],
             parse("0x00526855bdd13b55968dd71bddfca2409e77ee8c75cdc17fcdb641673558ae51"),
+        );
+        test_merkle_tree::<GL, GL4, Keccak256Hash<GL4>>(
+            vec![vec![from_const(34), from_const(56)]],
+            parse("0x97371a612a466e02663b2eef2800a09342003fbc0fdcc9a37111a3285b60c2a8"),
         );
     }
 
@@ -634,12 +698,26 @@ mod tests {
             ],
             parse("0xdc144d55dd7a9c48f00b495d30172b38db7d4dc71ee4a0feab99177e30a10d21"),
         );
+        test_merkle_tree::<GL, GL4, Sha2Hash<GL4>>(
+            vec![
+                vec![from_const(12), from_const(56)],
+                vec![from_const(34), from_const(78)],
+            ],
+            parse("0xde24d40a6507555666c04470640ff49396094a617478c8bd94688eb1996d4209"),
+        );
         test_merkle_tree::<BS, BS, Keccak256Hash<BS>>(
             vec![
                 vec![from_const(12), from_const(56)],
                 vec![from_const(34), from_const(78)],
             ],
             parse("0x086ff3e1257cbff588f5d01ce891ea152e15863c5e0d4407d4c3564d354b0614"),
+        );
+        test_merkle_tree::<GL, GL4, Keccak256Hash<GL4>>(
+            vec![
+                vec![from_const(12), from_const(56)],
+                vec![from_const(34), from_const(78)],
+            ],
+            parse("0xe862ac873453969fd46121d7fcc9e119190c2e2c4d2b6d23fb86764c94752532"),
         );
     }
 
@@ -652,12 +730,26 @@ mod tests {
             ],
             parse("0xfb5a002c9ef7dad6d9b4edc690f323f4c302c665926c085dd5d8681496c937c6"),
         );
+        test_merkle_tree::<GL, GL4, Sha2Hash<GL4>>(
+            vec![
+                vec![from_const(78), from_const(34)],
+                vec![from_const(56), from_const(12)],
+            ],
+            parse("0x3674569ea14d34d8615c8e0ba390af4f72e5510b50ad933bad3139ecaf9a8e1f"),
+        );
         test_merkle_tree::<BS, BS, Keccak256Hash<BS>>(
             vec![
                 vec![from_const(78), from_const(34)],
                 vec![from_const(56), from_const(12)],
             ],
             parse("0xb18e697b08221e2f411826d3c17c80bff6e06e90a55bcd5cc191ad67f1eb657a"),
+        );
+        test_merkle_tree::<GL, GL4, Keccak256Hash<GL4>>(
+            vec![
+                vec![from_const(78), from_const(34)],
+                vec![from_const(56), from_const(12)],
+            ],
+            parse("0xd3f639689d31146178166f434b1b6a0dd6b139a371b310946bee5b8fa0c8b0c0"),
         );
     }
 }
