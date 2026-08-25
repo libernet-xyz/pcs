@@ -145,9 +145,10 @@ pub struct Query<F: PrimeField, G: Field256 + From<F>, H: Hasher<G>> {
     blowup_log2: usize,
     /// The index of the element we're opening (the partner index is inferred automatically).
     index: usize,
-    /// Proves a pair of "partner" values at each folding round with one [`LeafProof`] pair for
-    /// every round. The pair at `folds[0]` proves the opened values.
-    folds: Vec<(LeafProof<G, G, H>, LeafProof<G, G, H>)>,
+    /// Merkle proofs for the values opened in the main tree.
+    main_openings: (LeafProof<F, G, H>, LeafProof<F, G, H>),
+    /// Merkle proofs for the values opened in each folded tree.
+    fold_openings: Vec<(LeafProof<G, G, H>, LeafProof<G, G, H>)>,
     _data: PhantomData<F>,
 }
 
@@ -166,7 +167,7 @@ impl<F: PrimeField, G: Field256 + From<F>, H: Hasher<G>> Query<F, G, H> {
     /// Note that we use [`Polynomial::shift_domain`] before committing polynomials, so the element
     /// returned here is a shifted power of an N-th root of unity, with
     /// `N = degree_bound * 2^blowup_factor`. The shift consists of multiplying the actual domain
-    /// element by [`Scalar::MULTIPLICATIVE_GENERATOR`], consistently with `shift_domain`.
+    /// element by [`PrimeField::MULTIPLICATIVE_GENERATOR`], consistently with `shift_domain`.
     pub fn x(&self) -> F {
         Polynomial::<F>::coset_element2(self.index, self.degree_bound << self.blowup_log2)
     }
@@ -177,17 +178,12 @@ impl<F: PrimeField, G: Field256 + From<F>, H: Hasher<G>> Query<F, G, H> {
     /// returned by [`Self::indices`], while the second component contains those at the second
     /// index.
     pub fn values(&self) -> (&[F], &[F]) {
-        // TODO: (self.folds[0].0.leaf(), self.folds[0].1.leaf())
-        todo!()
+        (self.main_openings.0.leaf(), self.main_openings.1.leaf())
     }
 
     /// Returns the number of folding rounds.
-    ///
-    /// In general these are log2(d)+1, with `d` being the degree bound of the committed polynomial.
-    /// Note that for low-degree testing `d` is strictly less than the number of committed
-    /// evaluations `N`.
     pub fn len(&self) -> usize {
-        self.folds.len()
+        self.fold_openings.len()
     }
 
     /// Verifies this proof against the given commitment.
@@ -200,41 +196,75 @@ impl<F: PrimeField, G: Field256 + From<F>, H: Hasher<G>> Query<F, G, H> {
         assert!(n.is_power_of_two());
         assert!(self.index < n);
 
-        let k = n.trailing_zeros() as usize;
+        let mut k = n.trailing_zeros() as usize;
 
-        let folds = self.folds.as_slice();
-
-        let num_folds = folds.len();
-        if num_folds > self.degree_bound.trailing_zeros() as usize + 1 {
-            return Err(anyhow!("invalid proof size"));
+        let num_folds = self.fold_openings.len();
+        if num_folds > self.degree_bound.trailing_zeros() as usize {
+            return Err(anyhow!("incorrect proof size"));
         }
-        if commitment.len() != num_folds {
+        if commitment.len() != num_folds + 1 {
             return Err(anyhow!("wrong number of folding rounds"));
         }
 
         let mut index = self.index;
-        let mut pos = self.folds[0].0.leaf().to_vec();
         let mut step = F::ROOT_OF_UNITY_INV.pow_u64(1u64 << (F::S - k));
         let two_inv = G::from(F::TWO_INV);
 
-        for round in 0..num_folds {
-            let (left, right) = &folds[round];
-            let root_hash = commitment.roots()[round];
+        let mut pos = {
+            let root_hash = commitment.root();
             let alpha = H::challenge(&[*FOLD_DST, root_hash]);
-            let neg: Vec<G> = right.leaf().iter().copied().map(G::from).collect();
 
-            if 1usize << left.len() != n {
+            let (left, right) = &self.main_openings;
+            if left.len() != k {
                 return Err(anyhow!(
                     "invalid left-hand side Merkle proof height (got {}, want {})",
                     left.len(),
-                    n.trailing_zeros()
+                    k
                 ));
             }
-            if 1usize << right.len() != n {
+            if right.len() != k {
                 return Err(anyhow!(
                     "invalid right-hand side Merkle proof height (got {}, want {})",
                     right.len(),
-                    n.trailing_zeros()
+                    k
+                ));
+            }
+
+            left.verify(index, root_hash)?;
+            right.verify((index + n / 2) % n, root_hash)?;
+
+            let omega_inv: G = step.pow_small(index).into();
+            n /= 2;
+            k -= 1;
+            index %= n;
+
+            let mut pos: Vec<G> = left.leaf().iter().copied().map(G::from).collect();
+            let neg: Vec<G> = right.leaf().iter().copied().map(G::from).collect();
+            for i in 0..pos.len() {
+                pos[i] = (pos[i] + neg[i] + alpha * omega_inv * (pos[i] - neg[i])) * two_inv;
+            }
+            step = step.square();
+
+            pos
+        };
+
+        for round in 0..num_folds {
+            let root_hash = commitment.roots()[round + 1];
+            let alpha = H::challenge(&[*FOLD_DST, root_hash]);
+
+            let (left, right) = &self.fold_openings[round];
+            if left.len() != k {
+                return Err(anyhow!(
+                    "invalid left-hand side Merkle proof height (got {}, want {})",
+                    left.len(),
+                    k
+                ));
+            }
+            if right.len() != k {
+                return Err(anyhow!(
+                    "invalid right-hand side Merkle proof height (got {}, want {})",
+                    right.len(),
+                    k
                 ));
             }
 
@@ -242,21 +272,21 @@ impl<F: PrimeField, G: Field256 + From<F>, H: Hasher<G>> Query<F, G, H> {
             left.verify(index, root_hash)?;
             right.verify((index + n / 2) % n, root_hash)?;
 
-            let omega_inv_i = step.pow_small(index);
+            let omega_inv: G = step.pow_small(index).into();
             n /= 2;
+            k -= 1;
             index %= n;
 
+            let neg = right.leaf().to_vec();
             for i in 0..pos.len() {
-                pos[i] = (G::from(pos[i] + neg[i])
-                    + alpha * G::from(omega_inv_i) * (pos[i] - neg[i]))
-                    * two_inv;
+                pos[i] = (pos[i] + neg[i] + alpha * omega_inv * (pos[i] - neg[i])) * two_inv;
             }
             step = step.square();
         }
 
-        let (left, right) = folds.last().unwrap();
+        let (left, right) = self.fold_openings.last().unwrap();
         if !left.is_constant()? || !right.is_constant()? {
-            return Err(anyhow!("final folded polynomial is not constant"));
+            return Err(anyhow!("the final folded polynomial is not constant"));
         }
 
         Ok(())
