@@ -378,12 +378,112 @@ impl<F: PrimeField, G: Field256 + From<F>, H: Hasher<G>> Prover<F, G, H> {
         }
     }
 
-    // TODO
+    /// Builds a FRI [`Query`] for the value at the specified index of the evaluation domain.
+    ///
+    /// NOTE: `index` is relative to the *inflated* evaluation domain, so for example if you
+    /// committed to 4 evaluations with a blowup factor of 8 the range for `index` is [0, 32).
+    pub fn query(&self, index: usize) -> Query<F, G, H> {
+        let mut n = self.degree_bound << self.blowup_log2;
+        assert!(index < n);
+
+        let mut i = index;
+
+        let main_openings = (
+            self.main_tree.query(i),
+            self.main_tree.query((i + n / 2) % n),
+        );
+        n /= 2;
+        i %= n;
+
+        let mut fold_openings = vec![];
+        for tree in &self.folded_trees {
+            fold_openings.push((tree.query(i), tree.query((i + n / 2) % n)));
+            n /= 2;
+            i %= n;
+        }
+
+        {
+            let (left, right) = fold_openings.last().unwrap();
+            assert!(left.is_constant().unwrap());
+            assert!(right.is_constant().unwrap());
+        }
+
+        Query {
+            degree_bound: self.degree_bound,
+            blowup_log2: self.blowup_log2,
+            index,
+            main_openings,
+            fold_openings,
+            _data: Default::default(),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hash::{Keccak256Hash, Sha2Hash};
+    use starkom_bluesky::Scalar as BS;
+    use starkom_goldilocks::{GL, GL4};
+
+    fn test_prover_impl<F: PrimeField, G: Field256 + From<F>, H: Hasher<G>>(
+        polynomials: &[Polynomial<F>],
+        degree_bound: usize,
+        blowup_log2: usize,
+    ) {
+        let prover = Prover::<F, G, H>::new(
+            polynomials.iter().cloned().collect(),
+            degree_bound,
+            blowup_log2,
+        );
+        assert_eq!(prover.degree_bound(), degree_bound);
+        let n = degree_bound << blowup_log2;
+        assert_eq!(prover.extended_domain_size(), n);
+        let commitment = prover.commit();
+        for i in 0..n {
+            let query = prover.query(i);
+            assert_eq!(query.indices(), (i, (i + n / 2) % n));
+            assert_eq!(query.len(), degree_bound.trailing_zeros() as usize + 1);
+            assert!(query.verify(&commitment).is_ok());
+        }
+    }
+
+    fn test_prover(polynomials: Vec<Vec<u64>>, degree_bound: usize) {
+        let bluesky_polynomials: Vec<Polynomial<BS>> = polynomials
+            .iter()
+            .map(|coefficients| {
+                Polynomial::with_coefficients(
+                    coefficients.iter().copied().map(BS::from_const).collect(),
+                )
+            })
+            .collect();
+        let goldilocks_polynomials: Vec<Polynomial<GL>> = polynomials
+            .into_iter()
+            .map(|coefficients| {
+                Polynomial::with_coefficients(
+                    coefficients.into_iter().map(GL::from_const).collect(),
+                )
+            })
+            .collect();
+        test_prover_impl::<BS, BS, Sha2Hash<BS>>(&bluesky_polynomials, degree_bound, 1);
+        test_prover_impl::<GL, GL4, Sha2Hash<GL4>>(&goldilocks_polynomials, degree_bound, 1);
+        test_prover_impl::<BS, BS, Keccak256Hash<BS>>(&bluesky_polynomials, degree_bound, 1);
+        test_prover_impl::<GL, GL4, Keccak256Hash<GL4>>(&goldilocks_polynomials, degree_bound, 1);
+        test_prover_impl::<BS, BS, Sha2Hash<BS>>(&bluesky_polynomials, degree_bound, 2);
+        test_prover_impl::<GL, GL4, Sha2Hash<GL4>>(&goldilocks_polynomials, degree_bound, 2);
+        test_prover_impl::<BS, BS, Keccak256Hash<BS>>(&bluesky_polynomials, degree_bound, 2);
+        test_prover_impl::<GL, GL4, Keccak256Hash<GL4>>(&goldilocks_polynomials, degree_bound, 2);
+        test_prover_impl::<BS, BS, Sha2Hash<BS>>(&bluesky_polynomials, degree_bound, 3);
+        test_prover_impl::<GL, GL4, Sha2Hash<GL4>>(&goldilocks_polynomials, degree_bound, 3);
+        test_prover_impl::<BS, BS, Keccak256Hash<BS>>(&bluesky_polynomials, degree_bound, 3);
+        test_prover_impl::<GL, GL4, Keccak256Hash<GL4>>(&goldilocks_polynomials, degree_bound, 3);
+    }
+
+    #[test]
+    fn test_one_constant_polynomial() {
+        test_prover(vec![vec![12]], 1);
+        test_prover(vec![vec![34]], 1);
+    }
 
     // TODO
 }
