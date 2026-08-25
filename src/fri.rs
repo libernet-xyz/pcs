@@ -19,11 +19,12 @@ trait FoldableTree<F: PrimeField, G: Field256 + From<F>, H: Hasher<G>>: Sized {
     /// Performs one FRI folding round, returning the new folded tree.
     fn fold(&self) -> Tree<G, G, H>;
 
-    /// Performs `times` FRI folding and returns an array of `times+1` trees.
+    /// Performs `times` FRI folding rounds and returns an array of `times` trees.
     ///
-    /// The first element is `self` (N leaves), the second element is the tree from the first
-    /// folding round (N/2 leaves), the third element is the tree from the second folding round (N/4
-    /// leaves), and so on.
+    /// The first element is the tree from the first folding round (N/2 leaves, with N being the
+    /// number of leaves in `self`), the second element is the tree from the second folding round
+    /// (N/4 leaves), and so on. If `times` is 0 no folding is performed and an empty array is
+    /// returned.
     fn fold_all(&self, times: usize) -> Vec<Tree<G, G, H>>;
 }
 
@@ -89,7 +90,10 @@ impl<B: PrimeField, F: Field, G: Field256 + From<B> + From<F>, H: Hasher<G>> Fol
     }
 
     fn fold_all(&self, times: usize) -> Vec<Tree<G, G, H>> {
-        let mut trees = Vec::with_capacity(times + 1);
+        let mut trees = Vec::with_capacity(times);
+        if times == 0 {
+            return trees;
+        }
         let mut tree = <Tree<F, G, H> as FoldableTree<B, G, H>>::fold(&self);
         for _ in 1..times {
             let folded = <Tree<G, G, H> as FoldableTree<B, G, H>>::fold(&tree);
@@ -196,8 +200,6 @@ impl<F: PrimeField, G: Field256 + From<F>, H: Hasher<G>> Query<F, G, H> {
         assert!(n.is_power_of_two());
         assert!(self.index < n);
 
-        let mut k = n.trailing_zeros() as usize;
-
         let num_folds = self.fold_openings.len();
         if num_folds > self.degree_bound.trailing_zeros() as usize {
             return Err(anyhow!("incorrect proof size"));
@@ -205,6 +207,19 @@ impl<F: PrimeField, G: Field256 + From<F>, H: Hasher<G>> Query<F, G, H> {
         if commitment.len() != num_folds + 1 {
             return Err(anyhow!("wrong number of folding rounds"));
         }
+
+        if num_folds == 0 {
+            let root_hash = commitment.root();
+            let (left, right) = &self.main_openings;
+            left.verify(self.index, root_hash)?;
+            right.verify((self.index + n / 2) % n, root_hash)?;
+            if !left.is_constant()? || !right.is_constant()? {
+                return Err(anyhow!("the final folded polynomial is not constant"));
+            }
+            return Ok(());
+        }
+
+        let mut k = n.trailing_zeros() as usize;
 
         let mut index = self.index;
         let mut step = F::ROOT_OF_UNITY_INV.pow_u64(1u64 << (F::S - k));
@@ -392,20 +407,23 @@ impl<F: PrimeField, G: Field256 + From<F>, H: Hasher<G>> Prover<F, G, H> {
             self.main_tree.query(i),
             self.main_tree.query((i + n / 2) % n),
         );
-        n /= 2;
-        i %= n;
-
         let mut fold_openings = vec![];
+
         for tree in &self.folded_trees {
-            fold_openings.push((tree.query(i), tree.query((i + n / 2) % n)));
             n /= 2;
             i %= n;
+            fold_openings.push((tree.query(i), tree.query((i + n / 2) % n)));
         }
 
-        {
-            let (left, right) = fold_openings.last().unwrap();
-            assert!(left.is_constant().unwrap());
-            assert!(right.is_constant().unwrap());
+        match fold_openings.last() {
+            Some((left, right)) => {
+                assert!(left.is_constant().unwrap());
+                assert!(right.is_constant().unwrap());
+            }
+            None => {
+                assert!(main_openings.0.is_constant().unwrap());
+                assert!(main_openings.1.is_constant().unwrap());
+            }
         }
 
         Query {
@@ -443,7 +461,7 @@ mod tests {
         for i in 0..n {
             let query = prover.query(i);
             assert_eq!(query.indices(), (i, (i + n / 2) % n));
-            assert_eq!(query.len(), degree_bound.trailing_zeros() as usize + 1);
+            assert_eq!(query.len(), degree_bound.trailing_zeros() as usize);
             assert!(query.verify(&commitment).is_ok());
         }
     }
@@ -485,5 +503,81 @@ mod tests {
         test_prover(vec![vec![34]], 1);
     }
 
-    // TODO
+    #[test]
+    fn test_two_constant_polynomials() {
+        test_prover(vec![vec![12], vec![34]], 1);
+    }
+
+    #[test]
+    fn test_three_constant_polynomials() {
+        test_prover(vec![vec![34], vec![56], vec![78]], 1);
+    }
+
+    #[test]
+    fn test_one_polynomial_degree_one() {
+        test_prover(vec![vec![12, 34]], 2);
+        test_prover(vec![vec![56, 78]], 2);
+    }
+
+    #[test]
+    fn test_two_polynomials_degree_one() {
+        test_prover(vec![vec![12, 34], vec![56, 78]], 2);
+    }
+
+    #[test]
+    fn test_three_polynomials_degree_one() {
+        test_prover(vec![vec![34, 56], vec![56, 78], vec![78, 90]], 2);
+    }
+
+    #[test]
+    fn test_one_polynomial_degree_three() {
+        test_prover(vec![vec![12, 34, 56, 78]], 4);
+        test_prover(vec![vec![42, 43, 44, 45]], 4);
+    }
+
+    #[test]
+    fn test_two_polynomials_degree_three() {
+        test_prover(vec![vec![12, 34, 56, 78], vec![42, 43, 44, 45]], 4);
+    }
+
+    #[test]
+    fn test_three_polynomials_degree_three() {
+        test_prover(
+            vec![
+                vec![42, 43, 44, 45],
+                vec![12, 34, 56, 78],
+                vec![34, 56, 78, 90],
+            ],
+            4,
+        );
+    }
+
+    #[test]
+    fn test_one_polynomial_degree_seven() {
+        test_prover(vec![vec![12, 34, 56, 78, 90, 12, 34]], 8);
+        test_prover(vec![vec![42, 43, 44, 45, 46, 47, 48]], 8);
+    }
+
+    #[test]
+    fn test_two_polynomials_degree_seven() {
+        test_prover(
+            vec![
+                vec![12, 34, 56, 78, 90, 12, 34],
+                vec![42, 43, 44, 45, 46, 47, 48],
+            ],
+            8,
+        );
+    }
+
+    #[test]
+    fn test_three_polynomials_degree_seven() {
+        test_prover(
+            vec![
+                vec![42, 43, 44, 45, 46, 47, 48],
+                vec![12, 34, 56, 78, 90, 12, 34],
+                vec![34, 56, 78, 90, 78, 56, 34],
+            ],
+            8,
+        );
+    }
 }
