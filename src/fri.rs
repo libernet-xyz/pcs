@@ -65,7 +65,7 @@ impl<B: PrimeField, F: Field, G: Field256 + From<B> + From<F>, H: Hasher<G>> Fol
         let n = self.num_leaves();
         assert!(n.is_power_of_two());
 
-        let alpha = H::challenge(&[*FOLD_DST, self.root_hash()]);
+        let alpha = H::challenge(*FOLD_DST, &[self.root_hash()]);
 
         let k = n.trailing_zeros() as usize;
         let omega_inv = B::ROOT_OF_UNITY_INV.pow_u64(1u64 << (B::S - k));
@@ -227,7 +227,7 @@ impl<F: PrimeField, G: Field256 + From<F>, H: Hasher<G>> Query<F, G, H> {
 
         let mut pos = {
             let root_hash = commitment.root();
-            let alpha = H::challenge(&[*FOLD_DST, root_hash]);
+            let alpha = H::challenge(*FOLD_DST, &[root_hash]);
 
             let (left, right) = &self.main_openings;
             if left.len() != k {
@@ -265,7 +265,7 @@ impl<F: PrimeField, G: Field256 + From<F>, H: Hasher<G>> Query<F, G, H> {
 
         for round in 0..num_folds {
             let root_hash = commitment.roots()[round + 1];
-            let alpha = H::challenge(&[*FOLD_DST, root_hash]);
+            let alpha = H::challenge(*FOLD_DST, &[root_hash]);
 
             let (left, right) = &self.fold_openings[round];
             if left.len() != k {

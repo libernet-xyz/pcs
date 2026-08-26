@@ -3,7 +3,11 @@
 
 #![doc = include_str!("../README.md")]
 
-mod fri;
+mod deep;
+mod dst;
 mod merkle;
 
+pub mod fri;
 pub mod hash;
+
+pub use deep::*;

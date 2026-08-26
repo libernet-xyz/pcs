@@ -1,9 +1,8 @@
-use primitive_types::{H128, H256, U128, U512};
+use primitive_types::{H256, U128, U256, U512};
 use sha2::Digest;
 use starkom_ff::Field256;
 use std::fmt::Debug;
 use std::marker::PhantomData;
-use std::sync::LazyLock;
 
 /// Describes a hash backend for hashing internal Merkle tree nodes.
 pub trait MerkleHasher {
@@ -28,7 +27,7 @@ pub trait Hasher<F: Field256>: MerkleHasher {
     fn hash(inputs: impl IntoIterator<Item = F>) -> H256;
 
     /// Generates a ~256-bit Fiat-Shamir challenge from the provided transcript.
-    fn challenge(transcript: &[H256]) -> F;
+    fn challenge(dst: H256, transcript: &[H256]) -> F;
 }
 
 mod internal {
@@ -69,20 +68,14 @@ mod internal {
         }
     }
 
-    fn make_dst(s: &'static [u8]) -> H128 {
-        let mut hasher = sha3::Sha3_256::new();
-        hasher.update(s);
-        H128::from_slice(&hasher.finalize().as_slice()[0..16])
-    }
-
     pub struct HasherImpl<H: LowLevelHash, F: Field256> {
         _data: PhantomData<(H, F)>,
     }
 
     impl<H: LowLevelHash, F: Field256> HasherImpl<H, F> {
-        fn hash_transcript(dst: H128, transcript: &[H256]) -> H256 {
+        fn hash_transcript(dst: U256, transcript: &[H256]) -> H256 {
             let mut hasher = H::default();
-            hasher.update(dst.as_bytes());
+            hasher.update(dst.to_big_endian().as_slice());
             hasher.update(&U128::from(transcript.len() as u64).to_big_endian());
             for element in transcript {
                 hasher.update(element.as_bytes());
@@ -117,15 +110,10 @@ mod internal {
             hasher.finalize()
         }
 
-        fn challenge(transcript: &[H256]) -> F {
-            let hi = {
-                static DST: LazyLock<H128> = LazyLock::new(|| make_dst(b"starkom/pcs/challenge/0"));
-                Self::hash_transcript(*DST, transcript)
-            };
-            let lo = {
-                static DST: LazyLock<H128> = LazyLock::new(|| make_dst(b"starkom/pcs/challenge/1"));
-                Self::hash_transcript(*DST, transcript)
-            };
+        fn challenge(dst: H256, transcript: &[H256]) -> F {
+            let dst = U256::from_big_endian(dst.as_bytes());
+            let hi = Self::hash_transcript(dst, transcript);
+            let lo = Self::hash_transcript(dst + U256::one(), transcript);
             let mut bytes = [0u8; 64];
             bytes[0..32].copy_from_slice(hi.as_bytes());
             bytes[32..].copy_from_slice(lo.as_bytes());
@@ -149,6 +137,13 @@ mod tests {
     use starkom_bluesky::Scalar as BS;
     use starkom_goldilocks::GL4;
     use std::str::FromStr;
+    use std::sync::LazyLock;
+
+    static DST: LazyLock<H256> = LazyLock::new(|| {
+        let mut hasher = sha3::Sha3_256::new();
+        hasher.update(b"starkom/pcs/test");
+        H256::from_slice(hasher.finalize().as_slice())
+    });
 
     fn from_u64<F: Field256>(value: u64) -> F {
         F::from(value)
@@ -299,100 +294,136 @@ mod tests {
     #[test]
     fn test_sha2_challenge_bluesky() {
         assert_eq!(
-            Sha2Hash::<BS>::challenge(&[parse(
-                "0x5b584bf4398b7ef509abeb33ba8521c96a4a497ffba046a492cc43ac34174c16"
-            )]),
-            parse("0x78b05d4cf077c387a38026c25943a8b03440178d8e351dc7140b9479a58efc62")
+            Sha2Hash::<BS>::challenge(
+                *DST,
+                &[parse(
+                    "0x5b584bf4398b7ef509abeb33ba8521c96a4a497ffba046a492cc43ac34174c16"
+                )]
+            ),
+            parse("0x60555de477c0592d48a0f76f80c88c39a0c127d7209e2ba893de300778792682")
         );
         assert_eq!(
-            Sha2Hash::<BS>::challenge(&[
-                parse("0x2a1d8bd2a5dc960774c53b77e3e8d677b225bb45ec5d9caaf544e4f229a8afcd"),
-                parse("0x39de8bea57c1ab4082270791ce637189f07d169852f8bba5d05784368b505a12"),
-            ]),
-            parse("0x6900b583e0659590d5ea91b8c882cba9054d8a1b7929c445c3746d0ec095bc68")
+            Sha2Hash::<BS>::challenge(
+                *DST,
+                &[
+                    parse("0x2a1d8bd2a5dc960774c53b77e3e8d677b225bb45ec5d9caaf544e4f229a8afcd"),
+                    parse("0x39de8bea57c1ab4082270791ce637189f07d169852f8bba5d05784368b505a12"),
+                ]
+            ),
+            parse("0x2abcb323efcc551be2b473c75ccc1c3f563530df6a279dc4f053282deafccabc")
         );
         assert_eq!(
-            Sha2Hash::<BS>::challenge(&[
-                parse("0x2cbe7a924ef4a68b49dc6eac0fcf7c8504cc9ecfcb1628cf2b9686d8597e088e"),
-                parse("0x4f6c036f1eaa65e8b761c7fc972156ca4a8340d47d26cd091c9a63655b415896"),
-                parse("0x32c783c083c0fafa4dba39e2176fc3a14791b83d4f1a51372aa483279a93d687"),
-            ]),
-            parse("0x3f137d653dc81b281abd74125613820759f872831822d305bd203f591f5baf09")
+            Sha2Hash::<BS>::challenge(
+                *DST,
+                &[
+                    parse("0x2cbe7a924ef4a68b49dc6eac0fcf7c8504cc9ecfcb1628cf2b9686d8597e088e"),
+                    parse("0x4f6c036f1eaa65e8b761c7fc972156ca4a8340d47d26cd091c9a63655b415896"),
+                    parse("0x32c783c083c0fafa4dba39e2176fc3a14791b83d4f1a51372aa483279a93d687"),
+                ]
+            ),
+            parse("0x1e4a2f56b812c4842720698bb2fb8708eec162e1febe52e90aceac66bb57ae3e")
         );
     }
 
     #[test]
     fn test_sha2_challenge_goldilocks() {
         assert_eq!(
-            Sha2Hash::<GL4>::challenge(&[parse(
-                "0x5b584bf4398b7ef509abeb33ba8521c96a4a497ffba046a492cc43ac34174c16"
-            )]),
-            parse("0x8d9ac2b5aad3733563e99865b441c1eb314ebace4103d55988fcc3b8b2911f2d")
+            Sha2Hash::<GL4>::challenge(
+                *DST,
+                &[parse(
+                    "0x5b584bf4398b7ef509abeb33ba8521c96a4a497ffba046a492cc43ac34174c16"
+                )]
+            ),
+            parse("0x3db58df62452afc50e241f9ae42230b788cf37d4aa0b13a43831946bed72e170")
         );
         assert_eq!(
-            Sha2Hash::<GL4>::challenge(&[
-                parse("0x2a1d8bd2a5dc960774c53b77e3e8d677b225bb45ec5d9caaf544e4f229a8afcd"),
-                parse("0x39de8bea57c1ab4082270791ce637189f07d169852f8bba5d05784368b505a12"),
-            ]),
-            parse("0x9fad853c08e40ffafa35e323bca17ac34b52f8a2836116571f0044f556665b72")
+            Sha2Hash::<GL4>::challenge(
+                *DST,
+                &[
+                    parse("0x2a1d8bd2a5dc960774c53b77e3e8d677b225bb45ec5d9caaf544e4f229a8afcd"),
+                    parse("0x39de8bea57c1ab4082270791ce637189f07d169852f8bba5d05784368b505a12"),
+                ]
+            ),
+            parse("0x10fecd76d44d659f9b0502705a45dd0c54236211eb6f88680df390d92e5d5d06")
         );
         assert_eq!(
-            Sha2Hash::<GL4>::challenge(&[
-                parse("0x2cbe7a924ef4a68b49dc6eac0fcf7c8504cc9ecfcb1628cf2b9686d8597e088e"),
-                parse("0x4f6c036f1eaa65e8b761c7fc972156ca4a8340d47d26cd091c9a63655b415896"),
-                parse("0x32c783c083c0fafa4dba39e2176fc3a14791b83d4f1a51372aa483279a93d687"),
-            ]),
-            parse("0x22ada69eb25d9e0c1654b47c06ca8e6ca7596367a20dd56d966ff4787296bb73")
+            Sha2Hash::<GL4>::challenge(
+                *DST,
+                &[
+                    parse("0x2cbe7a924ef4a68b49dc6eac0fcf7c8504cc9ecfcb1628cf2b9686d8597e088e"),
+                    parse("0x4f6c036f1eaa65e8b761c7fc972156ca4a8340d47d26cd091c9a63655b415896"),
+                    parse("0x32c783c083c0fafa4dba39e2176fc3a14791b83d4f1a51372aa483279a93d687"),
+                ]
+            ),
+            parse("0x19f2ce3d8ba0c988a6ed215951f72abb675b50da360d4b0c9868360105b69e19")
         );
     }
 
     #[test]
     fn test_keccak256_challenge_bluesky() {
         assert_eq!(
-            Keccak256Hash::<BS>::challenge(&[parse(
-                "0x5b584bf4398b7ef509abeb33ba8521c96a4a497ffba046a492cc43ac34174c16"
-            )]),
-            parse("0x031c4e9c4d002b5609c02156388648c3ffe34d80ed0b17bfd50a95d0baf45aa8")
+            Keccak256Hash::<BS>::challenge(
+                *DST,
+                &[parse(
+                    "0x5b584bf4398b7ef509abeb33ba8521c96a4a497ffba046a492cc43ac34174c16"
+                )]
+            ),
+            parse("0x66647f27ced95c30909f94ab8649419a5457026e3b7d956902401b521672b1bd")
         );
         assert_eq!(
-            Keccak256Hash::<BS>::challenge(&[
-                parse("0x2a1d8bd2a5dc960774c53b77e3e8d677b225bb45ec5d9caaf544e4f229a8afcd"),
-                parse("0x39de8bea57c1ab4082270791ce637189f07d169852f8bba5d05784368b505a12"),
-            ]),
-            parse("0x068087bf4a49a0d2e40500e0d2ce69afb2192f042318d53fefeb73c535b2652f")
+            Keccak256Hash::<BS>::challenge(
+                *DST,
+                &[
+                    parse("0x2a1d8bd2a5dc960774c53b77e3e8d677b225bb45ec5d9caaf544e4f229a8afcd"),
+                    parse("0x39de8bea57c1ab4082270791ce637189f07d169852f8bba5d05784368b505a12"),
+                ]
+            ),
+            parse("0x448a77521c4edee2ead1cbaedb7d2b9cdf2f72b7f54abbb6824241ce3f273355")
         );
         assert_eq!(
-            Keccak256Hash::<BS>::challenge(&[
-                parse("0x2cbe7a924ef4a68b49dc6eac0fcf7c8504cc9ecfcb1628cf2b9686d8597e088e"),
-                parse("0x4f6c036f1eaa65e8b761c7fc972156ca4a8340d47d26cd091c9a63655b415896"),
-                parse("0x32c783c083c0fafa4dba39e2176fc3a14791b83d4f1a51372aa483279a93d687"),
-            ]),
-            parse("0x2ceda98a8005aae79c4dafd76c1464d376dacd5e97ce2bd208f33d936a8bddd4")
+            Keccak256Hash::<BS>::challenge(
+                *DST,
+                &[
+                    parse("0x2cbe7a924ef4a68b49dc6eac0fcf7c8504cc9ecfcb1628cf2b9686d8597e088e"),
+                    parse("0x4f6c036f1eaa65e8b761c7fc972156ca4a8340d47d26cd091c9a63655b415896"),
+                    parse("0x32c783c083c0fafa4dba39e2176fc3a14791b83d4f1a51372aa483279a93d687"),
+                ]
+            ),
+            parse("0x48e3fc25084ef8f0183b3ed2d827ad8b701a7129c25ba03f471fada5ab59568a")
         );
     }
 
     #[test]
     fn test_keccak256_challenge_goldilocks() {
         assert_eq!(
-            Keccak256Hash::<GL4>::challenge(&[parse(
-                "0x5b584bf4398b7ef509abeb33ba8521c96a4a497ffba046a492cc43ac34174c16"
-            )]),
-            parse("0x8f8f79a93bf43c083b2334b4893247860192c59a0576b6cecd9425968f5217c8")
+            Keccak256Hash::<GL4>::challenge(
+                *DST,
+                &[parse(
+                    "0x5b584bf4398b7ef509abeb33ba8521c96a4a497ffba046a492cc43ac34174c16"
+                )]
+            ),
+            parse("0xe80eb8ea838e3bf1e5734f4ac0efe313d2faee4b74593eaa52e1772040b22e3f")
         );
         assert_eq!(
-            Keccak256Hash::<GL4>::challenge(&[
-                parse("0x2a1d8bd2a5dc960774c53b77e3e8d677b225bb45ec5d9caaf544e4f229a8afcd"),
-                parse("0x39de8bea57c1ab4082270791ce637189f07d169852f8bba5d05784368b505a12"),
-            ]),
-            parse("0x2d93d1e7a6ca805e782ede54b65dd3b1d8b74b11dc08f2537a82bcbabddb6780")
+            Keccak256Hash::<GL4>::challenge(
+                *DST,
+                &[
+                    parse("0x2a1d8bd2a5dc960774c53b77e3e8d677b225bb45ec5d9caaf544e4f229a8afcd"),
+                    parse("0x39de8bea57c1ab4082270791ce637189f07d169852f8bba5d05784368b505a12"),
+                ]
+            ),
+            parse("0xc7327dd09bc9df340622777b370ed74e9cb57e4882bc7fc9a23127bcae403499")
         );
         assert_eq!(
-            Keccak256Hash::<GL4>::challenge(&[
-                parse("0x2cbe7a924ef4a68b49dc6eac0fcf7c8504cc9ecfcb1628cf2b9686d8597e088e"),
-                parse("0x4f6c036f1eaa65e8b761c7fc972156ca4a8340d47d26cd091c9a63655b415896"),
-                parse("0x32c783c083c0fafa4dba39e2176fc3a14791b83d4f1a51372aa483279a93d687"),
-            ]),
-            parse("0x0bbf9a8a1b46deed8e1ab544ad73abe8a7c96cfb0c57e7ef4a7b6dd52997814d")
+            Keccak256Hash::<GL4>::challenge(
+                *DST,
+                &[
+                    parse("0x2cbe7a924ef4a68b49dc6eac0fcf7c8504cc9ecfcb1628cf2b9686d8597e088e"),
+                    parse("0x4f6c036f1eaa65e8b761c7fc972156ca4a8340d47d26cd091c9a63655b415896"),
+                    parse("0x32c783c083c0fafa4dba39e2176fc3a14791b83d4f1a51372aa483279a93d687"),
+                ]
+            ),
+            parse("0x4123d9b2786928a9e646df736814516967778af7c0c0e28de6719e6c24c0bde8")
         );
     }
 }
