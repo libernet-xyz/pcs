@@ -83,3 +83,22 @@ impl<F: PrimeField, G: Field256 + From<F>, H: Hasher<G>> Commitment<F, G, H> {
         indices
     }
 }
+
+// TODO
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_query_dst() {
+        assert_eq!(
+            *QUERY_DST,
+            "0x344dcbdbf48e4b008c5998834be6306ea62faff77441a031a89dd2d7b8a36d4a"
+                .parse()
+                .unwrap()
+        );
+    }
+
+    // TODO
+}

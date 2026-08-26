@@ -4,7 +4,6 @@
 #![doc = include_str!("../README.md")]
 
 mod deep;
-mod dst;
 mod merkle;
 
 pub mod fri;

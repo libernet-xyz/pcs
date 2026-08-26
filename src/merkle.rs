@@ -1,9 +1,32 @@
-use crate::dst;
 use crate::hash::{Hasher, MerkleHasher};
 use anyhow::{Result, anyhow};
-use primitive_types::H256;
+use primitive_types::{H256, U256, U512};
+use sha2::Digest;
 use starkom_ff::{Field, Field256};
+use std::any::TypeId;
+use std::collections::BTreeMap;
 use std::marker::PhantomData;
+use std::sync::{LazyLock, Mutex};
+
+fn make_dst(s: &'static [u8], modulus: U512) -> U256 {
+    let mut hasher = sha3::Sha3_512::new();
+    hasher.update(s);
+    let hash: U512 = U512::from_little_endian(hasher.finalize().as_slice());
+    let value = hash % modulus;
+    U256::from_little_endian(&value.to_little_endian()[0..32])
+}
+
+fn get_dst<F: Field>(s: &'static [u8]) -> F {
+    static DST_CACHE: LazyLock<Mutex<BTreeMap<(TypeId, &'static [u8]), U256>>> =
+        LazyLock::new(|| Mutex::default());
+    let value = {
+        let mut cache = DST_CACHE.lock().unwrap();
+        *cache
+            .entry((TypeId::of::<F>(), s))
+            .or_insert_with(|| make_dst(s, F::MODULUS.parse().unwrap()))
+    };
+    F::try_from_le_bytes(&value.to_little_endian()[0..(F::LEN)]).unwrap()
+}
 
 /// Hashes a leaf of a Merkle tree.
 ///
@@ -12,7 +35,7 @@ use std::marker::PhantomData;
 /// parameter is a slice of scalar values.
 fn hash_leaf<F: Field, G: Field256 + From<F>, H: Hasher<G>>(values: &[F]) -> H256 {
     H::hash(
-        std::iter::once(dst::get_dst::<F>(b"starkom/merkle/leaf"))
+        std::iter::once(get_dst::<F>(b"starkom/merkle/leaf"))
             .chain(std::iter::once(F::try_from(values.len()).unwrap()))
             .chain(values.iter().cloned())
             .map(Into::<G>::into),
@@ -262,6 +285,18 @@ mod tests {
 
     fn parse<V: FromStr<Err: Debug>>(s: &'static str) -> V {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn test_dsts() {
+        assert_eq!(
+            get_dst::<BS>(b"starkom/merkle/leaf"),
+            parse("0x08cb2652a56289bd316cfcb356f5d2be485538e04a601fb14fc2c98f03077fcb")
+        );
+        assert_eq!(
+            get_dst::<GL>(b"starkom/merkle/leaf"),
+            parse("0x9e8c852f6e39922a")
+        );
     }
 
     #[test]

@@ -444,6 +444,16 @@ mod tests {
     use starkom_bluesky::Scalar as BS;
     use starkom_goldilocks::{GL, GL4};
 
+    #[test]
+    fn test_fold_dst() {
+        assert_eq!(
+            *FOLD_DST,
+            "0x9ffd3556faeb2cae194ce95adf6b3580f590504daa0dea56966ce4ef233844af"
+                .parse()
+                .unwrap()
+        );
+    }
+
     fn test_prover_impl<F: PrimeField, G: Field256 + From<F>, H: Hasher<G>>(
         polynomials: &[Polynomial<F>],
         degree_bound: usize,
