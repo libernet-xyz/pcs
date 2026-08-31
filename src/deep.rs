@@ -13,6 +13,13 @@ use std::sync::LazyLock;
 /// Target security level in bits.
 pub const LAMBDA: usize = 128;
 
+/// Domain separator tag used by [`Committer::transcript_hash`].
+static TRANSCRIPT_DST: LazyLock<H256> = LazyLock::new(|| {
+    let mut hasher = sha3::Sha3_256::new();
+    hasher.update(b"starkom/deep/transcript");
+    H256::from_slice(hasher.finalize().as_slice())
+});
+
 /// Domain separator tag for the Fiat-Shamir challenge used to derive query indices.
 static QUERY_DST: LazyLock<H256> = LazyLock::new(|| {
     let mut hasher = sha3::Sha3_256::new();
@@ -69,6 +76,28 @@ impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> Commitment<F, G, H> {
     /// Returns the root hashes of the Merkle trees where all batched polynomials are stored.
     pub fn tree_roots(&self) -> &[H256] {
         self.tree_roots.as_slice()
+    }
+
+    /// Hashes the first `batch_count` [tree roots](`Self::tree_roots`).
+    ///
+    /// The returned hash is cryptographically bound to the full transcript up to the given
+    /// polynomial batch, and can be used by a verifier to recover Fiat-Shamir challenges.
+    ///
+    /// REQUIRES: `batch_count` must be strictly greater than 0 and less than or equal to the number
+    /// of tree roots.
+    ///
+    /// The hashes returned by this method are compatible with [`Committer::transcript_hash`], which
+    /// can be used on the prover side.
+    pub fn transcript_hash(&self, batch_count: usize) -> H256 {
+        assert!(batch_count > 0);
+        assert!(batch_count <= self.tree_roots.len());
+        H::hash_transcript(
+            *TRANSCRIPT_DST,
+            std::iter::once(encode_usize(batch_count))
+                .chain(self.tree_roots[..batch_count].iter().copied())
+                .collect::<Vec<H256>>()
+                .as_slice(),
+        )
     }
 
     /// Returns the FRI query indices derived via Fiat-Shamir from the full commitment transcript
@@ -164,6 +193,23 @@ impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> Committer<F, G, H> {
     /// This value can be used to derive Fiat-Shamir challenges.
     pub fn root_hash(&self, index: usize) -> H256 {
         self.trees[index].root_hash()
+    }
+
+    /// Hashes the Merkle roots of all polynomial batches accumulated so far.
+    ///
+    /// The returned hash is cryptographically bound to the full transcript so far, and can be used
+    /// by the caller to generate Fiat-Shamir challenges.
+    ///
+    /// The hashes returned by this method are compatible with [`Commitment::transcript_hash`],
+    /// which can be used on the verifier side.
+    pub fn transcript_hash(&self) -> H256 {
+        H::hash_transcript(
+            *TRANSCRIPT_DST,
+            std::iter::once(encode_usize(self.trees.len()))
+                .chain(self.trees.iter().map(Tree::root_hash))
+                .collect::<Vec<H256>>()
+                .as_slice(),
+        )
     }
 
     /// Adds a batch of polynomials, returning the index of the newly created batch.
@@ -518,6 +564,9 @@ impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> Prover<F, G, H> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hash::Sha2Hash;
+    use starkom_bluesky::Scalar as BS;
+    use starkom_goldilocks::{GL, GL4};
 
     #[test]
     fn test_query_dst() {
@@ -527,6 +576,128 @@ mod tests {
                 .parse()
                 .unwrap()
         );
+    }
+
+    fn test_prover_impl<F: Field, G: Field256 + From<F>, H: Hasher<G>>(
+        mut polynomial_batches: Vec<Vec<Polynomial<F>>>,
+        points: &[u16],
+        degree_bound: usize,
+        blowup_log2: usize,
+    ) {
+        let num_batches = polynomial_batches.len();
+        let num_polys = polynomial_batches.iter().map(|batch| batch.len()).sum();
+        let points = BTreeMap::from_iter(points.iter().cloned().map(|z| {
+            (
+                F::from(z),
+                polynomial_batches
+                    .iter()
+                    .flatten()
+                    .map(|polynomial| polynomial.evaluate(z.into()))
+                    .collect::<Vec<F>>(),
+            )
+        }));
+        let first_batch = polynomial_batches.remove(0);
+        let mut committer = Committer::<F, G, H>::new(degree_bound, blowup_log2, first_batch);
+        let transcript_hashes: Vec<H256> = std::iter::once(committer.transcript_hash())
+            .chain(polynomial_batches.into_iter().map(|batch| {
+                committer.add_batch(batch);
+                committer.transcript_hash()
+            }))
+            .collect();
+        let (commitment, prover) = committer.commit(points.iter().map(|(&z, _)| z).collect());
+        assert_eq!(
+            (0..num_batches)
+                .map(|i| commitment.transcript_hash(i + 1))
+                .collect::<Vec<H256>>(),
+            transcript_hashes
+        );
+        assert_eq!(prover.degree_bound(), degree_bound);
+        assert_eq!(prover.extended_domain_size(), degree_bound << blowup_log2);
+        assert_eq!(prover.num_polys(), num_polys);
+        assert_eq!(prover.num_trees(), num_batches);
+        assert_eq!(*prover.points(), points);
+        let proof = prover.prove(&commitment);
+        assert_eq!(proof.degree_bound(), degree_bound);
+        assert_eq!(proof.blowup_log2(), blowup_log2);
+        assert_eq!(proof.extended_domain_size(), degree_bound << blowup_log2);
+        assert_eq!(proof.num_polys(), num_polys);
+        assert!(proof.verify(&commitment).is_ok());
+        assert_eq!(*proof.points(), points);
+    }
+
+    fn test_prover(polynomial_batches: Vec<Vec<Vec<u16>>>, points: &[u16], degree_bound: usize) {
+        let bluesky_polynomial_batches: Vec<Vec<Polynomial<BS>>> = polynomial_batches
+            .iter()
+            .map(|batch| {
+                batch
+                    .iter()
+                    .map(|coefficients| {
+                        Polynomial::with_coefficients(
+                            coefficients.iter().copied().map(BS::from).collect(),
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        let goldilocks_polynomial_batches: Vec<Vec<Polynomial<GL>>> = polynomial_batches
+            .iter()
+            .map(|batch| {
+                batch
+                    .iter()
+                    .map(|coefficients| {
+                        Polynomial::with_coefficients(
+                            coefficients.iter().copied().map(GL::from).collect(),
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        test_prover_impl::<BS, BS, Sha2Hash<BS>>(
+            bluesky_polynomial_batches.clone(),
+            points,
+            degree_bound,
+            1,
+        );
+        test_prover_impl::<GL, GL4, Sha2Hash<GL4>>(
+            goldilocks_polynomial_batches.clone(),
+            points,
+            degree_bound,
+            1,
+        );
+        test_prover_impl::<BS, BS, Sha2Hash<BS>>(
+            bluesky_polynomial_batches.clone(),
+            points,
+            degree_bound,
+            2,
+        );
+        test_prover_impl::<GL, GL4, Sha2Hash<GL4>>(
+            goldilocks_polynomial_batches.clone(),
+            points,
+            degree_bound,
+            2,
+        );
+        test_prover_impl::<BS, BS, Sha2Hash<BS>>(
+            bluesky_polynomial_batches.clone(),
+            points,
+            degree_bound,
+            3,
+        );
+        test_prover_impl::<GL, GL4, Sha2Hash<GL4>>(
+            goldilocks_polynomial_batches.clone(),
+            points,
+            degree_bound,
+            3,
+        );
+    }
+
+    #[test]
+    fn test_one_constant_polynomial_one_point_1() {
+        test_prover(vec![vec![vec![12]]], &[123], 1);
+    }
+
+    #[test]
+    fn test_one_constant_polynomial_one_point_2() {
+        test_prover(vec![vec![vec![12]]], &[321], 1);
     }
 
     // TODO

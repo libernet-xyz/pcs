@@ -26,7 +26,15 @@ pub trait Hasher<F: Field256>: MerkleHasher {
     /// caller is responsible for those when necessary.
     fn hash(inputs: impl IntoIterator<Item = F>) -> H256;
 
-    /// Generates a ~256-bit Fiat-Shamir challenge from the provided transcript.
+    /// Hashes the provided transcript.
+    fn hash_transcript(dst: H256, transcript: &[H256]) -> H256;
+
+    /// Generates a ~256-bit Fiat-Shamir challenge from a transcript.
+    ///
+    /// The provided implementation hashes the transcript with [`Self::hash_transcript`] and
+    /// converts the hash to a field element. To avoid distribution bias, the transcript is hashed
+    /// twice with slightly different DSTs, and the resulting 512 bits are converted to a 256-bit
+    /// field element via modular reduction.
     fn challenge(dst: H256, transcript: &[H256]) -> F;
 }
 
@@ -72,18 +80,6 @@ mod internal {
         _data: PhantomData<(H, F)>,
     }
 
-    impl<H: LowLevelHash, F: Field256> HasherImpl<H, F> {
-        fn hash_transcript(dst: U256, transcript: &[H256]) -> H256 {
-            let mut hasher = H::default();
-            hasher.update(dst.to_big_endian().as_slice());
-            hasher.update(&U128::from(transcript.len() as u64).to_big_endian());
-            for element in transcript {
-                hasher.update(element.as_bytes());
-            }
-            hasher.finalize()
-        }
-    }
-
     impl<H: LowLevelHash, F: Field256> MerkleHasher for HasherImpl<H, F> {
         fn hash_binary(left: H256, right: H256) -> H256 {
             let mut hasher = H::default();
@@ -110,10 +106,21 @@ mod internal {
             hasher.finalize()
         }
 
+        fn hash_transcript(dst: H256, transcript: &[H256]) -> H256 {
+            let mut hasher = H::default();
+            hasher.update(dst.as_bytes());
+            hasher.update(&U128::from(transcript.len() as u64).to_big_endian());
+            for element in transcript {
+                hasher.update(element.as_bytes());
+            }
+            hasher.finalize()
+        }
+
         fn challenge(dst: H256, transcript: &[H256]) -> F {
-            let dst = U256::from_big_endian(dst.as_bytes());
-            let hi = Self::hash_transcript(dst, transcript);
-            let lo = Self::hash_transcript(dst + U256::one(), transcript);
+            let dst_hi = U256::from_big_endian(dst.as_bytes());
+            let dst_lo = dst_hi + U256::one();
+            let hi = Self::hash_transcript(H256::from_slice(&dst_hi.to_big_endian()), transcript);
+            let lo = Self::hash_transcript(H256::from_slice(&dst_lo.to_big_endian()), transcript);
             let mut bytes = [0u8; 64];
             bytes[0..32].copy_from_slice(hi.as_bytes());
             bytes[32..].copy_from_slice(lo.as_bytes());
