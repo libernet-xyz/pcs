@@ -569,10 +569,22 @@ mod tests {
     use starkom_goldilocks::{GL, GL4};
 
     #[test]
-    fn test_query_dst() {
+    fn test_dsts() {
+        assert_eq!(
+            *TRANSCRIPT_DST,
+            "0x09f36235476a658841de9bcdd34e1ac31ec792e41def5de31aecb4eb3bb1816b"
+                .parse()
+                .unwrap()
+        );
         assert_eq!(
             *QUERY_DST,
             "0x344dcbdbf48e4b008c5998834be6306ea62faff77441a031a89dd2d7b8a36d4a"
+                .parse()
+                .unwrap()
+        );
+        assert_eq!(
+            *RLC_DST,
+            "0x688ae37e5f05871810e7c6777e1c16c55ef4b14f072357586d7a298cefc11368"
                 .parse()
                 .unwrap()
         );
