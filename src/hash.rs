@@ -95,16 +95,16 @@ mod internal {
     impl<H: LowLevelHash, F: Field256> MerkleHasher for HasherImpl<H, F> {
         fn hash_binary(left: H256, right: H256) -> H256 {
             let mut hasher = H::default();
-            hasher.update(&left.to_fixed_bytes());
-            hasher.update(&right.to_fixed_bytes());
+            hasher.update(left.as_bytes());
+            hasher.update(right.as_bytes());
             hasher.finalize()
         }
 
         fn hash_ternary(children: [H256; 3]) -> H256 {
             let mut hasher = H::default();
-            hasher.update(&children[0].to_fixed_bytes());
-            hasher.update(&children[1].to_fixed_bytes());
-            hasher.update(&children[2].to_fixed_bytes());
+            hasher.update(children[0].as_bytes());
+            hasher.update(children[1].as_bytes());
+            hasher.update(children[2].as_bytes());
             hasher.finalize()
         }
     }

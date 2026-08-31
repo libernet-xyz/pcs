@@ -1,6 +1,6 @@
 use crate::hash::Hasher;
 use crate::merkle::{Proof as LeafProof, Tree};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use primitive_types::H256;
 use sha2::Digest;
 use starkom_ff::Field256;
@@ -216,7 +216,7 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
         }
 
         let (left, right) = self.folds.last().unwrap();
-        if !left.is_constant()? || !right.is_constant()? {
+        if !left.is_constant() || !right.is_constant() {
             return Err(anyhow!("the final folded polynomial is not constant"));
         }
 
@@ -244,9 +244,11 @@ pub struct Prover<F: Field256, H: Hasher<F>> {
 impl<F: Field256, H: Hasher<F>> Prover<F, H> {
     pub fn new(polynomials: Vec<Polynomial<F>>, degree_bound: usize, blowup_log2: usize) -> Self {
         assert!(degree_bound.is_power_of_two());
-        assert!(polynomials
-            .iter()
-            .all(|polynomial| degree_bound >= polynomial.degree_bound()));
+        assert!(
+            polynomials
+                .iter()
+                .all(|polynomial| degree_bound >= polynomial.degree_bound())
+        );
         assert!(blowup_log2 > 0);
 
         let n = degree_bound << blowup_log2;
@@ -317,8 +319,8 @@ impl<F: Field256, H: Hasher<F>> Prover<F, H> {
 
         {
             let (left, right) = folds.last().unwrap();
-            assert!(left.is_constant().unwrap());
-            assert!(right.is_constant().unwrap());
+            assert!(left.is_constant());
+            assert!(right.is_constant());
         }
 
         Query {
