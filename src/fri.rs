@@ -1,6 +1,6 @@
 use crate::hash::Hasher;
 use crate::merkle::{Proof as LeafProof, Tree};
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use primitive_types::H256;
 use sha2::Digest;
 use starkom_ff::Field256;
@@ -152,7 +152,7 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
     /// Note that for low-degree testing `d` is strictly less than the number of committed
     /// evaluations `N`.
     pub fn len(&self) -> usize {
-        self.folds.len() - 1
+        self.folds.len()
     }
 
     /// Verifies this proof against the given commitment.
@@ -244,11 +244,9 @@ pub struct Prover<F: Field256, H: Hasher<F>> {
 impl<F: Field256, H: Hasher<F>> Prover<F, H> {
     pub fn new(polynomials: Vec<Polynomial<F>>, degree_bound: usize, blowup_log2: usize) -> Self {
         assert!(degree_bound.is_power_of_two());
-        assert!(
-            polynomials
-                .iter()
-                .all(|polynomial| degree_bound >= polynomial.degree_bound())
-        );
+        assert!(polynomials
+            .iter()
+            .all(|polynomial| degree_bound >= polynomial.degree_bound()));
         assert!(blowup_log2 > 0);
 
         let n = degree_bound << blowup_log2;
@@ -257,11 +255,7 @@ impl<F: Field256, H: Hasher<F>> Prover<F, H> {
         let main_tree = Tree::<F, F, H>::new(
             polynomials
                 .into_iter()
-                .map(|polynomial| {
-                    polynomial
-                        .shift_domain_by(F::MULTIPLICATIVE_GENERATOR.into())
-                        .lde2(n)
-                })
+                .map(|polynomial| polynomial.shift_domain().lde2(n))
                 .collect(),
         );
         let trees = main_tree.fold_all(degree_bound.trailing_zeros() as usize);
@@ -370,7 +364,7 @@ mod tests {
         for i in 0..n {
             let query = prover.query(i);
             assert_eq!(query.indices(), (i, (i + n / 2) % n));
-            assert_eq!(query.len(), degree_bound.trailing_zeros() as usize);
+            assert_eq!(query.len(), degree_bound.trailing_zeros() as usize + 1);
             assert!(query.verify(&commitment).is_ok());
         }
     }

@@ -7,7 +7,7 @@
 ## Overview
 
 This crate contains Starkom's quantum-resistant polynomial commitment scheme, a DEEP-FRI
-implementation that works with any prime field with sufficient 2-adicity.
+implementation that works with any field with sufficient 2-adicity.
 
 Starkom's zkSTARK suite currently provides three fields and all work correctly with this PCS: the [BLS12-381 scalar field][bls12-381], [BlueSky][bluesky], and [Goldilocks][goldilocks].
 
