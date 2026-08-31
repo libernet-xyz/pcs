@@ -8,22 +8,22 @@ use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::sync::{LazyLock, Mutex};
 
-fn make_dst(s: &'static [u8], modulus: U512) -> U256 {
+fn make_leaf_dst(modulus: U512) -> U256 {
+    static DST_STRING: &'static [u8] = b"starkom/merkle/leaf";
     let mut hasher = sha3::Sha3_512::new();
-    hasher.update(s);
+    hasher.update(DST_STRING);
     let hash: U512 = U512::from_little_endian(hasher.finalize().as_slice());
     let value = hash % modulus;
     U256::from_little_endian(&value.to_little_endian()[0..32])
 }
 
-fn get_dst<F: Field>(s: &'static [u8]) -> F {
-    static DST_CACHE: LazyLock<Mutex<BTreeMap<(TypeId, &'static [u8]), U256>>> =
-        LazyLock::new(|| Mutex::default());
+fn get_leaf_dst<F: Field>() -> F {
+    static DST_CACHE: LazyLock<Mutex<BTreeMap<TypeId, U256>>> = LazyLock::new(|| Mutex::default());
     let value = {
         let mut cache = DST_CACHE.lock().unwrap();
         *cache
-            .entry((TypeId::of::<F>(), s))
-            .or_insert_with(|| make_dst(s, F::MODULUS.parse().unwrap()))
+            .entry(TypeId::of::<F>())
+            .or_insert_with(|| make_leaf_dst(F::MODULUS.parse().unwrap()))
     };
     F::try_from_le_bytes(&value.to_little_endian()[0..(F::LEN)]).unwrap()
 }
@@ -35,7 +35,7 @@ fn get_dst<F: Field>(s: &'static [u8]) -> F {
 /// parameter is a slice of scalar values.
 fn hash_leaf<F: Field, G: Field256 + From<F>, H: Hasher<G>>(values: &[F]) -> H256 {
     H::hash(
-        std::iter::once(get_dst::<F>(b"starkom/merkle/leaf"))
+        std::iter::once(get_leaf_dst::<F>())
             .chain(std::iter::once(F::try_from(values.len()).unwrap()))
             .chain(values.iter().cloned())
             .map(Into::<G>::into),
@@ -290,13 +290,10 @@ mod tests {
     #[test]
     fn test_dsts() {
         assert_eq!(
-            get_dst::<BS>(b"starkom/merkle/leaf"),
+            get_leaf_dst::<BS>(),
             parse("0x08cb2652a56289bd316cfcb356f5d2be485538e04a601fb14fc2c98f03077fcb")
         );
-        assert_eq!(
-            get_dst::<GL>(b"starkom/merkle/leaf"),
-            parse("0x9e8c852f6e39922a")
-        );
+        assert_eq!(get_leaf_dst::<GL>(), parse("0x9e8c852f6e39922a"));
     }
 
     #[test]
