@@ -145,7 +145,7 @@ pub struct Committer<F: Field, G: Field256 + From<F>, H: Hasher<G>> {
     /// The Merkle trees built so far.
     ///
     /// The sum of all `num_polys` of all trees must match the number of `polynomials`.
-    trees: Vec<Tree<F, G, H>>,
+    trees: Vec<Tree<G, G, H>>,
 }
 
 impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> Committer<F, G, H> {
@@ -230,17 +230,28 @@ impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> Committer<F, G, H> {
             .next_power_of_two();
         assert!(degree_bound <= self.degree_bound);
         let n = self.degree_bound << self.blowup_log2;
-        assert!(n.trailing_zeros() as usize <= F::S);
+        assert!(n.trailing_zeros() as usize <= G::S);
 
         let evaluations = polynomials
             .iter()
-            .map(|polynomial| polynomial.clone().shift_domain().lde2(n))
-            .collect::<Vec<Vec<F>>>();
+            .map(|polynomial| {
+                Polynomial::with_coefficients(
+                    polynomial
+                        .coefficients()
+                        .iter()
+                        .copied()
+                        .map(G::from)
+                        .collect(),
+                )
+                .shift_domain()
+                .lde2(n)
+            })
+            .collect::<Vec<Vec<G>>>();
 
         let index = self.trees.len();
 
         self.polynomials.extend(polynomials);
-        self.trees.push(Tree::<F, G, H>::new(evaluations));
+        self.trees.push(Tree::new(evaluations));
 
         index
     }
@@ -254,10 +265,10 @@ impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> Committer<F, G, H> {
     pub fn commit(self, points: BTreeSet<F>) -> (Commitment<F, G, H>, Prover<F, G, H>) {
         {
             let n = self.degree_bound << self.blowup_log2;
-            let g = F::MULTIPLICATIVE_GENERATOR.pow_small(n);
+            let g = G::MULTIPLICATIVE_GENERATOR.pow_small(n);
             for &z in &points {
-                // All opened points must lie outside the evaluation domain.
-                assert_ne!(z.pow_small(n), g);
+                // All opened points must lie outside the evaluation domain, which is a coset of G.
+                assert_ne!(G::from(z).pow_small(n), g);
             }
         }
 
@@ -355,7 +366,7 @@ pub struct Proof<F: Field, G: Field256 + From<F>, H: Hasher<G>> {
     /// the FRI folds). The outer array has one entry for every FRI query
     /// (`openings.len() == queries.len()`), and the inner arrays contain one proof for every Merkle
     /// tree.
-    openings: Vec<Vec<LeafProof<F, G, H>>>,
+    openings: Vec<Vec<LeafProof<G, G, H>>>,
     /// FRI queries on the DEEP quotients. The number of queries is calculated by [`num_queries`]
     /// above and is tuned so as to achieve 128-bit security.
     queries: Vec<fri::Query<G, H>>,
@@ -453,8 +464,7 @@ impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> Proof<F, G, H> {
             let combined = rlc(
                 openings
                     .iter()
-                    .flat_map(|proof| proof.leaf().iter().copied())
-                    .map(G::from),
+                    .flat_map(|proof| proof.leaf().iter().copied()),
                 alpha,
             );
 
@@ -492,7 +502,7 @@ pub struct Prover<F: Field, G: Field256 + From<F>, H: Hasher<G>> {
     /// The base-2 logarithm of the blowup factor.
     blowup_log2: usize,
     /// Raw Merkle trees for the committed polynomials, one for each batch.
-    trees: Vec<Tree<F, G, H>>,
+    trees: Vec<Tree<G, G, H>>,
     /// The opened points.
     ///
     /// The keys of the map are the (off-domain) X-coordinates of the points, while values are lists
