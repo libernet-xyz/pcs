@@ -700,5 +700,121 @@ mod tests {
         test_prover(vec![vec![vec![12]]], &[321], 1);
     }
 
-    // TODO
+    #[test]
+    fn test_one_constant_polynomial_one_point_3() {
+        test_prover(vec![vec![vec![34]]], &[123], 1);
+    }
+
+    #[test]
+    fn test_one_constant_polynomial_two_points() {
+        test_prover(vec![vec![vec![12]]], &[123, 456], 1);
+    }
+
+    #[test]
+    fn test_one_constant_polynomial_three_points() {
+        test_prover(vec![vec![vec![12]]], &[789, 456, 123], 1);
+    }
+
+    #[test]
+    fn test_one_polynomial_degree_one_one_point_1() {
+        test_prover(vec![vec![vec![12, 34]]], &[123], 2);
+    }
+
+    #[test]
+    fn test_one_polynomial_degree_one_one_point_2() {
+        test_prover(vec![vec![vec![12, 34]]], &[321], 2);
+    }
+
+    #[test]
+    fn test_one_polynomial_degree_one_one_point_3() {
+        test_prover(vec![vec![vec![34, 56]]], &[123], 2);
+    }
+
+    #[test]
+    fn test_one_polynomial_degree_one_two_points() {
+        test_prover(vec![vec![vec![12, 34]]], &[123, 456], 2);
+    }
+
+    #[test]
+    fn test_one_polynomial_degree_one_three_points() {
+        test_prover(vec![vec![vec![12, 34]]], &[789, 456, 123], 2);
+    }
+
+    #[test]
+    fn test_two_polynomials_degree_three_one_point_1() {
+        test_prover(
+            vec![vec![vec![12, 34, 56, 78], vec![42, 43, 44, 45]]],
+            &[123],
+            4,
+        );
+    }
+
+    #[test]
+    fn test_two_polynomials_degree_three_one_point_2() {
+        test_prover(
+            vec![vec![vec![12, 34, 56, 78], vec![42, 43, 44, 45]]],
+            &[321],
+            4,
+        );
+    }
+
+    #[test]
+    fn test_two_polynomials_degree_three_one_point_3() {
+        test_prover(
+            vec![vec![vec![45, 44, 43, 42], vec![78, 56, 34, 12]]],
+            &[123],
+            4,
+        );
+    }
+
+    #[test]
+    fn test_two_polynomials_degree_three_two_points() {
+        test_prover(
+            vec![vec![vec![12, 34, 56, 78], vec![42, 43, 44, 45]]],
+            &[123, 456],
+            4,
+        );
+    }
+
+    #[test]
+    fn test_two_polynomials_degree_three_three_points() {
+        test_prover(
+            vec![vec![vec![12, 34, 56, 78], vec![42, 43, 44, 45]]],
+            &[789, 456, 123],
+            4,
+        );
+    }
+
+    #[test]
+    fn test_two_batches_one_and_one() {
+        test_prover(
+            vec![vec![vec![12, 34, 56, 78]], vec![vec![42, 43, 44, 45]]],
+            &[123, 456],
+            4,
+        );
+    }
+
+    #[test]
+    fn test_two_batches_two_and_one() {
+        test_prover(
+            vec![
+                vec![vec![12, 34, 56, 78], vec![90, 78, 56, 34]],
+                vec![vec![42, 43, 44, 45]],
+            ],
+            &[456, 789],
+            4,
+        );
+    }
+
+    #[test]
+    fn test_two_batches_one_and_two() {
+        test_prover(
+            vec![
+                vec![vec![90, 78, 56, 34]],
+                vec![vec![12, 34, 56, 78], vec![42, 43, 44, 45]],
+            ],
+            &[456, 789],
+            4,
+        );
+    }
 }
