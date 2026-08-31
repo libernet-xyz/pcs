@@ -35,7 +35,19 @@ pub trait Hasher<F: Field256>: MerkleHasher {
     /// converts the hash to a field element. To avoid distribution bias, the transcript is hashed
     /// twice with slightly different DSTs, and the resulting 512 bits are converted to a 256-bit
     /// field element via modular reduction.
-    fn challenge(dst: H256, transcript: &[H256]) -> F;
+    fn challenge(dst: H256, transcript: &[H256]) -> F {
+        let dst_hi = U256::from_big_endian(dst.as_bytes());
+        let dst_lo = dst_hi + U256::one();
+        let hi = Self::hash_transcript(H256::from_slice(&dst_hi.to_big_endian()), transcript);
+        let lo = Self::hash_transcript(H256::from_slice(&dst_lo.to_big_endian()), transcript);
+        let mut bytes = [0u8; 64];
+        bytes[0..32].copy_from_slice(hi.as_bytes());
+        bytes[32..].copy_from_slice(lo.as_bytes());
+        let hash = U512::from_big_endian(&bytes);
+        let modulus: U512 = F::MODULUS.parse().unwrap();
+        let challenge = hash % modulus;
+        F::try_from_be_bytes(&challenge.to_big_endian()[32..]).unwrap()
+    }
 }
 
 mod internal {
@@ -114,20 +126,6 @@ mod internal {
                 hasher.update(element.as_bytes());
             }
             hasher.finalize()
-        }
-
-        fn challenge(dst: H256, transcript: &[H256]) -> F {
-            let dst_hi = U256::from_big_endian(dst.as_bytes());
-            let dst_lo = dst_hi + U256::one();
-            let hi = Self::hash_transcript(H256::from_slice(&dst_hi.to_big_endian()), transcript);
-            let lo = Self::hash_transcript(H256::from_slice(&dst_lo.to_big_endian()), transcript);
-            let mut bytes = [0u8; 64];
-            bytes[0..32].copy_from_slice(hi.as_bytes());
-            bytes[32..].copy_from_slice(lo.as_bytes());
-            let hash = U512::from_big_endian(&bytes);
-            let modulus: U512 = F::MODULUS.parse().unwrap();
-            let challenge = hash % modulus;
-            F::try_from_be_bytes(&challenge.to_big_endian()[32..]).unwrap()
         }
     }
 }
