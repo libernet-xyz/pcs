@@ -69,9 +69,10 @@ impl<F: Field256, H: Hasher<F>> FoldableTree<F, H> for Tree<F, F, H> {
 
 /// Stores the Merkle root hashes of a FRI commitment.
 ///
-/// Note that for low-degree testing these are *less* than log2(N), with N being the number of
-/// committed evaluations. Once the folding process has reduced all polynomials to degree-0 ones
-/// (that is, single constants) all subsequent folds would be identical, so we don't store them.
+/// Note that for low-degree testing these are strictly less than `log2(N)+1`, with N being the
+/// number of committed evaluations. Once the folding process has reduced all polynomials to
+/// degree-0 ones (that is, single constants) all subsequent folds would be identical, so we don't
+/// store them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Commitment {
     /// The first element in the array is the root of the main Merkle tree, the second one is the
@@ -81,9 +82,12 @@ pub struct Commitment {
 }
 
 impl Commitment {
-    /// Returns the number of stored roots, equivalent to the number of folding rounds and therefore
-    /// to the log2 of the degree bound plus one. For example, if the user commits 4 evaluations
-    /// `len()` will return 3.
+    /// Returns the number of stored roots, equivalent to the number of Merkle trees known to the
+    /// prover. These would in turn include the base Merkle tree of the committed evaluations (over
+    /// the extended domain) and one subsequent tree for every folding round. The number of folding
+    /// rounds equals the log2 of the degree bound of the original polynomial. For example, if the
+    /// user commits a degree<8 polynomial encoding 8 values, `len()` will return
+    /// log2(8)+1 = 3+1 = 4 regardless of the blowup factor.
     pub fn len(&self) -> usize {
         self.roots.len()
     }

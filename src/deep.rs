@@ -78,6 +78,12 @@ impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> Commitment<F, G, H> {
         self.tree_roots.as_slice()
     }
 
+    /// The degree bound this commitment attests to, implied by the number of FRI folding rounds.
+    /// Always equals [`Proof::degree_bound`].
+    pub fn degree_bound(&self) -> usize {
+        1usize << (self.inner.len() - 1)
+    }
+
     /// Hashes the first `batch_count` [tree roots](`Self::tree_roots`).
     ///
     /// The returned hash is cryptographically bound to the full transcript up to the given
@@ -627,6 +633,7 @@ mod tests {
             }))
             .collect();
         let (commitment, prover) = committer.commit(points.iter().map(|(&z, _)| z).collect());
+        assert_eq!(commitment.degree_bound(), degree_bound);
         assert_eq!(
             (0..num_batches)
                 .map(|i| commitment.transcript_hash(i + 1))
