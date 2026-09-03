@@ -48,6 +48,25 @@ fn encode_usize(value: usize) -> H256 {
     H256::from_slice(&bytes)
 }
 
+/// Checks that none of the given points lies inside the evaluation domain of size `n`.
+///
+/// Used on both sides: the prover must not be asked to open such a point, and a verifier must
+/// reject a proof that claims one.
+fn check_points_off_domain<F: Field256>(
+    points: impl IntoIterator<Item = F>,
+    n: usize,
+) -> Result<()> {
+    let marker = F::MULTIPLICATIVE_GENERATOR.pow_small(n);
+    for z in points {
+        if z.pow_small(n) == marker {
+            return Err(anyhow!(
+                "the opened point {z} is inside the evaluation domain"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Computes a random linear combination of a list of values.
 ///
 /// `alpha` is a Fiat-Shamir challenge of some sort.
@@ -257,14 +276,7 @@ impl<F: Field256, H: Hasher<F>> Committer<F, H> {
     /// (off-domain) X-coordinates; the corresponding Y-coordinates will be computed automatically
     /// for every batched polynomial.
     pub fn commit(self, points: BTreeSet<F>) -> (Commitment<F, H>, Prover<F, H>) {
-        {
-            let n = self.degree_bound << self.blowup_log2;
-            let g = F::MULTIPLICATIVE_GENERATOR.pow_small(n);
-            for &z in &points {
-                // All opened points must lie outside the evaluation domain, which is a coset of G.
-                assert_ne!(z.pow_small(n), g);
-            }
-        }
+        check_points_off_domain(points.iter().copied(), self.extended_domain_size()).unwrap();
 
         let alpha = H::challenge(
             *RLC_DST,
@@ -389,6 +401,8 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
 
     /// Verifies this proof against the given commitment.
     pub fn verify(&self, commitment: &Commitment<F, H>) -> Result<()> {
+        check_points_off_domain(self.points.keys().copied(), self.extended_domain_size())?;
+
         let indices = commitment.get_query_indices(self.degree_bound, self.blowup_log2);
         if self.openings.len() != indices.len() {
             return Err(anyhow!(
@@ -562,7 +576,7 @@ mod tests {
     use super::*;
     use crate::hash::Sha2Hash;
     use starkom_bluesky::Scalar as BS;
-    use starkom_goldilocks::{GL, GL4};
+    use starkom_goldilocks::GL4;
 
     #[test]
     fn test_dsts() {
