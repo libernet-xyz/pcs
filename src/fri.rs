@@ -16,7 +16,7 @@ static FOLD_DST: LazyLock<H256> = LazyLock::new(|| {
 
 trait FoldableTree<F: Field256, H: Hasher<F>>: Sized {
     /// Performs one FRI folding round, returning the new folded tree.
-    fn fold(&self) -> Tree<F, F, H>;
+    fn fold(&self) -> Tree<F, H>;
 
     /// Performs `times` FRI folding rounds and returns an array of `times` trees.
     ///
@@ -24,11 +24,11 @@ trait FoldableTree<F: Field256, H: Hasher<F>>: Sized {
     /// number of leaves in `self`), the second element is the tree from the second folding round
     /// (N/4 leaves), and so on. If `times` is 0 no folding is performed and an empty array is
     /// returned.
-    fn fold_all(self, times: usize) -> Vec<Tree<F, F, H>>;
+    fn fold_all(self, times: usize) -> Vec<Tree<F, H>>;
 }
 
-impl<F: Field256, H: Hasher<F>> FoldableTree<F, H> for Tree<F, F, H> {
-    fn fold(&self) -> Tree<F, F, H> {
+impl<F: Field256, H: Hasher<F>> FoldableTree<F, H> for Tree<F, H> {
+    fn fold(&self) -> Tree<F, H> {
         let num_polys = self.num_polys();
         let n = self.num_leaves();
         assert!(n.is_power_of_two());
@@ -54,7 +54,7 @@ impl<F: Field256, H: Hasher<F>> FoldableTree<F, H> for Tree<F, F, H> {
         Self::new(leaves)
     }
 
-    fn fold_all(self, times: usize) -> Vec<Tree<F, F, H>> {
+    fn fold_all(self, times: usize) -> Vec<Tree<F, H>> {
         let mut trees = Vec::with_capacity(times + 1);
         let mut tree = self;
         for _ in 0..times {
@@ -117,7 +117,7 @@ pub struct Query<F: Field256, H: Hasher<F>> {
     index: usize,
     /// Proves a pair of "partner" values at each folding round with one [`LeafProof`] pair for
     /// every round. The pair at `folds[0]` proves the opened values.
-    folds: Vec<(LeafProof<F, F, H>, LeafProof<F, F, H>)>,
+    folds: Vec<(LeafProof<F, H>, LeafProof<F, H>)>,
 }
 
 impl<F: Field256, H: Hasher<F>> Query<F, H> {
@@ -242,7 +242,7 @@ pub struct Prover<F: Field256, H: Hasher<F>> {
     /// The base-2 logarithm of the blowup factor.
     blowup_log2: usize,
     /// The folded Merkle trees, one for every folding round.
-    trees: Vec<Tree<F, F, H>>,
+    trees: Vec<Tree<F, H>>,
 }
 
 impl<F: Field256, H: Hasher<F>> Prover<F, H> {
@@ -258,7 +258,7 @@ impl<F: Field256, H: Hasher<F>> Prover<F, H> {
         let n = degree_bound << blowup_log2;
         assert!(n as u64 <= 1u64 << F::S);
 
-        let main_tree = Tree::<F, F, H>::new(
+        let main_tree = Tree::<F, H>::new(
             polynomials
                 .into_iter()
                 .map(|polynomial| polynomial.shift_domain().lde2(n))
@@ -358,11 +358,7 @@ mod tests {
         degree_bound: usize,
         blowup_log2: usize,
     ) {
-        let prover = Prover::<F, H>::new(
-            polynomials.iter().cloned().collect(),
-            degree_bound,
-            blowup_log2,
-        );
+        let prover = Prover::<F, H>::new(polynomials.to_vec(), degree_bound, blowup_log2);
         assert_eq!(prover.degree_bound(), degree_bound);
         let n = degree_bound << blowup_log2;
         assert_eq!(prover.extended_domain_size(), n);

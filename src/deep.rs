@@ -141,8 +141,7 @@ impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> Commitment<F, G, H> {
 /// that Fiat-Shamir challenges can be derived before any quotients are built.
 #[derive(Debug, Clone)]
 pub struct Committer<F: Field, G: Field256 + From<F>, H: Hasher<G>> {
-    /// The proven degree bound. The degree of all batched polynomials must be strictly less than
-    /// this value.
+    /// The proven degree bound. The degree of all batched polynomials must be less than this value.
     degree_bound: usize,
     /// The base-2 logarithm of the blowup factor.
     blowup_log2: usize,
@@ -151,7 +150,7 @@ pub struct Committer<F: Field, G: Field256 + From<F>, H: Hasher<G>> {
     /// The Merkle trees built so far.
     ///
     /// The sum of all `num_polys` of all trees must match the number of `polynomials`.
-    trees: Vec<Tree<G, G, H>>,
+    trees: Vec<Tree<G, H>>,
 }
 
 impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> Committer<F, G, H> {
@@ -372,7 +371,7 @@ pub struct Proof<F: Field, G: Field256 + From<F>, H: Hasher<G>> {
     /// the FRI folds). The outer array has one entry for every FRI query
     /// (`openings.len() == queries.len()`), and the inner arrays contain one proof for every Merkle
     /// tree.
-    openings: Vec<Vec<LeafProof<G, G, H>>>,
+    openings: Vec<Vec<LeafProof<G, H>>>,
     /// FRI queries on the DEEP quotients. The number of queries is calculated by [`num_queries`]
     /// above and is tuned so as to achieve 128-bit security.
     queries: Vec<fri::Query<G, H>>,
@@ -508,7 +507,7 @@ pub struct Prover<F: Field, G: Field256 + From<F>, H: Hasher<G>> {
     /// The base-2 logarithm of the blowup factor.
     blowup_log2: usize,
     /// Raw Merkle trees for the committed polynomials, one for each batch.
-    trees: Vec<Tree<G, G, H>>,
+    trees: Vec<Tree<G, H>>,
     /// The opened points.
     ///
     /// The keys of the map are the (off-domain) X-coordinates of the points, while values are lists
