@@ -135,7 +135,8 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
     /// Note that we use [`Polynomial::shift_domain`] before committing polynomials, so the element
     /// returned here is a shifted power of an N-th root of unity, with
     /// `N = degree_bound * 2^blowup_factor`. The shift consists of multiplying the actual domain
-    /// element by [`PrimeField::MULTIPLICATIVE_GENERATOR`], consistently with `shift_domain`.
+    /// element by [`starkom_ff::Field::MULTIPLICATIVE_GENERATOR`], consistently with
+    /// `shift_domain`.
     pub fn x(&self) -> F {
         Polynomial::<F>::coset_element2(self.index, self.degree_bound << self.blowup_log2)
     }

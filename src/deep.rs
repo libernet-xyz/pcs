@@ -63,16 +63,16 @@ fn rlc<F: Field>(values: impl IntoIterator<Item = F>, alpha: F) -> F {
 
 /// A batched DEEP-FRI polynomial commitment (see [`Committer`] for details).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Commitment<F: Field, G: Field256 + From<F>, H: Hasher<G>> {
+pub struct Commitment<F: Field256, H: Hasher<F>> {
     /// The root hashes of the Merkle trees where the evaluations of all batched polynomials are
     /// stored. There is one root hash per polynomial batch.
     tree_roots: Vec<H256>,
     /// The underlying FRI commitment.
     inner: fri::Commitment,
-    _data: PhantomData<(F, G, H)>,
+    _data: PhantomData<(F, H)>,
 }
 
-impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> Commitment<F, G, H> {
+impl<F: Field256, H: Hasher<F>> Commitment<F, H> {
     /// Returns the root hashes of the Merkle trees where all batched polynomials are stored.
     pub fn tree_roots(&self) -> &[H256] {
         self.tree_roots.as_slice()
@@ -140,7 +140,7 @@ impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> Commitment<F, G, H> {
 /// polynomials before running the FRI folding argument and even before batching all polynomials, so
 /// that Fiat-Shamir challenges can be derived before any quotients are built.
 #[derive(Debug, Clone)]
-pub struct Committer<F: Field, G: Field256 + From<F>, H: Hasher<G>> {
+pub struct Committer<F: Field256, H: Hasher<F>> {
     /// The proven degree bound. The degree of all batched polynomials must be less than this value.
     degree_bound: usize,
     /// The base-2 logarithm of the blowup factor.
@@ -150,17 +150,17 @@ pub struct Committer<F: Field, G: Field256 + From<F>, H: Hasher<G>> {
     /// The Merkle trees built so far.
     ///
     /// The sum of all `num_polys` of all trees must match the number of `polynomials`.
-    trees: Vec<Tree<G, H>>,
+    trees: Vec<Tree<F, H>>,
 }
 
-impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> Committer<F, G, H> {
+impl<F: Field256, H: Hasher<F>> Committer<F, H> {
     /// Constructs a [`Committer`] with the given degree bound, blowup factor, and first batch of
     /// polynomials.
     ///
     /// We require specifying the first batch because our DEEP-FRI protocol requires at least one
     /// committed polynomial to work.
     ///
-    /// `degree_bound` must be a power of 2 less than or equal to 2^[F::S](`PrimeField::S`), and
+    /// `degree_bound` must be a power of 2 less than or equal to 2^[F::S](`Field::S`), and
     /// `blowup_log2` must not be zero.
     pub fn new(degree_bound: usize, blowup_log2: usize, polynomials: Vec<Polynomial<F>>) -> Self {
         assert!(degree_bound.is_power_of_two());
@@ -235,23 +235,12 @@ impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> Committer<F, G, H> {
             .next_power_of_two();
         assert!(degree_bound <= self.degree_bound);
         let n = self.degree_bound << self.blowup_log2;
-        assert!(n.trailing_zeros() as usize <= G::S);
+        assert!(n.trailing_zeros() as usize <= F::S);
 
         let evaluations = polynomials
             .iter()
-            .map(|polynomial| {
-                Polynomial::with_coefficients(
-                    polynomial
-                        .coefficients()
-                        .iter()
-                        .copied()
-                        .map(G::from)
-                        .collect(),
-                )
-                .shift_domain()
-                .lde2(n)
-            })
-            .collect::<Vec<Vec<G>>>();
+            .map(|polynomial| polynomial.clone().shift_domain().lde2(n))
+            .collect::<Vec<Vec<F>>>();
 
         let index = self.trees.len();
 
@@ -267,13 +256,13 @@ impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> Committer<F, G, H> {
     /// `points` is the set of points to open in the [`Prover`]. The contained scalars are
     /// (off-domain) X-coordinates; the corresponding Y-coordinates will be computed automatically
     /// for every batched polynomial.
-    pub fn commit(self, points: BTreeSet<F>) -> (Commitment<F, G, H>, Prover<F, G, H>) {
+    pub fn commit(self, points: BTreeSet<F>) -> (Commitment<F, H>, Prover<F, H>) {
         {
             let n = self.degree_bound << self.blowup_log2;
-            let g = G::MULTIPLICATIVE_GENERATOR.pow_small(n);
+            let g = F::MULTIPLICATIVE_GENERATOR.pow_small(n);
             for &z in &points {
                 // All opened points must lie outside the evaluation domain, which is a coset of G.
-                assert_ne!(G::from(z).pow_small(n), g);
+                assert_ne!(z.pow_small(n), g);
             }
         }
 
@@ -290,7 +279,7 @@ impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> Committer<F, G, H> {
                                 .iter()
                                 .map(|polynomial| polynomial.evaluate(z)),
                         )
-                        .map(|value| H256::from_slice(&G::from(value).to_be_bytes()))
+                        .map(|value| H256::from_slice(&value.to_be_bytes()))
                         .collect::<Vec<H256>>()
                 }))
                 .collect::<Vec<H256>>()
@@ -312,15 +301,9 @@ impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> Committer<F, G, H> {
 
         let combined = {
             let mut combined = Polynomial::default();
-            let mut pow = G::ONE;
+            let mut pow = F::ONE;
             for polynomial in &self.polynomials {
-                let coefficients: Vec<G> = polynomial
-                    .coefficients()
-                    .iter()
-                    .copied()
-                    .map(G::from)
-                    .collect();
-                combined += Polynomial::with_coefficients(coefficients) * pow;
+                combined += polynomial.clone() * pow;
                 pow *= alpha;
             }
             combined
@@ -329,14 +312,14 @@ impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> Committer<F, G, H> {
         let quotients = points
             .iter()
             .map(|(&z, values)| {
-                let value = rlc(values.iter().copied().map(G::from), alpha);
+                let value = rlc(values.iter().copied(), alpha);
                 let (quotient, remainder) = (combined.clone() - value).horner(z.into());
-                assert_eq!(remainder, G::ZERO);
+                assert_eq!(remainder, F::ZERO);
                 quotient
             })
             .collect();
 
-        let inner_prover = fri::Prover::<G, H>::new(quotients, self.degree_bound, self.blowup_log2);
+        let inner_prover = fri::Prover::<F, H>::new(quotients, self.degree_bound, self.blowup_log2);
 
         let commitment = Commitment {
             tree_roots: self.trees.iter().map(Tree::root_hash).collect(),
@@ -356,7 +339,7 @@ impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> Committer<F, G, H> {
 
 /// A DEEP-FRI proof.
 #[derive(Debug, Clone)]
-pub struct Proof<F: Field, G: Field256 + From<F>, H: Hasher<G>> {
+pub struct Proof<F: Field256, H: Hasher<F>> {
     /// The proven degree bound. If the proof is valid the degree of all batched polynomials is
     /// guaranteed to be strictly less than this value.
     degree_bound: usize,
@@ -371,13 +354,13 @@ pub struct Proof<F: Field, G: Field256 + From<F>, H: Hasher<G>> {
     /// the FRI folds). The outer array has one entry for every FRI query
     /// (`openings.len() == queries.len()`), and the inner arrays contain one proof for every Merkle
     /// tree.
-    openings: Vec<Vec<LeafProof<G, H>>>,
+    openings: Vec<Vec<LeafProof<F, H>>>,
     /// FRI queries on the DEEP quotients. The number of queries is calculated by [`num_queries`]
     /// above and is tuned so as to achieve 128-bit security.
-    queries: Vec<fri::Query<G, H>>,
+    queries: Vec<fri::Query<F, H>>,
 }
 
-impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> Proof<F, G, H> {
+impl<F: Field256, H: Hasher<F>> Proof<F, H> {
     /// Returns the proven degree bound.
     pub fn degree_bound(&self) -> usize {
         self.degree_bound
@@ -405,7 +388,7 @@ impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> Proof<F, G, H> {
     }
 
     /// Verifies this proof against the given commitment.
-    pub fn verify(&self, commitment: &Commitment<F, G, H>) -> Result<()> {
+    pub fn verify(&self, commitment: &Commitment<F, H>) -> Result<()> {
         let indices = commitment.get_query_indices(self.degree_bound, self.blowup_log2);
         if self.openings.len() != indices.len() {
             return Err(anyhow!(
@@ -431,7 +414,7 @@ impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> Proof<F, G, H> {
                 .chain(self.points.iter().flat_map(|(z, values)| {
                     std::iter::once(z)
                         .chain(values.iter())
-                        .map(|&value| H256::from_slice(&G::from(value).to_be_bytes()))
+                        .map(|&value| H256::from_slice(&value.to_be_bytes()))
                 }))
                 .collect::<Vec<H256>>()
                 .as_slice(),
@@ -484,10 +467,8 @@ impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> Proof<F, G, H> {
 
             let x = query.x();
             for ((&z, values), &quotient) in self.points.iter().zip(quotients.iter()) {
-                let v = rlc(values.iter().copied().map(G::from), alpha);
-                let numerator = combined - v;
-                let denominator = x - G::from(z);
-                if quotient * denominator != numerator {
+                let v = rlc(values.iter().copied(), alpha);
+                if quotient * (x - z) != combined - v {
                     return Err(anyhow!("algebraic check failed at query index {index}"));
                 }
             }
@@ -501,13 +482,13 @@ impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> Proof<F, G, H> {
 ///
 /// [`Prover`]s are constructed by [`Committer::commit()`]; see that method for details.
 #[derive(Debug, Clone)]
-pub struct Prover<F: Field, G: Field256 + From<F>, H: Hasher<G>> {
+pub struct Prover<F: Field256, H: Hasher<F>> {
     /// The degree bound to prove.
     degree_bound: usize,
     /// The base-2 logarithm of the blowup factor.
     blowup_log2: usize,
     /// Raw Merkle trees for the committed polynomials, one for each batch.
-    trees: Vec<Tree<G, H>>,
+    trees: Vec<Tree<F, H>>,
     /// The opened points.
     ///
     /// The keys of the map are the (off-domain) X-coordinates of the points, while values are lists
@@ -515,10 +496,10 @@ pub struct Prover<F: Field, G: Field256 + From<F>, H: Hasher<G>> {
     points: BTreeMap<F, Vec<F>>,
     /// The underlying FRI prover for the DEEP quotients. There's one quotient for every opened
     /// point, and all quotients are batched into the same FRI folding argument.
-    inner_prover: fri::Prover<G, H>,
+    inner_prover: fri::Prover<F, H>,
 }
 
-impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> Prover<F, G, H> {
+impl<F: Field256, H: Hasher<F>> Prover<F, H> {
     /// Returns the proven degree bound.
     pub fn degree_bound(&self) -> usize {
         self.degree_bound
@@ -555,7 +536,7 @@ impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> Prover<F, G, H> {
 
     /// Makes a DEEP-FRI proof opening the committed polynomials at the points specified at
     /// commitment time (see [`Committer::commit()`]).
-    pub fn prove(&self, commitment: &Commitment<F, G, H>) -> Proof<F, G, H> {
+    pub fn prove(&self, commitment: &Commitment<F, H>) -> Proof<F, H> {
         let indices = commitment.get_query_indices(self.degree_bound, self.blowup_log2);
         let openings = indices
             .iter()
@@ -605,7 +586,7 @@ mod tests {
         );
     }
 
-    fn test_prover_impl<F: Field, G: Field256 + From<F>, H: Hasher<G>>(
+    fn test_prover_impl<F: Field256, H: Hasher<F>>(
         mut polynomial_batches: Vec<Vec<Polynomial<F>>>,
         points: &[u16],
         degree_bound: usize,
@@ -624,7 +605,7 @@ mod tests {
             )
         }));
         let first_batch = polynomial_batches.remove(0);
-        let mut committer = Committer::<F, G, H>::new(degree_bound, blowup_log2, first_batch);
+        let mut committer = Committer::<F, H>::new(degree_bound, blowup_log2, first_batch);
         let transcript_hashes: Vec<H256> = std::iter::once(committer.transcript_hash())
             .chain(polynomial_batches.into_iter().map(|batch| {
                 committer.add_batch(batch);
@@ -667,50 +648,50 @@ mod tests {
                     .collect()
             })
             .collect();
-        let goldilocks_polynomial_batches: Vec<Vec<Polynomial<GL>>> = polynomial_batches
+        let goldilocks_polynomial_batches: Vec<Vec<Polynomial<GL4>>> = polynomial_batches
             .iter()
             .map(|batch| {
                 batch
                     .iter()
                     .map(|coefficients| {
                         Polynomial::with_coefficients(
-                            coefficients.iter().copied().map(GL::from).collect(),
+                            coefficients.iter().copied().map(GL4::from).collect(),
                         )
                     })
                     .collect()
             })
             .collect();
-        test_prover_impl::<BS, BS, Sha2Hash<BS>>(
+        test_prover_impl::<BS, Sha2Hash<BS>>(
             bluesky_polynomial_batches.clone(),
             points,
             degree_bound,
             1,
         );
-        test_prover_impl::<GL, GL4, Sha2Hash<GL4>>(
+        test_prover_impl::<GL4, Sha2Hash<GL4>>(
             goldilocks_polynomial_batches.clone(),
             points,
             degree_bound,
             1,
         );
-        test_prover_impl::<BS, BS, Sha2Hash<BS>>(
+        test_prover_impl::<BS, Sha2Hash<BS>>(
             bluesky_polynomial_batches.clone(),
             points,
             degree_bound,
             2,
         );
-        test_prover_impl::<GL, GL4, Sha2Hash<GL4>>(
+        test_prover_impl::<GL4, Sha2Hash<GL4>>(
             goldilocks_polynomial_batches.clone(),
             points,
             degree_bound,
             2,
         );
-        test_prover_impl::<BS, BS, Sha2Hash<BS>>(
+        test_prover_impl::<BS, Sha2Hash<BS>>(
             bluesky_polynomial_batches.clone(),
             points,
             degree_bound,
             3,
         );
-        test_prover_impl::<GL, GL4, Sha2Hash<GL4>>(
+        test_prover_impl::<GL4, Sha2Hash<GL4>>(
             goldilocks_polynomial_batches.clone(),
             points,
             degree_bound,
