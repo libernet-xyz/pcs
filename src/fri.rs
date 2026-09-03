@@ -489,4 +489,139 @@ mod tests {
             8,
         );
     }
+
+    const DEGREE_BOUND: usize = 8;
+    const BLOWUP_LOG2: usize = 2;
+    const QUERY_INDEX: usize = 3;
+
+    fn make_prover(coefficients: [u64; 8]) -> Prover<BS, Sha2Hash<BS>> {
+        Prover::new(
+            vec![Polynomial::with_coefficients(
+                coefficients.into_iter().map(BS::from_const).collect(),
+            )],
+            DEGREE_BOUND,
+            BLOWUP_LOG2,
+        )
+    }
+
+    fn honest_prover() -> Prover<BS, Sha2Hash<BS>> {
+        make_prover([12, 34, 56, 78, 90, 12, 34, 56])
+    }
+
+    fn assert_rejected(result: Result<()>, expected: &str) {
+        let error = result
+            .expect_err("the tampered proof was accepted")
+            .to_string();
+        assert!(error.contains(expected), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn test_accept_untampered_proof() {
+        let prover = honest_prover();
+        assert!(prover.query(QUERY_INDEX).verify(&prover.commit()).is_ok());
+    }
+
+    #[test]
+    fn test_reject_foreign_commitment() {
+        let query = honest_prover().query(QUERY_INDEX);
+        let foreign = make_prover([90, 78, 56, 34, 12, 90, 78, 56]).commit();
+        assert_rejected(query.verify(&foreign), "root hash mismatch");
+    }
+
+    #[test]
+    fn test_reject_corrupted_root() {
+        let prover = honest_prover();
+        let mut commitment = prover.commit();
+        commitment.roots[2] = H256::repeat_byte(0xAA);
+        assert_rejected(
+            prover.query(QUERY_INDEX).verify(&commitment),
+            "root hash mismatch",
+        );
+    }
+
+    #[test]
+    fn test_reject_truncated_folds() {
+        let prover = honest_prover();
+        let commitment = prover.commit();
+        let mut query = prover.query(QUERY_INDEX);
+        query.folds.truncate(3);
+        assert_rejected(query.verify(&commitment), "wrong number of folding rounds");
+    }
+
+    #[test]
+    fn test_reject_truncated_commitment() {
+        let prover = honest_prover();
+        let mut commitment = prover.commit();
+        commitment.roots.truncate(3);
+        assert_rejected(
+            prover.query(QUERY_INDEX).verify(&commitment),
+            "wrong number of folding rounds",
+        );
+    }
+
+    #[test]
+    fn test_reject_extra_folds() {
+        let prover = honest_prover();
+        let commitment = prover.commit();
+        let mut query = prover.query(QUERY_INDEX);
+        let mut donor = prover.query(QUERY_INDEX);
+        query.folds.push(donor.folds.pop().unwrap());
+        assert_rejected(query.verify(&commitment), "incorrect proof size");
+    }
+
+    #[test]
+    fn test_reject_folding_stopped_early() {
+        let prover = honest_prover();
+        let mut commitment = prover.commit();
+        let mut query = prover.query(QUERY_INDEX);
+        commitment.roots.truncate(3);
+        query.folds.truncate(3);
+        assert_rejected(query.verify(&commitment), "not constant");
+    }
+
+    #[test]
+    fn test_reject_wrong_left_proof_height() {
+        let prover = honest_prover();
+        let commitment = prover.commit();
+        let mut query = prover.query(QUERY_INDEX);
+        let mut donor = prover.query(QUERY_INDEX);
+        query.folds[0].0 = donor.folds.remove(1).0;
+        assert_rejected(
+            query.verify(&commitment),
+            "invalid left-hand side Merkle proof height",
+        );
+    }
+
+    #[test]
+    fn test_reject_wrong_right_proof_height() {
+        let prover = honest_prover();
+        let commitment = prover.commit();
+        let mut query = prover.query(QUERY_INDEX);
+        let mut donor = prover.query(QUERY_INDEX);
+        query.folds[0].1 = donor.folds.remove(1).1;
+        assert_rejected(
+            query.verify(&commitment),
+            "invalid right-hand side Merkle proof height",
+        );
+    }
+
+    #[test]
+    fn test_reject_swapped_partners() {
+        let prover = honest_prover();
+        let commitment = prover.commit();
+        let mut query = prover.query(QUERY_INDEX);
+        let pair = &mut query.folds[0];
+        std::mem::swap(&mut pair.0, &mut pair.1);
+        assert_rejected(query.verify(&commitment), "root hash mismatch");
+    }
+
+    #[test]
+    fn test_reject_foreign_leaf_proof() {
+        let prover = honest_prover();
+        let commitment = prover.commit();
+        let mut query = prover.query(QUERY_INDEX);
+        let mut other = prover.query(QUERY_INDEX + 4);
+        query.folds[1].0 = other.folds.remove(1).0;
+        assert_rejected(query.verify(&commitment), "leaf value mismatch");
+    }
 }
