@@ -92,6 +92,48 @@ mod internal {
         _data: PhantomData<(H, F)>,
     }
 
+    impl<H: LowLevelHash, F: Field256> Debug for HasherImpl<H, F> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("HasherImpl").finish()
+        }
+    }
+
+    impl<H: LowLevelHash, F: Field256> Default for HasherImpl<H, F> {
+        fn default() -> Self {
+            Self {
+                _data: PhantomData::default(),
+            }
+        }
+    }
+
+    impl<H: LowLevelHash, F: Field256> Copy for HasherImpl<H, F> {}
+
+    impl<H: LowLevelHash, F: Field256> Clone for HasherImpl<H, F> {
+        fn clone(&self) -> Self {
+            *self
+        }
+    }
+
+    impl<H: LowLevelHash, F: Field256> PartialEq for HasherImpl<H, F> {
+        fn eq(&self, _other: &Self) -> bool {
+            true
+        }
+    }
+
+    impl<H: LowLevelHash, F: Field256> Eq for HasherImpl<H, F> {}
+
+    impl<H: LowLevelHash, F: Field256> PartialOrd for HasherImpl<H, F> {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    impl<H: LowLevelHash, F: Field256> Ord for HasherImpl<H, F> {
+        fn cmp(&self, _other: &Self) -> std::cmp::Ordering {
+            std::cmp::Ordering::Equal
+        }
+    }
+
     impl<H: LowLevelHash, F: Field256> MerkleHasher for HasherImpl<H, F> {
         fn hash_binary(left: H256, right: H256) -> H256 {
             let mut hasher = H::default();
