@@ -265,7 +265,7 @@ mod tests {
     use super::*;
     use crate::hash::{Keccak256Hash, Sha2Hash};
     use starkom_bluesky::Scalar as BS;
-    use starkom_goldilocks::{GL, GL4};
+    use starkom_goldilocks::GL4;
     use std::fmt::Debug;
     use std::str::FromStr;
 
@@ -283,7 +283,10 @@ mod tests {
             get_leaf_dst::<BS>(),
             parse("0x08cb2652a56289bd316cfcb356f5d2be485538e04a601fb14fc2c98f03077fcb")
         );
-        assert_eq!(get_leaf_dst::<GL>(), parse("0x9e8c852f6e39922a"));
+        assert_eq!(
+            get_leaf_dst::<GL4>(),
+            parse("0x5c2a4bcf48496a9c0b5c038ecd6a7977e055af164d18a3a8ce1012be480276be")
+        );
     }
 
     #[test]
