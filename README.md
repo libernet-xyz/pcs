@@ -7,13 +7,14 @@
 ## Overview
 
 This crate contains Starkom's quantum-resistant polynomial commitment scheme, a DEEP-FRI
-implementation.
+implementation that works with any field with sufficient 2-adicity.
 
-It currently works on the [BlueSky](https://docs.rs/starkom-bluesky) field only.
+Starkom's zkSTARK suite currently provides three fields and all work correctly with this PCS: the [BLS12-381 scalar field][bls12-381], [BlueSky][bluesky], and [Goldilocks][goldilocks].
 
-Three different hash backends are provided: one based on SHA-256 for fast verification on the EVM,
-one based on [Poseidon](https://docs.rs/starkom-poseidon), and one based on
-[Poseidon2](https://docs.rs/starkom-poseidon2) for efficient recursion.
+Two hash backends are provided, one using SHA2-256 and one using Keccak-256, and both are
+implemented in the most EVM-friendly possible way. Check out Starkom's [EVM verifier][evm-verifier].
 
-The SHA-256 hash backend is compatible with our
-[EVM verifier](https://github.com/libernet-xyz/evm-verifier).
+[bls12-381]: https://docs.rs/starkom-ff/latest/starkom_ff/bls12_381/struct.Scalar.html
+[bluesky]: https://docs.rs/starkom-bluesky
+[evm-verifier]: https://github.com/libernet-xyz/evm-verifier
+[goldilocks]: https://docs.rs/starkom-goldilocks

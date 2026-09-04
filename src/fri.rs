@@ -1,51 +1,48 @@
-use crate::hash::HashBackend;
+use crate::hash::Hasher;
 use crate::merkle::{Proof as LeafProof, Tree};
 use crate::utils;
 use anyhow::{Result, anyhow};
 use primitive_types::H256;
-use starkom_bluesky::Scalar;
-use starkom_ff::{Field, PrimeField};
-use starkom_poly;
-use std::marker::PhantomData;
+use starkom_ff::Field256;
+use starkom_poly::Polynomial;
 use std::sync::LazyLock;
 
-type Polynomial = starkom_poly::Polynomial<Scalar>;
-
 /// Domain separator tag used when deriving the Fiat-Shamir challenge for FRI folding.
-static FOLD_DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"starkom/fri/fold"));
+static FOLD_DST: LazyLock<H256> = LazyLock::new(|| utils::make_dst(b"starkom/fri/fold"));
 
-trait FoldableTree<H: HashBackend<Scalar>> {
+trait FoldableTree<F: Field256, H: Hasher<F>>: Sized {
     /// Performs one FRI folding round, returning the new folded tree.
-    fn fold(&self) -> Self;
+    fn fold(&self) -> Tree<F, H>;
 
-    /// Performs `times` FRI folding and returns an array of `times+1` trees.
+    /// Performs `times` FRI folding rounds and returns an array of `times` trees.
     ///
-    /// The first element is `self` (N leaves), the second element is the tree from the first
-    /// folding round (N/2 leaves), the third element is the tree from the second folding round (N/4
-    /// leaves), and so on.
-    fn fold_all(self, times: usize) -> Vec<Tree<H>>;
+    /// The first element is the tree from the first folding round (N/2 leaves, with N being the
+    /// number of leaves in `self`), the second element is the tree from the second folding round
+    /// (N/4 leaves), and so on. If `times` is 0 no folding is performed and an empty array is
+    /// returned.
+    fn fold_all(self, times: usize) -> Vec<Tree<F, H>>;
 }
 
-impl<H: HashBackend<Scalar>> FoldableTree<H> for Tree<H> {
-    fn fold(&self) -> Self {
+impl<F: Field256, H: Hasher<F>> FoldableTree<F, H> for Tree<F, H> {
+    fn fold(&self) -> Tree<F, H> {
         let num_polys = self.num_polys();
         let n = self.num_leaves();
         assert!(n.is_power_of_two());
 
-        let alpha = H::challenge(*FOLD_DST, [self.root_hash()]);
+        let alpha = H::challenge(*FOLD_DST, &[self.root_hash()]);
 
         let k = n.trailing_zeros() as usize;
-        let omega_inv = Scalar::ROOT_OF_UNITY_INV.pow_u64(1u64 << (Scalar::S - k));
+        let omega_inv = F::ROOT_OF_UNITY_INV.pow_u64(1u64 << (F::S - k));
 
         let m = n / 2;
-        let mut omega_inv_i = Scalar::ONE;
+        let mut omega_inv_i = F::ONE;
 
-        let mut leaves = vec![vec![Scalar::ZERO; m]; num_polys];
+        let mut leaves = vec![vec![F::ZERO; m]; num_polys];
         for i in 0..m {
             for j in 0..num_polys {
                 let pos = self.leaf_value(j, i);
                 let neg = self.leaf_value(j, i + m);
-                leaves[j][i] = (pos + neg + alpha * omega_inv_i * (pos - neg)) * Scalar::TWO_INV;
+                leaves[j][i] = (pos + neg + alpha * omega_inv_i * (pos - neg)) * F::TWO_INV;
             }
             omega_inv_i *= omega_inv;
         }
@@ -53,7 +50,7 @@ impl<H: HashBackend<Scalar>> FoldableTree<H> for Tree<H> {
         Self::new(leaves)
     }
 
-    fn fold_all(self, times: usize) -> Vec<Self> {
+    fn fold_all(self, times: usize) -> Vec<Tree<F, H>> {
         let mut trees = Vec::with_capacity(times + 1);
         let mut tree = self;
         for _ in 0..times {
@@ -68,9 +65,10 @@ impl<H: HashBackend<Scalar>> FoldableTree<H> for Tree<H> {
 
 /// Stores the Merkle root hashes of a FRI commitment.
 ///
-/// Note that for low-degree testing these are *less* than log2(N), with N being the number of
-/// committed evaluations. Once the folding process has reduced all polynomials to degree-0 ones
-/// (that is, single constants) all subsequent folds would be identical, so we don't store them.
+/// Note that for low-degree testing these are strictly less than `log2(N)+1`, with N being the
+/// number of committed evaluations. Once the folding process has reduced all polynomials to
+/// degree-0 ones (that is, single constants) all subsequent folds would be identical, so we don't
+/// store them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Commitment {
     /// The first element in the array is the root of the main Merkle tree, the second one is the
@@ -80,9 +78,12 @@ pub struct Commitment {
 }
 
 impl Commitment {
-    /// Returns the number of stored roots, equivalent to the number of folding rounds and therefore
-    /// to the log2 of the degree bound plus one. For example, if the user commits 4 evaluations
-    /// `len()` will return 3.
+    /// Returns the number of stored roots, equivalent to the number of Merkle trees known to the
+    /// prover. These would in turn include the base Merkle tree of the committed evaluations (over
+    /// the extended domain) and one subsequent tree for every folding round. The number of folding
+    /// rounds equals the log2 of the degree bound of the original polynomial. For example, if the
+    /// user commits a degree<8 polynomial encoding 8 values, `len()` will return
+    /// log2(8)+1 = 3+1 = 4 regardless of the blowup factor.
     pub fn len(&self) -> usize {
         self.roots.len()
     }
@@ -101,8 +102,9 @@ impl Commitment {
     }
 }
 
+/// A single FRI query.
 #[derive(Debug, Clone)]
-pub struct Query<H: HashBackend<Scalar>> {
+pub struct Query<F: Field256, H: Hasher<F>> {
     /// The degree bound of the committed polynomials (always a power of 2).
     degree_bound: usize,
     /// The base-2 logarithm of the blowup factor.
@@ -111,11 +113,10 @@ pub struct Query<H: HashBackend<Scalar>> {
     index: usize,
     /// Proves a pair of "partner" values at each folding round with one [`LeafProof`] pair for
     /// every round. The pair at `folds[0]` proves the opened values.
-    folds: Vec<(LeafProof<H>, LeafProof<H>)>,
-    _data: PhantomData<H>,
+    folds: Vec<(LeafProof<F, H>, LeafProof<F, H>)>,
 }
 
-impl<H: HashBackend<Scalar>> Query<H> {
+impl<F: Field256, H: Hasher<F>> Query<F, H> {
     /// Returns the two opened indices.
     pub fn indices(&self) -> (usize, usize) {
         let n = self.degree_bound << self.blowup_log2;
@@ -130,9 +131,10 @@ impl<H: HashBackend<Scalar>> Query<H> {
     /// Note that we use [`Polynomial::shift_domain`] before committing polynomials, so the element
     /// returned here is a shifted power of an N-th root of unity, with
     /// `N = degree_bound * 2^blowup_factor`. The shift consists of multiplying the actual domain
-    /// element by [`Scalar::MULTIPLICATIVE_GENERATOR`], consistently with `shift_domain`.
-    pub fn x(&self) -> Scalar {
-        Polynomial::coset_element2(self.index, self.degree_bound << self.blowup_log2)
+    /// element by [`starkom_ff::Field::MULTIPLICATIVE_GENERATOR`], consistently with
+    /// `shift_domain`.
+    pub fn x(&self) -> F {
+        Polynomial::<F>::coset_element2(self.index, self.degree_bound << self.blowup_log2)
     }
 
     /// Returns the opened evaluations, one for every committed polynomial.
@@ -140,11 +142,12 @@ impl<H: HashBackend<Scalar>> Query<H> {
     /// The first component of the returned tuple contains the evaluations at the first index
     /// returned by [`Self::indices`], while the second component contains those at the second
     /// index.
-    pub fn values(&self) -> (&[Scalar], &[Scalar]) {
+    pub fn values(&self) -> (&[F], &[F]) {
         (self.folds[0].0.leaf(), self.folds[0].1.leaf())
     }
 
-    /// Returns the number of folding rounds.
+    /// Returns the number of Merkle trees in the proof: one for the original polynomial evaluations
+    /// plus one for every folding round.
     ///
     /// In general these are log2(d)+1, with `d` being the degree bound of the committed polynomial.
     /// Note that for low-degree testing `d` is strictly less than the number of committed
@@ -163,13 +166,11 @@ impl<H: HashBackend<Scalar>> Query<H> {
         assert!(n.is_power_of_two());
         assert!(self.index < n);
 
-        let k = n.trailing_zeros() as usize;
+        let mut k = n.trailing_zeros() as usize;
 
-        let folds = self.folds.as_slice();
-
-        let num_folds = folds.len();
+        let num_folds = self.folds.len();
         if num_folds > self.degree_bound.trailing_zeros() as usize + 1 {
-            return Err(anyhow!("invalid proof size"));
+            return Err(anyhow!("incorrect proof size"));
         }
         if commitment.len() != num_folds {
             return Err(anyhow!("wrong number of folding rounds"));
@@ -177,26 +178,24 @@ impl<H: HashBackend<Scalar>> Query<H> {
 
         let mut index = self.index;
         let mut pos = self.folds[0].0.leaf().to_vec();
-        let mut step = Scalar::ROOT_OF_UNITY_INV.pow_u64(1u64 << (Scalar::S - k));
+        let mut step = F::ROOT_OF_UNITY_INV.pow_u64(1u64 << (F::S - k));
 
         for round in 0..num_folds {
-            let (left, right) = &folds[round];
             let root_hash = commitment.roots()[round];
-            let alpha = H::challenge(*FOLD_DST, [root_hash]);
-            let neg = right.leaf();
 
-            if 1usize << left.len() != n {
+            let (left, right) = &self.folds[round];
+            if left.len() != k {
                 return Err(anyhow!(
                     "invalid left-hand side Merkle proof height (got {}, want {})",
                     left.len(),
-                    n.trailing_zeros()
+                    k
                 ));
             }
-            if 1usize << right.len() != n {
+            if right.len() != k {
                 return Err(anyhow!(
                     "invalid right-hand side Merkle proof height (got {}, want {})",
                     right.len(),
-                    n.trailing_zeros()
+                    k
                 ));
             }
 
@@ -204,20 +203,22 @@ impl<H: HashBackend<Scalar>> Query<H> {
             left.verify(index, root_hash)?;
             right.verify((index + n / 2) % n, root_hash)?;
 
-            let omega_inv_i = step.pow_small(index);
+            let omega_inv = step.pow_small(index);
             n /= 2;
+            k -= 1;
             index %= n;
 
+            let neg = right.leaf();
+            let alpha = H::challenge(*FOLD_DST, &[root_hash]);
             for i in 0..pos.len() {
-                pos[i] =
-                    (pos[i] + neg[i] + alpha * omega_inv_i * (pos[i] - neg[i])) * Scalar::TWO_INV;
+                pos[i] = (pos[i] + neg[i] + alpha * omega_inv * (pos[i] - neg[i])) * F::TWO_INV;
             }
             step = step.square();
         }
 
-        let (left, right) = folds.last().unwrap();
-        if !left.is_constant()? || !right.is_constant()? {
-            return Err(anyhow!("final folded polynomial is not constant"));
+        let (left, right) = self.folds.last().unwrap();
+        if !left.is_constant() || !right.is_constant() {
+            return Err(anyhow!("the final folded polynomial is not constant"));
         }
 
         Ok(())
@@ -231,20 +232,18 @@ impl<H: HashBackend<Scalar>> Query<H> {
 /// folded into constant ones. Note that the final Merkle tree still has more than one leaf due to
 /// the low-degree extension.
 #[derive(Debug, Clone)]
-pub struct Prover<H: HashBackend<Scalar>> {
+pub struct Prover<F: Field256, H: Hasher<F>> {
     /// The degree bound of the committed polynomials. This is the highest degree among the
     /// committed polynomials, plus one.
     degree_bound: usize,
     /// The base-2 logarithm of the blowup factor.
     blowup_log2: usize,
-    /// The Merkle trees, one for the original polynomials plus one for every folding round.
-    /// `trees[0]` is the tree built over the original polynomial evaluations, `trees[1]` is the
-    /// tree resulting from the first folding round, etc.
-    trees: Vec<Tree<H>>,
+    /// The folded Merkle trees, one for every folding round.
+    trees: Vec<Tree<F, H>>,
 }
 
-impl<H: HashBackend<Scalar>> Prover<H> {
-    pub fn new(polynomials: Vec<Polynomial>, degree_bound: usize, blowup_log2: usize) -> Self {
+impl<F: Field256, H: Hasher<F>> Prover<F, H> {
+    pub fn new(polynomials: Vec<Polynomial<F>>, degree_bound: usize, blowup_log2: usize) -> Self {
         assert!(degree_bound.is_power_of_two());
         assert!(
             polynomials
@@ -254,9 +253,9 @@ impl<H: HashBackend<Scalar>> Prover<H> {
         assert!(blowup_log2 > 0);
 
         let n = degree_bound << blowup_log2;
-        assert!(n as u64 <= 1u64 << Scalar::S);
+        assert!(n as u64 <= 1u64 << F::S);
 
-        let main_tree = Tree::<H>::new(
+        let main_tree = Tree::<F, H>::new(
             polynomials
                 .into_iter()
                 .map(|polynomial| polynomial.shift_domain().lde2(n))
@@ -299,7 +298,7 @@ impl<H: HashBackend<Scalar>> Prover<H> {
     /// Creates the FRI commitment for the batched polynomials.
     pub fn commit(&self) -> Commitment {
         Commitment {
-            roots: self.trees.iter().map(|tree| tree.root_hash()).collect(),
+            roots: self.trees.iter().map(Tree::root_hash).collect(),
         }
     }
 
@@ -307,7 +306,7 @@ impl<H: HashBackend<Scalar>> Prover<H> {
     ///
     /// NOTE: `index` is relative to the *inflated* evaluation domain, so for example if you
     /// committed to 4 evaluations with a blowup factor of 8 the range for `index` is [0, 32).
-    pub fn query(&self, index: usize) -> Query<H> {
+    pub fn query(&self, index: usize) -> Query<F, H> {
         let mut n = self.degree_bound << self.blowup_log2;
         assert!(index < n);
 
@@ -321,8 +320,8 @@ impl<H: HashBackend<Scalar>> Prover<H> {
 
         {
             let (left, right) = folds.last().unwrap();
-            assert!(left.is_constant().unwrap());
-            assert!(right.is_constant().unwrap());
+            assert!(left.is_constant());
+            assert!(right.is_constant());
         }
 
         Query {
@@ -330,7 +329,6 @@ impl<H: HashBackend<Scalar>> Prover<H> {
             blowup_log2: self.blowup_log2,
             index,
             folds,
-            _data: Default::default(),
         }
     }
 }
@@ -338,19 +336,26 @@ impl<H: HashBackend<Scalar>> Prover<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hash;
-    use starkom_bluesky::from_const;
+    use crate::hash::{Keccak256Hash, Sha2Hash};
+    use starkom_bluesky::Scalar as BS;
+    use starkom_goldilocks::GL4;
 
-    type Sha2Hash = hash::Sha2Hash<Scalar>;
-    type Poseidon1Hash = hash::Poseidon1Hash<Scalar>;
-    type Poseidon2Hash = hash::Poseidon2Hash<Scalar>;
+    #[test]
+    fn test_fold_dst() {
+        assert_eq!(
+            *FOLD_DST,
+            "0x9ffd3556faeb2cae194ce95adf6b3580f590504daa0dea56966ce4ef233844af"
+                .parse()
+                .unwrap()
+        );
+    }
 
-    fn test_prover_impl<H: HashBackend<Scalar>>(
-        polynomials: Vec<Polynomial>,
+    fn test_prover_impl<F: Field256, H: Hasher<F>>(
+        polynomials: &[Polynomial<F>],
         degree_bound: usize,
         blowup_log2: usize,
     ) {
-        let prover = Prover::<H>::new(polynomials, degree_bound, blowup_log2);
+        let prover = Prover::<F, H>::new(polynomials.to_vec(), degree_bound, blowup_log2);
         assert_eq!(prover.degree_bound(), degree_bound);
         let n = degree_bound << blowup_log2;
         assert_eq!(prover.extended_domain_size(), n);
@@ -363,153 +368,87 @@ mod tests {
         }
     }
 
-    fn test_prover(polynomials: Vec<Polynomial>, degree_bound: usize) {
-        test_prover_impl::<Sha2Hash>(polynomials.clone(), degree_bound, 1);
-        test_prover_impl::<Poseidon1Hash>(polynomials.clone(), degree_bound, 1);
-        test_prover_impl::<Poseidon2Hash>(polynomials.clone(), degree_bound, 1);
-        test_prover_impl::<Sha2Hash>(polynomials.clone(), degree_bound, 2);
-        test_prover_impl::<Poseidon1Hash>(polynomials.clone(), degree_bound, 2);
-        test_prover_impl::<Poseidon2Hash>(polynomials.clone(), degree_bound, 2);
-        test_prover_impl::<Sha2Hash>(polynomials.clone(), degree_bound, 3);
-        test_prover_impl::<Poseidon1Hash>(polynomials.clone(), degree_bound, 3);
-        test_prover_impl::<Poseidon2Hash>(polynomials.clone(), degree_bound, 3);
+    fn test_prover(polynomials: Vec<Vec<u64>>, degree_bound: usize) {
+        let bluesky_polynomials: Vec<Polynomial<BS>> = polynomials
+            .iter()
+            .map(|coefficients| {
+                Polynomial::with_coefficients(
+                    coefficients.iter().copied().map(BS::from_const).collect(),
+                )
+            })
+            .collect();
+        let goldilocks_polynomials: Vec<Polynomial<GL4>> = polynomials
+            .into_iter()
+            .map(|coefficients| {
+                Polynomial::with_coefficients(
+                    coefficients.into_iter().map(GL4::from_const).collect(),
+                )
+            })
+            .collect();
+        test_prover_impl::<BS, Sha2Hash<BS>>(&bluesky_polynomials, degree_bound, 1);
+        test_prover_impl::<GL4, Sha2Hash<GL4>>(&goldilocks_polynomials, degree_bound, 1);
+        test_prover_impl::<BS, Keccak256Hash<BS>>(&bluesky_polynomials, degree_bound, 1);
+        test_prover_impl::<GL4, Keccak256Hash<GL4>>(&goldilocks_polynomials, degree_bound, 1);
+        test_prover_impl::<BS, Sha2Hash<BS>>(&bluesky_polynomials, degree_bound, 2);
+        test_prover_impl::<GL4, Sha2Hash<GL4>>(&goldilocks_polynomials, degree_bound, 2);
+        test_prover_impl::<BS, Keccak256Hash<BS>>(&bluesky_polynomials, degree_bound, 2);
+        test_prover_impl::<GL4, Keccak256Hash<GL4>>(&goldilocks_polynomials, degree_bound, 2);
+        test_prover_impl::<BS, Sha2Hash<BS>>(&bluesky_polynomials, degree_bound, 3);
+        test_prover_impl::<GL4, Sha2Hash<GL4>>(&goldilocks_polynomials, degree_bound, 3);
+        test_prover_impl::<BS, Keccak256Hash<BS>>(&bluesky_polynomials, degree_bound, 3);
+        test_prover_impl::<GL4, Keccak256Hash<GL4>>(&goldilocks_polynomials, degree_bound, 3);
     }
 
     #[test]
     fn test_one_constant_polynomial() {
-        test_prover(vec![Polynomial::with_coefficients(vec![from_const(12)])], 1);
-        test_prover(vec![Polynomial::with_coefficients(vec![from_const(34)])], 1);
+        test_prover(vec![vec![12]], 1);
+        test_prover(vec![vec![34]], 1);
     }
 
     #[test]
     fn test_two_constant_polynomials() {
-        test_prover(
-            vec![
-                Polynomial::with_coefficients(vec![from_const(12)]),
-                Polynomial::with_coefficients(vec![from_const(34)]),
-            ],
-            1,
-        );
+        test_prover(vec![vec![12], vec![34]], 1);
     }
 
     #[test]
     fn test_three_constant_polynomials() {
-        test_prover(
-            vec![
-                Polynomial::with_coefficients(vec![from_const(34)]),
-                Polynomial::with_coefficients(vec![from_const(56)]),
-                Polynomial::with_coefficients(vec![from_const(78)]),
-            ],
-            1,
-        );
+        test_prover(vec![vec![34], vec![56], vec![78]], 1);
     }
 
     #[test]
     fn test_one_polynomial_degree_one() {
-        test_prover(
-            vec![Polynomial::with_coefficients(vec![
-                from_const(12),
-                from_const(34),
-            ])],
-            2,
-        );
-        test_prover(
-            vec![Polynomial::with_coefficients(vec![
-                from_const(56),
-                from_const(78),
-            ])],
-            2,
-        );
+        test_prover(vec![vec![12, 34]], 2);
+        test_prover(vec![vec![56, 78]], 2);
     }
 
     #[test]
     fn test_two_polynomials_degree_one() {
-        test_prover(
-            vec![
-                Polynomial::with_coefficients(vec![from_const(12), from_const(34)]),
-                Polynomial::with_coefficients(vec![from_const(56), from_const(78)]),
-            ],
-            2,
-        );
+        test_prover(vec![vec![12, 34], vec![56, 78]], 2);
     }
 
     #[test]
     fn test_three_polynomials_degree_one() {
-        test_prover(
-            vec![
-                Polynomial::with_coefficients(vec![from_const(34), from_const(56)]),
-                Polynomial::with_coefficients(vec![from_const(56), from_const(78)]),
-                Polynomial::with_coefficients(vec![from_const(78), from_const(90)]),
-            ],
-            2,
-        );
+        test_prover(vec![vec![34, 56], vec![56, 78], vec![78, 90]], 2);
     }
 
     #[test]
     fn test_one_polynomial_degree_three() {
-        test_prover(
-            vec![Polynomial::with_coefficients(vec![
-                from_const(12),
-                from_const(34),
-                from_const(56),
-                from_const(78),
-            ])],
-            4,
-        );
-        test_prover(
-            vec![Polynomial::with_coefficients(vec![
-                from_const(42),
-                from_const(43),
-                from_const(44),
-                from_const(45),
-            ])],
-            4,
-        );
+        test_prover(vec![vec![12, 34, 56, 78]], 4);
+        test_prover(vec![vec![42, 43, 44, 45]], 4);
     }
 
     #[test]
     fn test_two_polynomials_degree_three() {
-        test_prover(
-            vec![
-                Polynomial::with_coefficients(vec![
-                    from_const(12),
-                    from_const(34),
-                    from_const(56),
-                    from_const(78),
-                ]),
-                Polynomial::with_coefficients(vec![
-                    from_const(42),
-                    from_const(43),
-                    from_const(44),
-                    from_const(45),
-                ]),
-            ],
-            4,
-        );
+        test_prover(vec![vec![12, 34, 56, 78], vec![42, 43, 44, 45]], 4);
     }
 
     #[test]
     fn test_three_polynomials_degree_three() {
         test_prover(
             vec![
-                Polynomial::with_coefficients(vec![
-                    from_const(42),
-                    from_const(43),
-                    from_const(44),
-                    from_const(45),
-                ]),
-                Polynomial::with_coefficients(vec![
-                    from_const(12),
-                    from_const(34),
-                    from_const(56),
-                    from_const(78),
-                ]),
-                Polynomial::with_coefficients(vec![
-                    from_const(34),
-                    from_const(56),
-                    from_const(78),
-                    from_const(90),
-                ]),
+                vec![42, 43, 44, 45],
+                vec![12, 34, 56, 78],
+                vec![34, 56, 78, 90],
             ],
             4,
         );
@@ -517,54 +456,16 @@ mod tests {
 
     #[test]
     fn test_one_polynomial_degree_seven() {
-        test_prover(
-            vec![Polynomial::with_coefficients(vec![
-                from_const(12),
-                from_const(34),
-                from_const(56),
-                from_const(78),
-                from_const(90),
-                from_const(12),
-                from_const(34),
-            ])],
-            8,
-        );
-        test_prover(
-            vec![Polynomial::with_coefficients(vec![
-                from_const(42),
-                from_const(43),
-                from_const(44),
-                from_const(45),
-                from_const(46),
-                from_const(47),
-                from_const(48),
-            ])],
-            8,
-        );
+        test_prover(vec![vec![12, 34, 56, 78, 90, 12, 34]], 8);
+        test_prover(vec![vec![42, 43, 44, 45, 46, 47, 48]], 8);
     }
 
     #[test]
     fn test_two_polynomials_degree_seven() {
         test_prover(
             vec![
-                Polynomial::with_coefficients(vec![
-                    from_const(12),
-                    from_const(34),
-                    from_const(56),
-                    from_const(78),
-                    from_const(90),
-                    from_const(12),
-                    from_const(34),
-                ]),
-                Polynomial::with_coefficients(vec![
-                    from_const(42),
-                    from_const(43),
-                    from_const(44),
-                    from_const(45),
-                    from_const(46),
-                    from_const(47),
-                    from_const(48),
-                ]),
+                vec![12, 34, 56, 78, 90, 12, 34],
+                vec![42, 43, 44, 45, 46, 47, 48],
             ],
             8,
         );
@@ -574,35 +475,146 @@ mod tests {
     fn test_three_polynomials_degree_seven() {
         test_prover(
             vec![
-                Polynomial::with_coefficients(vec![
-                    from_const(42),
-                    from_const(43),
-                    from_const(44),
-                    from_const(45),
-                    from_const(46),
-                    from_const(47),
-                    from_const(48),
-                ]),
-                Polynomial::with_coefficients(vec![
-                    from_const(12),
-                    from_const(34),
-                    from_const(56),
-                    from_const(78),
-                    from_const(90),
-                    from_const(12),
-                    from_const(34),
-                ]),
-                Polynomial::with_coefficients(vec![
-                    from_const(34),
-                    from_const(56),
-                    from_const(78),
-                    from_const(90),
-                    from_const(78),
-                    from_const(56),
-                    from_const(34),
-                ]),
+                vec![42, 43, 44, 45, 46, 47, 48],
+                vec![12, 34, 56, 78, 90, 12, 34],
+                vec![34, 56, 78, 90, 78, 56, 34],
             ],
             8,
         );
+    }
+
+    const DEGREE_BOUND: usize = 8;
+    const BLOWUP_LOG2: usize = 2;
+    const QUERY_INDEX: usize = 3;
+
+    fn make_prover(coefficients: [u64; 8]) -> Prover<BS, Sha2Hash<BS>> {
+        Prover::new(
+            vec![Polynomial::with_coefficients(
+                coefficients.into_iter().map(BS::from_const).collect(),
+            )],
+            DEGREE_BOUND,
+            BLOWUP_LOG2,
+        )
+    }
+
+    fn honest_prover() -> Prover<BS, Sha2Hash<BS>> {
+        make_prover([12, 34, 56, 78, 90, 12, 34, 56])
+    }
+
+    fn assert_rejected(result: Result<()>, expected: &str) {
+        let error = result
+            .expect_err("the tampered proof was accepted")
+            .to_string();
+        assert!(error.contains(expected), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn test_accept_untampered_proof() {
+        let prover = honest_prover();
+        assert!(prover.query(QUERY_INDEX).verify(&prover.commit()).is_ok());
+    }
+
+    #[test]
+    fn test_reject_foreign_commitment() {
+        let query = honest_prover().query(QUERY_INDEX);
+        let foreign = make_prover([90, 78, 56, 34, 12, 90, 78, 56]).commit();
+        assert_rejected(query.verify(&foreign), "root hash mismatch");
+    }
+
+    #[test]
+    fn test_reject_corrupted_root() {
+        let prover = honest_prover();
+        let mut commitment = prover.commit();
+        commitment.roots[2] = H256::repeat_byte(0xAA);
+        assert_rejected(
+            prover.query(QUERY_INDEX).verify(&commitment),
+            "root hash mismatch",
+        );
+    }
+
+    #[test]
+    fn test_reject_truncated_folds() {
+        let prover = honest_prover();
+        let commitment = prover.commit();
+        let mut query = prover.query(QUERY_INDEX);
+        query.folds.truncate(3);
+        assert_rejected(query.verify(&commitment), "wrong number of folding rounds");
+    }
+
+    #[test]
+    fn test_reject_truncated_commitment() {
+        let prover = honest_prover();
+        let mut commitment = prover.commit();
+        commitment.roots.truncate(3);
+        assert_rejected(
+            prover.query(QUERY_INDEX).verify(&commitment),
+            "wrong number of folding rounds",
+        );
+    }
+
+    #[test]
+    fn test_reject_extra_folds() {
+        let prover = honest_prover();
+        let commitment = prover.commit();
+        let mut query = prover.query(QUERY_INDEX);
+        let mut donor = prover.query(QUERY_INDEX);
+        query.folds.push(donor.folds.pop().unwrap());
+        assert_rejected(query.verify(&commitment), "incorrect proof size");
+    }
+
+    #[test]
+    fn test_reject_folding_stopped_early() {
+        let prover = honest_prover();
+        let mut commitment = prover.commit();
+        let mut query = prover.query(QUERY_INDEX);
+        commitment.roots.truncate(3);
+        query.folds.truncate(3);
+        assert_rejected(query.verify(&commitment), "not constant");
+    }
+
+    #[test]
+    fn test_reject_wrong_left_proof_height() {
+        let prover = honest_prover();
+        let commitment = prover.commit();
+        let mut query = prover.query(QUERY_INDEX);
+        let mut donor = prover.query(QUERY_INDEX);
+        query.folds[0].0 = donor.folds.remove(1).0;
+        assert_rejected(
+            query.verify(&commitment),
+            "invalid left-hand side Merkle proof height",
+        );
+    }
+
+    #[test]
+    fn test_reject_wrong_right_proof_height() {
+        let prover = honest_prover();
+        let commitment = prover.commit();
+        let mut query = prover.query(QUERY_INDEX);
+        let mut donor = prover.query(QUERY_INDEX);
+        query.folds[0].1 = donor.folds.remove(1).1;
+        assert_rejected(
+            query.verify(&commitment),
+            "invalid right-hand side Merkle proof height",
+        );
+    }
+
+    #[test]
+    fn test_reject_swapped_partners() {
+        let prover = honest_prover();
+        let commitment = prover.commit();
+        let mut query = prover.query(QUERY_INDEX);
+        let pair = &mut query.folds[0];
+        std::mem::swap(&mut pair.0, &mut pair.1);
+        assert_rejected(query.verify(&commitment), "root hash mismatch");
+    }
+
+    #[test]
+    fn test_reject_foreign_leaf_proof() {
+        let prover = honest_prover();
+        let commitment = prover.commit();
+        let mut query = prover.query(QUERY_INDEX);
+        let mut other = prover.query(QUERY_INDEX + 4);
+        query.folds[1].0 = other.folds.remove(1).0;
+        assert_rejected(query.verify(&commitment), "leaf value mismatch");
     }
 }
