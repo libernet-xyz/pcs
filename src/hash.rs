@@ -100,9 +100,7 @@ mod internal {
 
     impl<H: LowLevelHash, F: Field256> Default for HasherImpl<H, F> {
         fn default() -> Self {
-            Self {
-                _data: PhantomData::default(),
-            }
+            Self { _data: PhantomData }
         }
     }
 

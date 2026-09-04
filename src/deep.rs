@@ -17,8 +17,11 @@ pub const LAMBDA: usize = 128;
 static TRANSCRIPT_DST: LazyLock<H256> =
     LazyLock::new(|| utils::make_dst(b"starkom/deep/transcript"));
 
-/// Domain separator tag for the Fiat-Shamir challenge used to derive query indices.
-static QUERY_DST: LazyLock<H256> = LazyLock::new(|| utils::make_dst(b"starkom/deep/query"));
+/// First domain separator tag for the Fiat-Shamir challenge used to derive query indices.
+static QUERY_DST0: LazyLock<H256> = LazyLock::new(|| utils::make_dst(b"starkom/deep/query/0"));
+
+/// Second domain separator tag for the Fiat-Shamir challenge used to derive query indices.
+static QUERY_DST1: LazyLock<H256> = LazyLock::new(|| utils::make_dst(b"starkom/deep/query/1"));
 
 /// Domain separator tag for the Fiat-Shamir challenge used to build the random linear combination.
 static RLC_DST: LazyLock<H256> = LazyLock::new(|| utils::make_dst(b"starkom/deep/rlc"));
@@ -29,11 +32,10 @@ fn num_queries(blowup_log2: usize) -> usize {
     LAMBDA.div_ceil(blowup_log2)
 }
 
-/// Encodes a `usize` into a `H256` for use in a transcript to derive the Fiat-Shamir query
-/// indices.
+/// Encodes a `usize` into a `H256` for use in various transcript hashes.
 fn encode_usize(value: usize) -> H256 {
     let mut bytes = [0u8; 32];
-    bytes[0..8].copy_from_slice(&(value as u64).to_be_bytes());
+    bytes[24..32].copy_from_slice(&(value as u64).to_be_bytes());
     H256::from_slice(&bytes)
 }
 
@@ -120,17 +122,17 @@ impl<F: Field256, H: Hasher<F>> Commitment<F, H> {
         let n = U256::from((degree_bound << blowup_log2) as u64);
         let k = num_queries(blowup_log2);
         let mut indices = Vec::with_capacity(k);
+        let seed = H::hash_transcript(
+            *QUERY_DST0,
+            std::iter::once(encode_usize(self.tree_roots.len()))
+                .chain(self.tree_roots.iter().copied())
+                .chain(std::iter::once(encode_usize(self.inner.len())))
+                .chain(self.inner.roots().iter().copied())
+                .collect::<Vec<H256>>()
+                .as_slice(),
+        );
         for i in 0..k {
-            let hash = H::challenge(
-                *QUERY_DST,
-                std::iter::once(encode_usize(self.tree_roots.len()))
-                    .chain(self.tree_roots.iter().copied())
-                    .chain(std::iter::once(encode_usize(self.inner.len())))
-                    .chain(self.inner.roots().iter().copied())
-                    .chain(std::iter::once(encode_usize(i)))
-                    .collect::<Vec<H256>>()
-                    .as_slice(),
-            );
+            let hash = H::challenge(*QUERY_DST1, &[seed, encode_usize(i)]);
             let index = hash.to_u256() % n;
             indices.push(index.as_u64() as usize);
         }
@@ -314,7 +316,7 @@ impl<F: Field256, H: Hasher<F>> Committer<F, H> {
             .iter()
             .map(|(&z, values)| {
                 let value = rlc(values.iter().copied(), alpha);
-                let (quotient, remainder) = (combined.clone() - value).horner(z.into());
+                let (quotient, remainder) = (combined.clone() - value).horner(z);
                 assert_eq!(remainder, F::ZERO);
                 quotient
             })
@@ -576,8 +578,14 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(
-            *QUERY_DST,
-            "0x344dcbdbf48e4b008c5998834be6306ea62faff77441a031a89dd2d7b8a36d4a"
+            *QUERY_DST0,
+            "0xbbec7289b9fc3aade75412c031b62a769b205d1d73b29c9a06dbb91943e046bc"
+                .parse()
+                .unwrap()
+        );
+        assert_eq!(
+            *QUERY_DST1,
+            "0x88209086b178c9f2fb9c2f813cd229e1a2528cb4f5e6cd618710dc9869f14ac5"
                 .parse()
                 .unwrap()
         );
