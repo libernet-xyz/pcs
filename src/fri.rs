@@ -1,18 +1,14 @@
 use crate::hash::Hasher;
 use crate::merkle::{Proof as LeafProof, Tree};
+use crate::utils;
 use anyhow::{Result, anyhow};
 use primitive_types::H256;
-use sha2::Digest;
 use starkom_ff::Field256;
 use starkom_poly::Polynomial;
 use std::sync::LazyLock;
 
 /// Domain separator tag used when deriving the Fiat-Shamir challenge for FRI folding.
-static FOLD_DST: LazyLock<H256> = LazyLock::new(|| {
-    let mut hasher = sha3::Sha3_256::new();
-    hasher.update(b"starkom/fri/fold");
-    H256::from_slice(hasher.finalize().as_slice())
-});
+static FOLD_DST: LazyLock<H256> = LazyLock::new(|| utils::make_dst(b"starkom/fri/fold"));
 
 trait FoldableTree<F: Field256, H: Hasher<F>>: Sized {
     /// Performs one FRI folding round, returning the new folded tree.

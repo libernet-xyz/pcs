@@ -1,9 +1,9 @@
 use crate::fri;
 use crate::hash::Hasher;
 use crate::merkle::{Proof as LeafProof, Tree};
+use crate::utils;
 use anyhow::{Result, anyhow};
 use primitive_types::{H256, U256};
-use sha2::Digest;
 use starkom_ff::{Field, Field256};
 use starkom_poly::Polynomial;
 use std::collections::{BTreeMap, BTreeSet};
@@ -14,25 +14,14 @@ use std::sync::LazyLock;
 pub const LAMBDA: usize = 128;
 
 /// Domain separator tag used by [`Committer::transcript_hash`].
-static TRANSCRIPT_DST: LazyLock<H256> = LazyLock::new(|| {
-    let mut hasher = sha3::Sha3_256::new();
-    hasher.update(b"starkom/deep/transcript");
-    H256::from_slice(hasher.finalize().as_slice())
-});
+static TRANSCRIPT_DST: LazyLock<H256> =
+    LazyLock::new(|| utils::make_dst(b"starkom/deep/transcript"));
 
 /// Domain separator tag for the Fiat-Shamir challenge used to derive query indices.
-static QUERY_DST: LazyLock<H256> = LazyLock::new(|| {
-    let mut hasher = sha3::Sha3_256::new();
-    hasher.update(b"starkom/deep/query");
-    H256::from_slice(hasher.finalize().as_slice())
-});
+static QUERY_DST: LazyLock<H256> = LazyLock::new(|| utils::make_dst(b"starkom/deep/query"));
 
 /// Domain separator tag for the Fiat-Shamir challenge used to build the random linear combination.
-static RLC_DST: LazyLock<H256> = LazyLock::new(|| {
-    let mut hasher = sha3::Sha3_256::new();
-    hasher.update(b"starkom/deep/rlc");
-    H256::from_slice(hasher.finalize().as_slice())
-});
+static RLC_DST: LazyLock<H256> = LazyLock::new(|| utils::make_dst(b"starkom/deep/rlc"));
 
 /// Returns the number of FRI queries required to achieve 128-bit security using a blowup factor of
 /// `2^blowup_log2`.

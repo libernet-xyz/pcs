@@ -5,6 +5,7 @@
 
 mod deep;
 mod merkle;
+mod utils;
 
 pub mod fri;
 pub mod hash;
