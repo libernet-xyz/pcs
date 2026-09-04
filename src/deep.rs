@@ -565,7 +565,7 @@ impl<F: Field256, H: Hasher<F>> Prover<F, H> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hash::Sha2Hash;
+    use crate::hash::{Keccak256Hash, Sha2Hash};
     use starkom_bluesky::Scalar as BS;
     use starkom_goldilocks::GL4;
 
@@ -708,6 +708,18 @@ mod tests {
             degree_bound,
             3,
         );
+        test_prover_impl::<BS, Keccak256Hash<BS>>(
+            bluesky_polynomial_batches.clone(),
+            points,
+            degree_bound,
+            2,
+        );
+        test_prover_impl::<GL4, Keccak256Hash<GL4>>(
+            goldilocks_polynomial_batches.clone(),
+            points,
+            degree_bound,
+            2,
+        );
     }
 
     #[test]
@@ -836,5 +848,123 @@ mod tests {
             &[456, 789],
             4,
         );
+    }
+
+    const ADVERSARIAL_DEGREE_BOUND: usize = 4;
+    const ADVERSARIAL_BLOWUP_LOG2: usize = 2;
+
+    fn polynomial(coefficients: &[u16]) -> Polynomial<BS> {
+        Polynomial::with_coefficients(coefficients.iter().copied().map(BS::from).collect())
+    }
+
+    fn adversarial_setup() -> (Commitment<BS, Sha2Hash<BS>>, Proof<BS, Sha2Hash<BS>>) {
+        let mut committer = Committer::<BS, Sha2Hash<BS>>::new(
+            ADVERSARIAL_DEGREE_BOUND,
+            ADVERSARIAL_BLOWUP_LOG2,
+            vec![polynomial(&[12, 34, 56, 78]), polynomial(&[42, 43, 44, 45])],
+        );
+        committer.add_batch(vec![polynomial(&[90, 78, 56, 34])]);
+        let (commitment, prover) =
+            committer.commit(BTreeSet::from([BS::from(123u16), BS::from(456u16)]));
+        let proof = prover.prove(&commitment);
+        (commitment, proof)
+    }
+
+    fn assert_rejected(result: Result<()>, expected: &str) {
+        let error = result
+            .expect_err("the tampered proof was accepted")
+            .to_string();
+        assert!(error.contains(expected), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn test_accept_untampered_proof() {
+        let (commitment, proof) = adversarial_setup();
+        assert!(proof.verify(&commitment).is_ok());
+    }
+
+    #[test]
+    fn test_reject_on_domain_point() {
+        let (commitment, mut proof) = adversarial_setup();
+        let values = proof.points.values().next().unwrap().clone();
+        let on_domain = Polynomial::<BS>::coset_element2(0, proof.extended_domain_size());
+        proof.points = BTreeMap::from([(on_domain, values)]);
+        assert_rejected(proof.verify(&commitment), "is inside the evaluation domain");
+    }
+
+    #[test]
+    fn test_reject_tampered_evaluation() {
+        let (commitment, mut proof) = adversarial_setup();
+        let z = *proof.points.keys().next().unwrap();
+        proof.points.get_mut(&z).unwrap()[0] += BS::ONE;
+        assert_rejected(proof.verify(&commitment), "algebraic check failed");
+    }
+
+    #[test]
+    fn test_reject_foreign_commitment() {
+        let (_, proof) = adversarial_setup();
+        let committer = Committer::<BS, Sha2Hash<BS>>::new(
+            ADVERSARIAL_DEGREE_BOUND,
+            ADVERSARIAL_BLOWUP_LOG2,
+            vec![polynomial(&[99, 98, 97, 96])],
+        );
+        let (foreign, _) = committer.commit(BTreeSet::from([BS::from(123u16)]));
+        assert_rejected(proof.verify(&foreign), "wrong query index");
+    }
+
+    #[test]
+    fn test_reject_missing_query() {
+        let (commitment, mut proof) = adversarial_setup();
+        proof.queries.pop();
+        assert_rejected(proof.verify(&commitment), "incorrect number of queries");
+    }
+
+    #[test]
+    fn test_reject_missing_openings() {
+        let (commitment, mut proof) = adversarial_setup();
+        proof.openings.pop();
+        assert_rejected(proof.verify(&commitment), "incorrect number of openings");
+    }
+
+    #[test]
+    fn test_reject_missing_opening_within_query() {
+        let (commitment, mut proof) = adversarial_setup();
+        proof.openings[0].pop();
+        assert_rejected(
+            proof.verify(&commitment),
+            "incorrect number of openings for index",
+        );
+    }
+
+    #[test]
+    fn test_reject_swapped_openings() {
+        let (commitment, mut proof) = adversarial_setup();
+        proof.openings.swap(0, 1);
+        assert_rejected(proof.verify(&commitment), "root hash mismatch");
+    }
+
+    #[test]
+    fn test_reject_extra_point() {
+        let (commitment, mut proof) = adversarial_setup();
+        let values = proof.points.values().next().unwrap().clone();
+        proof.points.insert(BS::from(789u16), values);
+        assert_rejected(
+            proof.verify(&commitment),
+            "doesn't match the number of FRI quotients",
+        );
+    }
+
+    #[test]
+    fn test_reject_opening_from_wrong_domain() {
+        let (commitment, mut proof) = adversarial_setup();
+        let committer = Committer::<BS, Sha2Hash<BS>>::new(
+            ADVERSARIAL_DEGREE_BOUND * 2,
+            ADVERSARIAL_BLOWUP_LOG2,
+            vec![polynomial(&[11, 22, 33, 44])],
+        );
+        let (other_commitment, other_prover) = committer.commit(BTreeSet::from([BS::from(123u16)]));
+        let mut other_proof = other_prover.prove(&other_commitment);
+        proof.openings[0][0] = other_proof.openings[0].remove(0);
+        assert_rejected(proof.verify(&commitment), "invalid opening for index");
     }
 }

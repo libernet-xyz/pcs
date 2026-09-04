@@ -747,4 +747,53 @@ mod tests {
             parse("0x763ae7db144ceade048b6f96efb13975cefa9cd9874fe57469ff8e1f6cff2512"),
         );
     }
+
+    fn test_query_roundtrip<F: Field256, H: Hasher<F>>(evaluations: Vec<Vec<F>>) {
+        let n = evaluations[0].len();
+        assert!(n > 1);
+        let tree = Tree::<F, H>::new(evaluations);
+        let root_hash = tree.root_hash();
+        for i in 0..n {
+            let proof = tree.query(i);
+            assert_eq!(proof.len(), n.trailing_zeros() as usize);
+            assert!(proof.verify(i, root_hash).is_ok(), "leaf {i} failed to verify");
+            for j in 0..n {
+                if j != i {
+                    assert!(
+                        proof.verify(j, root_hash).is_err(),
+                        "the proof for leaf {i} also verified at index {j}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_query_roundtrip_four_leaves() {
+        let values: Vec<Vec<u16>> = vec![vec![12, 34, 56, 78], vec![90, 12, 34, 56]];
+        test_query_roundtrip::<BS, Sha2Hash<BS>>(convert(&values));
+        test_query_roundtrip::<BS, Keccak256Hash<BS>>(convert(&values));
+        test_query_roundtrip::<GL4, Sha2Hash<GL4>>(convert(&values));
+        test_query_roundtrip::<GL4, Keccak256Hash<GL4>>(convert(&values));
+    }
+
+    #[test]
+    fn test_query_roundtrip_eight_leaves() {
+        let values: Vec<Vec<u16>> = vec![
+            vec![12, 34, 56, 78, 90, 12, 34, 56],
+            vec![42, 43, 44, 45, 46, 47, 48, 49],
+            vec![78, 56, 34, 12, 90, 78, 56, 34],
+        ];
+        test_query_roundtrip::<BS, Sha2Hash<BS>>(convert(&values));
+        test_query_roundtrip::<BS, Keccak256Hash<BS>>(convert(&values));
+        test_query_roundtrip::<GL4, Sha2Hash<GL4>>(convert(&values));
+        test_query_roundtrip::<GL4, Keccak256Hash<GL4>>(convert(&values));
+    }
+
+    fn convert<F: Field>(values: &[Vec<u16>]) -> Vec<Vec<F>> {
+        values
+            .iter()
+            .map(|row| row.iter().copied().map(from_const).collect())
+            .collect()
+    }
 }
