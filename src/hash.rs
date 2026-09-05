@@ -176,7 +176,7 @@ pub type Sha2Hash<F> = internal::HasherImpl<internal::LowLevelSha2Hash, F>;
 /// Keccak-256 hash backend.
 pub type Keccak256Hash<F> = internal::HasherImpl<internal::LowLevelKeccak256Hash, F>;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "bluesky", feature = "goldilocks"))]
 mod tests {
     use super::*;
     use starkom_bluesky::Scalar as BS;

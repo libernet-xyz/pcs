@@ -260,7 +260,7 @@ impl<F: Field256, H: Hasher<F>> Tree<F, H> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "bluesky", feature = "goldilocks"))]
 mod tests {
     use super::*;
     use crate::hash::{Keccak256Hash, Sha2Hash};
@@ -756,7 +756,10 @@ mod tests {
         for i in 0..n {
             let proof = tree.query(i);
             assert_eq!(proof.len(), n.trailing_zeros() as usize);
-            assert!(proof.verify(i, root_hash).is_ok(), "leaf {i} failed to verify");
+            assert!(
+                proof.verify(i, root_hash).is_ok(),
+                "leaf {i} failed to verify"
+            );
             for j in 0..n {
                 if j != i {
                     assert!(
