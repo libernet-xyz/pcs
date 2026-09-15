@@ -550,7 +550,7 @@ dependencies = [
 
 [[package]]
 name = "starkom-pcs"
-version = "6.0.1"
+version = "6.0.2"
 dependencies = [
  "anyhow",
  "primitive-types",
@@ -562,6 +562,7 @@ dependencies = [
  "starkom-poly",
  "starkom-poseidon",
  "starkom-poseidon2",
+ "starkom-schraderbrau",
 ]
 
 [[package]]
@@ -576,28 +577,45 @@ dependencies = [
 
 [[package]]
 name = "starkom-poseidon"
-version = "3.6.0"
+version = "3.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8804121433dee847670cc02c33e61ab557922bb666f0750663440a80269b871f"
+checksum = "7ce8b6255f56f72205fcfa296d820565b652d3c97c9c9919c697b957ec3be6b8"
 dependencies = [
  "anyhow",
  "primitive-types",
  "starkom-bluesky",
  "starkom-ff",
  "starkom-goldilocks",
+ "starkom-schraderbrau",
 ]
 
 [[package]]
 name = "starkom-poseidon2"
-version = "6.7.0"
+version = "6.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a03c6ce0fffc28aa38ba803985a194de0bcb04b1442f1b35d0e69c468dfd23f7"
+checksum = "f0d49b8f2c52b393bd45d4d8f01f947a6f779e057c86a3a0067ed15dee5caab7"
 dependencies = [
  "anyhow",
  "primitive-types",
  "starkom-bluesky",
  "starkom-ff",
  "starkom-goldilocks",
+ "starkom-schraderbrau",
+]
+
+[[package]]
+name = "starkom-schraderbrau"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0de61a35319c7fc513315d64e8029dceee0ec4054e450f2e3df471f7d171814"
+dependencies = [
+ "anyhow",
+ "getrandom 0.2.17",
+ "getrandom 0.4.3",
+ "primitive-types",
+ "rand_core 0.10.1",
+ "starkom-ff",
+ "subtle",
 ]
 
 [[package]]
