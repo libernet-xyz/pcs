@@ -1,6 +1,6 @@
 [package]
 name = "starkom-pcs"
-version = "6.0.2"
+version = "6.0.3"
 description = "The DEEP-FRI polynomial commitment scheme used in Starkom."
 license = "Apache-2.0"
 repository = "https://github.com/libernet-xyz/pcs.git"
@@ -30,4 +30,4 @@ starkom-schraderbrau = { version = "1.0.0", optional = true }
 default = []
 bluesky = ["starkom-bluesky", "starkom-poseidon/bluesky", "starkom-poseidon2/bluesky"]
 goldilocks = ["starkom-goldilocks", "starkom-poseidon/goldilocks", "starkom-poseidon2/goldilocks"]
-shraderbrau = ["starkom-schraderbrau", "starkom-poseidon/schraderbrau", "starkom-poseidon2/schraderbrau"]
+schraderbrau = ["starkom-schraderbrau", "starkom-poseidon/schraderbrau", "starkom-poseidon2/schraderbrau"]
