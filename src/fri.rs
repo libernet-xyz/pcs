@@ -134,7 +134,7 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
     /// element by [`starkom_ff::Field::MULTIPLICATIVE_GENERATOR`], consistently with
     /// `shift_domain`.
     pub fn x(&self) -> F {
-        Polynomial::<F>::coset_element2(self.index, self.degree_bound << self.blowup_log2)
+        Polynomial::<F>::coset_element2(self.index, self.degree_bound << self.blowup_log2).into()
     }
 
     /// Returns the opened evaluations, one for every committed polynomial.
