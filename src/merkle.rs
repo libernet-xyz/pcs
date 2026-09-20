@@ -35,13 +35,17 @@ fn get_leaf_dst<F: Field>() -> F {
 /// Our Merkle trees have vectors of values as leaves (there's one element for every committed
 /// polynomial so that we can commit multiple polynomials into the same tree), so the input `values`
 /// parameter is a slice of scalar values.
+///
+/// `dst` is the leaf DST returned by [`get_leaf_dst`], which the caller is expected to look up once
+/// rather than once per leaf.
 fn hash_leaf<F: Field256, H: Hasher<F>>(
+    dst: F,
     values: impl IntoIterator<Item = F, IntoIter: ExactSizeIterator>,
 ) -> H256 {
     let values = values.into_iter();
     let count = F::try_from(values.len()).unwrap();
     H::hash(
-        std::iter::once(get_leaf_dst::<F>())
+        std::iter::once(dst)
             .chain(std::iter::once(count))
             .chain(values),
     )
@@ -116,7 +120,7 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
 
     /// Verifies the proof against the given root hash.
     pub(crate) fn verify(&self, mut index: usize, root_hash: H256) -> Result<()> {
-        let mut hash = hash_leaf::<F, H>(self.leaf.iter().copied());
+        let mut hash = hash_leaf::<F, H>(get_leaf_dst::<F>(), self.leaf.iter().copied());
         for &sibling in &self.path {
             hash = if index & 1 != 0 {
                 H::hash_binary(sibling, hash)
@@ -146,7 +150,7 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
     /// Note that some polynomials may collapse earlier than others, and this function returns false
     /// if one or more haven't collapsed yet. So it returns true if and only if all have collapsed.
     pub(crate) fn is_constant(&self) -> bool {
-        let mut hash = hash_leaf::<F, H>(self.leaf.iter().copied());
+        let mut hash = hash_leaf::<F, H>(get_leaf_dst::<F>(), self.leaf.iter().copied());
         for &sibling in &self.path {
             if sibling != hash {
                 return false;
@@ -193,8 +197,9 @@ impl<F: Field256, H: Hasher<F>> Tree<F, H> {
         assert!(n.is_power_of_two());
         assert!(polynomials.iter().all(|polynomial| polynomial.len() == n));
         let mut hashes = vec![H256::default(); n * 2 - 1];
+        let dst = get_leaf_dst::<F>();
         for i in 0..n {
-            hashes[i] = hash_leaf::<F, H>(polynomials.iter().map(|polynomial| polynomial[i]));
+            hashes[i] = hash_leaf::<F, H>(dst, polynomials.iter().map(|polynomial| polynomial[i]));
         }
         merklify::<H>(hashes.as_mut_slice(), n);
         Self {
@@ -292,15 +297,18 @@ mod tests {
     #[test]
     fn test_hash_leaf_sha2_bluesky() {
         assert_eq!(
-            hash_leaf::<BS, Sha2Hash<BS>>([from_const(12)]),
+            hash_leaf::<BS, Sha2Hash<BS>>(get_leaf_dst::<BS>(), [from_const(12)]),
             parse("0x0bd187bc3deea1ef6c2a9ae254cf4e493f1dbbda32c79a662fc1d8437ab7e7c6")
         );
         assert_eq!(
-            hash_leaf::<BS, Sha2Hash<BS>>([from_const(34), from_const(56)]),
+            hash_leaf::<BS, Sha2Hash<BS>>(get_leaf_dst::<BS>(), [from_const(34), from_const(56)]),
             parse("0xbcd7235ceb553ca6682fd2df813650cad056a20fd6c76e1e04ae9f6a248c6c02")
         );
         assert_eq!(
-            hash_leaf::<BS, Sha2Hash<BS>>([from_const(78), from_const(90), from_const(12)]),
+            hash_leaf::<BS, Sha2Hash<BS>>(
+                get_leaf_dst::<BS>(),
+                [from_const(78), from_const(90), from_const(12)]
+            ),
             parse("0xeb8b9e0099332552744b9111d5a478dc61b231407d6c776586a50a3fc4513ca4")
         );
     }
@@ -308,15 +316,21 @@ mod tests {
     #[test]
     fn test_hash_leaf_sha2_goldilocks() {
         assert_eq!(
-            hash_leaf::<GL4, Sha2Hash<GL4>>([from_const(12)]),
+            hash_leaf::<GL4, Sha2Hash<GL4>>(get_leaf_dst::<GL4>(), [from_const(12)]),
             parse("0x35b8c46b2ddc91d8b6bf3a5f5c53be0fb8856ea801986a278693d6c5f0233c59")
         );
         assert_eq!(
-            hash_leaf::<GL4, Sha2Hash<GL4>>([from_const(34), from_const(56)]),
+            hash_leaf::<GL4, Sha2Hash<GL4>>(
+                get_leaf_dst::<GL4>(),
+                [from_const(34), from_const(56)]
+            ),
             parse("0x16b937b4393988c76386bb0fbda2ade97c28ec6b6f4d4aa49ce61fece35a48ec")
         );
         assert_eq!(
-            hash_leaf::<GL4, Sha2Hash<GL4>>([from_const(78), from_const(90), from_const(12)]),
+            hash_leaf::<GL4, Sha2Hash<GL4>>(
+                get_leaf_dst::<GL4>(),
+                [from_const(78), from_const(90), from_const(12)]
+            ),
             parse("0x36b7284c5d4b93f9a4d75343ca68866fbb39c773ff956a6ae9d7f7552a7a7051")
         );
     }
@@ -324,15 +338,21 @@ mod tests {
     #[test]
     fn test_hash_leaf_keccak256_bluesky() {
         assert_eq!(
-            hash_leaf::<BS, Keccak256Hash<BS>>([from_const(12)]),
+            hash_leaf::<BS, Keccak256Hash<BS>>(get_leaf_dst::<BS>(), [from_const(12)]),
             parse("0x5e70242e081756f445b5f3048611464568002e68800238dcfef718504de01782")
         );
         assert_eq!(
-            hash_leaf::<BS, Keccak256Hash<BS>>([from_const(34), from_const(56)]),
+            hash_leaf::<BS, Keccak256Hash<BS>>(
+                get_leaf_dst::<BS>(),
+                [from_const(34), from_const(56)]
+            ),
             parse("0x6cbf9a3af9793caffe8c509dfaccf0198e833cafa8eb83a0a7d57ce35a97dbd1")
         );
         assert_eq!(
-            hash_leaf::<BS, Keccak256Hash<BS>>([from_const(78), from_const(90), from_const(12)]),
+            hash_leaf::<BS, Keccak256Hash<BS>>(
+                get_leaf_dst::<BS>(),
+                [from_const(78), from_const(90), from_const(12)]
+            ),
             parse("0x05ce2ee03a570540c8a67a9b5a419dc7813922da6a39dff3c293806ed0f88fbb")
         );
     }
@@ -340,15 +360,21 @@ mod tests {
     #[test]
     fn test_hash_leaf_keccak256_goldilocks() {
         assert_eq!(
-            hash_leaf::<GL4, Keccak256Hash<GL4>>([from_const(12)]),
+            hash_leaf::<GL4, Keccak256Hash<GL4>>(get_leaf_dst::<GL4>(), [from_const(12)]),
             parse("0x0582d9f0e3652d6cef9c301b16fbff366dd1e8910befbc7f991cf7a4862574d3")
         );
         assert_eq!(
-            hash_leaf::<GL4, Keccak256Hash<GL4>>([from_const(34), from_const(56)]),
+            hash_leaf::<GL4, Keccak256Hash<GL4>>(
+                get_leaf_dst::<GL4>(),
+                [from_const(34), from_const(56)]
+            ),
             parse("0x0c8448a67efe90928470801e2b75ece4fb838f232ae4bb79e361b1bb97813dbd")
         );
         assert_eq!(
-            hash_leaf::<GL4, Keccak256Hash<GL4>>([from_const(78), from_const(90), from_const(12)]),
+            hash_leaf::<GL4, Keccak256Hash<GL4>>(
+                get_leaf_dst::<GL4>(),
+                [from_const(78), from_const(90), from_const(12)]
+            ),
             parse("0x48769fec704d28d0747b4bd8cd4fdef4025dfbfc9afb301f0bec283e9c0a6e6d")
         );
     }

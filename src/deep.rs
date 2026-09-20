@@ -47,7 +47,7 @@ fn check_points_off_domain<F: Field256>(
     points: impl IntoIterator<Item = F>,
     n: usize,
 ) -> Result<()> {
-    let marker = F::MULTIPLICATIVE_GENERATOR.pow_small(n);
+    let marker: F = F::BaseField::MULTIPLICATIVE_GENERATOR.pow_small(n).into();
     for z in points {
         if z.pow_small(n) == marker {
             return Err(anyhow!(
@@ -170,7 +170,7 @@ impl<F: Field256, H: Hasher<F>> Committer<F, H> {
     /// We require specifying the first batch because our DEEP-FRI protocol requires at least one
     /// committed polynomial to work.
     ///
-    /// `degree_bound` must be a power of 2 less than or equal to 2^[F::S](`Field::S`), and
+    /// `degree_bound` must be a power of 2 less than or equal to `2^(F::BaseField::S)`, and
     /// `blowup_log2` must not be zero.
     pub fn new(degree_bound: usize, blowup_log2: usize, polynomials: Vec<Polynomial<F>>) -> Self {
         assert!(degree_bound.is_power_of_two());
@@ -245,7 +245,7 @@ impl<F: Field256, H: Hasher<F>> Committer<F, H> {
             .next_power_of_two();
         assert!(degree_bound <= self.degree_bound);
         let n = self.degree_bound << self.blowup_log2;
-        assert!(n.trailing_zeros() as usize <= F::S);
+        assert!(n.trailing_zeros() as usize <= F::BaseField::S);
 
         let evaluations = polynomials
             .iter()
@@ -269,26 +269,6 @@ impl<F: Field256, H: Hasher<F>> Committer<F, H> {
     pub fn commit(self, points: BTreeSet<F>) -> (Commitment<F, H>, Prover<F, H>) {
         check_points_off_domain(points.iter().copied(), self.extended_domain_size()).unwrap();
 
-        let alpha = H::challenge(
-            *RLC_DST,
-            std::iter::once(encode_usize(self.trees.len()))
-                .chain(self.trees.iter().map(Tree::root_hash))
-                .chain(std::iter::once(encode_usize(self.polynomials.len())))
-                .chain(std::iter::once(encode_usize(points.len())))
-                .chain(points.iter().flat_map(|&z| {
-                    std::iter::once(z)
-                        .chain(
-                            self.polynomials
-                                .iter()
-                                .map(|polynomial| polynomial.evaluate(z)),
-                        )
-                        .map(|value| H256::from_slice(&value.to_be_bytes()))
-                        .collect::<Vec<H256>>()
-                }))
-                .collect::<Vec<H256>>()
-                .as_slice(),
-        );
-
         let points: BTreeMap<F, Vec<F>> = points
             .iter()
             .map(|&z| {
@@ -301,6 +281,21 @@ impl<F: Field256, H: Hasher<F>> Committer<F, H> {
                 )
             })
             .collect();
+
+        let alpha = H::challenge(
+            *RLC_DST,
+            std::iter::once(encode_usize(self.trees.len()))
+                .chain(self.trees.iter().map(Tree::root_hash))
+                .chain(std::iter::once(encode_usize(self.polynomials.len())))
+                .chain(std::iter::once(encode_usize(points.len())))
+                .chain(points.iter().flat_map(|(z, values)| {
+                    std::iter::once(z)
+                        .chain(values.iter())
+                        .map(|value| H256::from_slice(&value.to_be_bytes()))
+                }))
+                .collect::<Vec<H256>>()
+                .as_slice(),
+        );
 
         let combined = {
             let mut combined = Polynomial::default();
