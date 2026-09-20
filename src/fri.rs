@@ -3,7 +3,7 @@ use crate::merkle::{Proof as LeafProof, Tree};
 use crate::utils;
 use anyhow::{Result, anyhow};
 use primitive_types::H256;
-use starkom_ff::Field256;
+use starkom_ff::{Field, Field256};
 use starkom_poly::Polynomial;
 use std::sync::LazyLock;
 
@@ -31,18 +31,19 @@ impl<F: Field256, H: Hasher<F>> FoldableTree<F, H> for Tree<F, H> {
 
         let alpha = H::challenge(*FOLD_DST, &[self.root_hash()]);
 
-        let k = n.trailing_zeros() as usize;
-        let omega_inv = F::ROOT_OF_UNITY_INV.pow_u64(1u64 << (F::S - k));
+        let omega_inv = Polynomial::<F>::domain_element2(1, n).invert_unwrap();
 
         let m = n / 2;
-        let mut omega_inv_i = F::ONE;
+        let mut omega_inv_i = F::BaseField::ONE;
 
         let mut leaves = vec![vec![F::ZERO; m]; num_polys];
         for i in 0..m {
+            let alpha_omega_inv_i = alpha * omega_inv_i;
             for j in 0..num_polys {
                 let pos = self.leaf_value(j, i);
                 let neg = self.leaf_value(j, i + m);
-                leaves[j][i] = (pos + neg + alpha * omega_inv_i * (pos - neg)) * F::TWO_INV;
+                leaves[j][i] =
+                    (pos + neg + alpha_omega_inv_i * (pos - neg)) * F::BaseField::TWO_INV;
             }
             omega_inv_i *= omega_inv;
         }
@@ -131,8 +132,8 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
     /// Note that we use [`Polynomial::shift_domain`] before committing polynomials, so the element
     /// returned here is a shifted power of an N-th root of unity, with
     /// `N = degree_bound * 2^blowup_factor`. The shift consists of multiplying the actual domain
-    /// element by [`starkom_ff::Field::MULTIPLICATIVE_GENERATOR`], consistently with
-    /// `shift_domain`.
+    /// element by the [`MULTIPLICATIVE_GENERATOR`](`Field::MULTIPLICATIVE_GENERATOR`) of the *base*
+    /// field, consistently with `shift_domain`.
     pub fn x(&self) -> F {
         Polynomial::<F>::coset_element2(self.index, self.degree_bound << self.blowup_log2).into()
     }
@@ -178,7 +179,7 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
 
         let mut index = self.index;
         let mut pos = self.folds[0].0.leaf().to_vec();
-        let mut step = F::ROOT_OF_UNITY_INV.pow_u64(1u64 << (F::S - k));
+        let mut step = Polynomial::<F>::domain_element2(1, n).invert_unwrap();
 
         for round in 0..num_folds {
             let root_hash = commitment.roots()[round];
@@ -210,8 +211,10 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
 
             let neg = right.leaf();
             let alpha = H::challenge(*FOLD_DST, &[root_hash]);
+            let alpha_omega_inv = alpha * omega_inv;
             for i in 0..pos.len() {
-                pos[i] = (pos[i] + neg[i] + alpha * omega_inv * (pos[i] - neg[i])) * F::TWO_INV;
+                pos[i] =
+                    (pos[i] + neg[i] + alpha_omega_inv * (pos[i] - neg[i])) * F::BaseField::TWO_INV;
             }
             step = step.square();
         }
@@ -253,7 +256,7 @@ impl<F: Field256, H: Hasher<F>> Prover<F, H> {
         assert!(blowup_log2 > 0);
 
         let n = degree_bound << blowup_log2;
-        assert!(n as u64 <= 1u64 << F::S);
+        assert!(n as u64 <= 1u64 << F::BaseField::S);
 
         let main_tree = Tree::<F, H>::new(
             polynomials
