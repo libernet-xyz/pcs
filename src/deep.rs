@@ -28,7 +28,7 @@ static RLC_DST: LazyLock<H256> = LazyLock::new(|| utils::make_dst(b"starkom/deep
 
 /// Returns the number of FRI queries required to achieve 128-bit security using a blowup factor of
 /// `2^blowup_log2`.
-fn num_queries(blowup_log2: usize) -> usize {
+pub fn num_queries(blowup_log2: usize) -> usize {
     LAMBDA.div_ceil(blowup_log2)
 }
 
