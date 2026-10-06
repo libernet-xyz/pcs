@@ -600,32 +600,30 @@ mod tests {
     use crate::hash::{Keccak256Hash, Sha2Hash};
     use starkom_bluesky::Scalar as BS;
     use starkom_goldilocks::GL4;
+    use std::fmt::Debug;
+    use std::str::FromStr;
+
+    fn parse<V: FromStr<Err: Debug>>(s: &'static str) -> V {
+        s.parse().unwrap()
+    }
 
     #[test]
     fn test_dsts() {
         assert_eq!(
             *TRANSCRIPT_DST,
-            "0x09f36235476a658841de9bcdd34e1ac31ec792e41def5de31aecb4eb3bb1816b"
-                .parse()
-                .unwrap()
+            parse("0x09f36235476a658841de9bcdd34e1ac31ec792e41def5de31aecb4eb3bb1816b")
         );
         assert_eq!(
             *QUERY_DST0,
-            "0xbbec7289b9fc3aade75412c031b62a769b205d1d73b29c9a06dbb91943e046bc"
-                .parse()
-                .unwrap()
+            parse("0xbbec7289b9fc3aade75412c031b62a769b205d1d73b29c9a06dbb91943e046bc")
         );
         assert_eq!(
             *QUERY_DST1,
-            "0x88209086b178c9f2fb9c2f813cd229e1a2528cb4f5e6cd618710dc9869f14ac5"
-                .parse()
-                .unwrap()
+            parse("0x88209086b178c9f2fb9c2f813cd229e1a2528cb4f5e6cd618710dc9869f14ac5")
         );
         assert_eq!(
             *RLC_DST,
-            "0x688ae37e5f05871810e7c6777e1c16c55ef4b14f072357586d7a298cefc11368"
-                .parse()
-                .unwrap()
+            parse("0x688ae37e5f05871810e7c6777e1c16c55ef4b14f072357586d7a298cefc11368")
         );
     }
 
@@ -998,5 +996,50 @@ mod tests {
         let mut other_proof = other_prover.prove(&other_commitment);
         proof.openings[0][0] = other_proof.openings[0].remove(0);
         assert_rejected(proof.verify(&commitment), "invalid opening for index");
+    }
+
+    #[test]
+    fn test_commitment_serialization() {
+        let mut committer = Committer::<BS, Sha2Hash<BS>>::new(
+            4,
+            1,
+            vec![polynomial(&[12, 34, 56, 78]), polynomial(&[42, 43, 44, 45])],
+        );
+        committer.add_batch(vec![polynomial(&[90, 78, 56, 34])]);
+        let (commitment, _) =
+            committer.commit(BTreeSet::from([BS::from(123u16), BS::from(456u16)]));
+        assert_eq!(
+            commitment.tree_roots(),
+            [
+                parse("0xc47ed760edd5fc63ecb5c86240553f7e2fdabd0003ca62ab40d79e230ead9eb1"),
+                parse("0x13880d0002db3411382d144a40f86201f3b84b55c317bcb0b583f166100e8b37"),
+            ]
+        );
+        assert_eq!(
+            commitment.transcript_hash(1),
+            parse("0x8e58a20287b9d5f4743c73d0d57b2b1dcb5846f4b658d5463a393b0b44dafcfc")
+        );
+        assert_eq!(
+            commitment.transcript_hash(2),
+            parse("0x60d1b1e6e174c834b3ea7412cf09cdb5f3949f7b63f0c8f3f841b1cedc58c56a")
+        );
+        let proto = commitment.to_proto();
+        let commitment = Commitment::<BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
+        assert_eq!(commitment.degree_bound(), 4);
+        assert_eq!(
+            commitment.tree_roots(),
+            [
+                parse("0xc47ed760edd5fc63ecb5c86240553f7e2fdabd0003ca62ab40d79e230ead9eb1"),
+                parse("0x13880d0002db3411382d144a40f86201f3b84b55c317bcb0b583f166100e8b37"),
+            ]
+        );
+        assert_eq!(
+            commitment.transcript_hash(1),
+            parse("0x8e58a20287b9d5f4743c73d0d57b2b1dcb5846f4b658d5463a393b0b44dafcfc")
+        );
+        assert_eq!(
+            commitment.transcript_hash(2),
+            parse("0x60d1b1e6e174c834b3ea7412cf09cdb5f3949f7b63f0c8f3f841b1cedc58c56a")
+        );
     }
 }
