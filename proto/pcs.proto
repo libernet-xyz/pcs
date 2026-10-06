@@ -1,0 +1,89 @@
+syntax = "proto3";
+
+package starkom.proto.pcs.v6;
+
+// A batched DEEP-FRI polynomial commitment.
+message Commitment {
+    // Root hashes of the Merkle trees where the evaluations of all batched polynomials are stored.
+    // There is one root hash per polynomial batch.
+    repeated bytes tree_roots = 1;
+
+    // Merkle roots of the FRI folding argument.
+    //
+    // The first element is the root of the main Merkle tree, the second one is the root of the
+    // Merkle tree from the first folding round, and so on until the last element which is the value
+    // of the last folding round.
+    repeated bytes fri_roots = 2;
+}
+
+// A Merkle proof.
+//
+// The Merkle trees used in Starkom have vector leaves: each leaf is an array containing the
+// evaluations of one or more committed polynomials.
+message LeafProof {
+    // The evaluations of the batched polynomials at the domain location corresponding to this leaf.
+    repeated bytes leaf_values = 1;
+
+    // The leaf-to-root Merkle path, excluding the root hash.
+    //
+    // The root hash is not stored here because all root hashes are stored separately in the
+    // `Commitment` message.
+    //
+    // The first element of the array is the hash of the evaluations of the sibling leaf, the second
+    // element is the hash of the sibling of the parent node, and so on until the sibling of the
+    // child of the root.
+    repeated bytes merkle_path = 2;
+}
+
+// A FRI query.
+message Query {
+    // The index of the queries leaf.
+    uint64 index = 1;
+
+    // A pair of Merkle proofs resulting froma folding round.
+    message Fold {
+        LeafProof left = 1;
+        LeafProof right = 2;
+    }
+
+    // List of Merkle proofs resulting from the folding rounds.
+    repeated Fold folds = 2;
+}
+
+// A batched DEEP-FRI proof.
+message Proof {
+    // The proven degree bound. If the proof is valid the degree of all batched polynomials is
+    // guaranteed to be strictly less than this value.
+    uint64 degree_bound = 1;
+
+    // The base-2 logarithm of the blowup factor.
+    uint32 blowup_log2 = 2;
+
+    // Number of committed polynomials.
+    uint64 num_polys = 3;
+
+    // A point opened by the proof.
+    message Point {
+        // The (off-domain) X-coordinate of a proven opening.
+        bytes z = 1;
+
+        // Evaluations of every committed polynomial in `z`.
+        //
+        // This array must have exactly `num_polys` elements.
+        repeated bytes v = 2;
+    }
+
+    // The points opened by the proof.
+    repeated Point points = 4;
+
+    message Opening {
+        repeated LeafProof proofs = 1;
+    }
+
+    /// Merkle proofs for the points at the query positions, relative to the raw Merkle trees (not
+    /// the FRI folds). There's one entry for every FRI query (`openings.len() == queries.len()`).
+    repeated Opening openings = 5;
+
+    /// FRI queries on the DEEP quotients.
+    repeated Query queries = 6;
+}

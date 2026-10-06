@@ -1,6 +1,7 @@
 use crate::fri;
 use crate::hash::Hasher;
 use crate::merkle::{Proof as LeafProof, Tree};
+use crate::starkom::proto::pcs::v6 as proto;
 use crate::utils;
 use anyhow::{Result, anyhow};
 use primitive_types::{H256, U256};
@@ -137,6 +138,42 @@ impl<F: Field256, H: Hasher<F>> Commitment<F, H> {
             indices.push(index.as_u64() as usize);
         }
         indices
+    }
+
+    /// Serializes this commitment to a [`Commitment`](`proto::Commitment`) protobuf.
+    pub fn to_proto(&self) -> proto::Commitment {
+        proto::Commitment {
+            tree_roots: self
+                .tree_roots
+                .iter()
+                .map(|&hash| hash.as_bytes().to_vec())
+                .collect(),
+            fri_roots: self
+                .inner
+                .roots()
+                .iter()
+                .map(|&hash| hash.as_bytes().to_vec())
+                .collect(),
+        }
+    }
+
+    /// Deserializes a commitment from a [`Commitment`](`proto::Commitment`) protobuf.
+    pub fn from_proto(proto: &proto::Commitment) -> Result<Self> {
+        Ok(Self {
+            tree_roots: proto
+                .tree_roots
+                .iter()
+                .map(|bytes| utils::load_hash(bytes.as_slice()))
+                .collect::<Result<_>>()?,
+            inner: fri::Commitment::with_roots(
+                proto
+                    .fri_roots
+                    .iter()
+                    .map(|bytes| utils::load_hash(bytes.as_slice()))
+                    .collect::<Result<_>>()?,
+            ),
+            _data: PhantomData,
+        })
     }
 }
 

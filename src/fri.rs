@@ -79,6 +79,10 @@ pub struct Commitment {
 }
 
 impl Commitment {
+    pub(crate) fn with_roots(roots: Vec<H256>) -> Self {
+        Self { roots }
+    }
+
     /// Returns the number of stored roots, equivalent to the number of Merkle trees known to the
     /// prover. These would in turn include the base Merkle tree of the committed evaluations (over
     /// the extended domain) and one subsequent tree for every folding round. The number of folding

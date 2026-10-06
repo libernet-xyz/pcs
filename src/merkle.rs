@@ -1,4 +1,6 @@
 use crate::hash::{Hasher, MerkleHasher};
+use crate::starkom::proto::pcs::v6 as proto;
+use crate::utils;
 use anyhow::{Result, anyhow};
 use primitive_types::{H256, U256, U512};
 use sha2::Digest;
@@ -158,6 +160,39 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
             hash = H::hash_binary(hash, hash);
         }
         true
+    }
+
+    /// Serializes this Merkle proof to a [`LeafProof`](`proto::LeafProof`) protobuf.
+    pub fn to_proto(&self) -> proto::LeafProof {
+        proto::LeafProof {
+            leaf_values: self
+                .leaf
+                .iter()
+                .map(|&value| value.to_le_bytes().to_vec())
+                .collect(),
+            merkle_path: self
+                .path
+                .iter()
+                .map(|&hash| hash.as_bytes().to_vec())
+                .collect(),
+        }
+    }
+
+    /// Deserializes a Merkle proof from a [`LeafProof`](`proto::LeafProof`) protobuf.
+    pub fn from_proto(proto: &proto::LeafProof) -> Result<Self> {
+        Ok(Self {
+            leaf: proto
+                .leaf_values
+                .iter()
+                .map(|value| utils::load_scalar(value.as_slice()))
+                .collect::<Result<_>>()?,
+            path: proto
+                .merkle_path
+                .iter()
+                .map(|hash| utils::load_hash(hash.as_slice()))
+                .collect::<Result<_>>()?,
+            _data: PhantomData,
+        })
     }
 }
 
