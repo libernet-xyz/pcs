@@ -19,19 +19,14 @@ primitive-types = "0.14.0"
 prost = "0.14.4"
 sha2 = "0.11.0"
 sha3 = "0.12.0"
-starkom-bluesky = { version = "3.7.2", optional = true }
 starkom-ff = "4.1.0"
-starkom-goldilocks = { version = "3.3.0", optional = true }
 starkom-poly = "4.6.1"
 starkom-poseidon = "5.1.1"
 starkom-poseidon2 = "7.1.0"
-starkom-schraderbrau = { version = "1.1.1", optional = true }
 
-[features]
-default = []
-bluesky = ["starkom-bluesky", "starkom-poseidon/bluesky", "starkom-poseidon2/bluesky"]
-goldilocks = ["starkom-goldilocks", "starkom-poseidon/goldilocks", "starkom-poseidon2/goldilocks"]
-schraderbrau = ["starkom-schraderbrau", "starkom-poseidon/schraderbrau", "starkom-poseidon2/schraderbrau"]
+[dev-dependencies]
+starkom-bluesky = "3.7.2"
+starkom-goldilocks = "3.3.0"
 
 [build-dependencies]
 prost-build = "0.14.4"

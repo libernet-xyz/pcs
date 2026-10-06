@@ -594,7 +594,7 @@ impl<F: Field256, H: Hasher<F>> Prover<F, H> {
     }
 }
 
-#[cfg(all(test, feature = "bluesky", feature = "goldilocks"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::hash::{Keccak256Hash, Sha2Hash};
