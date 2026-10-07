@@ -45,6 +45,12 @@ message LeafProof {
 }
 
 // A FRI query.
+//
+// NOTE: the proven degree bound and the blowup factor are not stored here because all queries in a
+// proof refer to `Proof.degree_bound` and `Proof.blowup_log2`.
+//
+// NOTE: the number of evaluations in each contained `LeafProof` must match `Proof.num_polys` from
+// the containing proof.
 message Query {
     // The index of the queried leaf.
     uint64 index = 1;

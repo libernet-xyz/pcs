@@ -513,6 +513,78 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
 
         Ok(())
     }
+
+    /// Serializes this proof to a [`Proof`](`proto::Proof`) protobuf.
+    pub fn to_proto(&self) -> proto::Proof {
+        proto::Proof {
+            degree_bound: self.degree_bound as u64,
+            blowup_log2: self.blowup_log2 as u32,
+            num_polys: self.num_polys as u64,
+            points: self
+                .points
+                .iter()
+                .map(|(&z, values)| proto::proof::Point {
+                    z: z.to_le_bytes().to_vec(),
+                    v: values
+                        .iter()
+                        .map(|value| value.to_le_bytes().to_vec())
+                        .collect(),
+                })
+                .collect(),
+            openings: self
+                .openings
+                .iter()
+                .map(|proofs| proto::proof::Opening {
+                    proofs: proofs.iter().map(|proof| proof.to_proto()).collect(),
+                })
+                .collect(),
+            queries: self.queries.iter().map(|query| query.to_proto()).collect(),
+        }
+    }
+
+    /// Deserializes a proof from a [`Proof`](`proto::Proof`) protobuf.
+    ///
+    /// NOTE: this method does not validate the proof, it only deserializes it. The caller must
+    /// invoke [`Self::verify`] separately.
+    pub fn from_proto(proto: &proto::Proof) -> Result<Self> {
+        let degree_bound = proto.degree_bound as usize;
+        let blowup_log2 = proto.blowup_log2 as usize;
+        Ok(Self {
+            degree_bound,
+            blowup_log2,
+            num_polys: proto.num_polys as usize,
+            points: proto
+                .points
+                .iter()
+                .map(|point| {
+                    Ok((
+                        utils::load_scalar(point.z.as_slice())?,
+                        point
+                            .v
+                            .iter()
+                            .map(|value| utils::load_scalar(value.as_slice()))
+                            .collect::<Result<_>>()?,
+                    ))
+                })
+                .collect::<Result<_>>()?,
+            openings: proto
+                .openings
+                .iter()
+                .map(|opening| {
+                    opening
+                        .proofs
+                        .iter()
+                        .map(LeafProof::from_proto)
+                        .collect::<Result<_>>()
+                })
+                .collect::<Result<_>>()?,
+            queries: proto
+                .queries
+                .iter()
+                .map(|query| fri::Query::from_proto(degree_bound, blowup_log2, query))
+                .collect::<Result<_>>()?,
+        })
+    }
 }
 
 /// A DEEP-FRI prover.
@@ -1041,5 +1113,28 @@ mod tests {
             commitment.transcript_hash(2),
             parse("0x60d1b1e6e174c834b3ea7412cf09cdb5f3949f7b63f0c8f3f841b1cedc58c56a")
         );
+    }
+
+    #[test]
+    fn test_proof_serialization() {
+        let mut committer = Committer::<BS, Sha2Hash<BS>>::new(
+            4,
+            3,
+            vec![polynomial(&[12, 34, 56, 78]), polynomial(&[42, 43, 44, 45])],
+        );
+        committer.add_batch(vec![polynomial(&[90, 78, 56, 34])]);
+        let (commitment, prover) =
+            committer.commit(BTreeSet::from([BS::from(123u16), BS::from(456u16)]));
+        let proof = prover.prove(&commitment);
+        let proto = proof.to_proto();
+        let proof = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
+        assert_eq!(proof.degree_bound(), 4);
+        assert_eq!(proof.blowup_log2(), 3);
+        assert_eq!(proof.num_polys(), 3);
+        assert_eq!(
+            proof.points().keys().copied().collect::<BTreeSet<BS>>(),
+            BTreeSet::from([BS::from(123u16), BS::from(456u16)])
+        );
+        assert!(proof.verify(&commitment).is_ok());
     }
 }
