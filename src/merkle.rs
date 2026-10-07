@@ -1,4 +1,6 @@
 use crate::hash::{Hasher, MerkleHasher};
+use crate::starkom::proto::pcs::v6 as proto;
+use crate::utils;
 use anyhow::{Result, anyhow};
 use primitive_types::{H256, U256, U512};
 use sha2::Digest;
@@ -159,6 +161,42 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
         }
         true
     }
+
+    /// Serializes this Merkle proof to a [`LeafProof`](`proto::LeafProof`) protobuf.
+    pub(crate) fn to_proto(&self) -> proto::LeafProof {
+        proto::LeafProof {
+            leaf_values: self
+                .leaf
+                .iter()
+                .map(|&value| value.to_le_bytes().to_vec())
+                .collect(),
+            merkle_path: self
+                .path
+                .iter()
+                .map(|&hash| hash.as_bytes().to_vec())
+                .collect(),
+        }
+    }
+
+    /// Deserializes a Merkle proof from a [`LeafProof`](`proto::LeafProof`) protobuf.
+    ///
+    /// NOTE: this method does not validate the proof, it only deserializes it. The caller must
+    /// invoke [`Self::verify`] separately.
+    pub(crate) fn from_proto(proto: &proto::LeafProof) -> Result<Self> {
+        Ok(Self {
+            leaf: proto
+                .leaf_values
+                .iter()
+                .map(|value| utils::load_scalar(value.as_slice()))
+                .collect::<Result<_>>()?,
+            path: proto
+                .merkle_path
+                .iter()
+                .map(|hash| H::load_hash(hash.as_slice()))
+                .collect::<Result<_>>()?,
+            _data: PhantomData,
+        })
+    }
 }
 
 /// A Merkle tree whose leaves are multiple polynomial evaluations.
@@ -265,7 +303,7 @@ impl<F: Field256, H: Hasher<F>> Tree<F, H> {
     }
 }
 
-#[cfg(all(test, feature = "bluesky", feature = "goldilocks"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::hash::{Keccak256Hash, Sha2Hash};
@@ -774,6 +812,13 @@ mod tests {
         );
     }
 
+    fn convert<F: Field>(values: &[Vec<u16>]) -> Vec<Vec<F>> {
+        values
+            .iter()
+            .map(|row| row.iter().copied().map(from_const).collect())
+            .collect()
+    }
+
     fn test_query_roundtrip<F: Field256, H: Hasher<F>>(evaluations: Vec<Vec<F>>) {
         let n = evaluations[0].len();
         assert!(n > 1);
@@ -782,16 +827,10 @@ mod tests {
         for i in 0..n {
             let proof = tree.query(i);
             assert_eq!(proof.len(), n.trailing_zeros() as usize);
-            assert!(
-                proof.verify(i, root_hash).is_ok(),
-                "leaf {i} failed to verify"
-            );
+            assert!(proof.verify(i, root_hash).is_ok());
             for j in 0..n {
                 if j != i {
-                    assert!(
-                        proof.verify(j, root_hash).is_err(),
-                        "the proof for leaf {i} also verified at index {j}"
-                    );
+                    assert!(proof.verify(j, root_hash).is_err());
                 }
             }
         }
@@ -819,10 +858,27 @@ mod tests {
         test_query_roundtrip::<GL4, Keccak256Hash<GL4>>(convert(&values));
     }
 
-    fn convert<F: Field>(values: &[Vec<u16>]) -> Vec<Vec<F>> {
-        values
-            .iter()
-            .map(|row| row.iter().copied().map(from_const).collect())
-            .collect()
+    #[test]
+    fn test_serialization() {
+        let values: Vec<Vec<u16>> = vec![
+            vec![12, 34, 56, 78],
+            vec![90, 12, 34, 56],
+            vec![42, 43, 44, 45],
+        ];
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(convert(&values));
+        let proof = tree.query(2);
+        let proto = proof.to_proto();
+        let proof = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
+        assert_eq!(proof.len(), 2);
+        assert!(!proof.is_constant());
+        assert!(
+            proof
+                .check_leaf(&[from_const(56), from_const(34), from_const(44)])
+                .is_ok()
+        );
+        assert!(proof.verify(0, tree.root_hash()).is_err());
+        assert!(proof.verify(1, tree.root_hash()).is_err());
+        assert!(proof.verify(2, tree.root_hash()).is_ok());
+        assert!(proof.verify(3, tree.root_hash()).is_err());
     }
 }

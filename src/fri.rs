@@ -1,5 +1,6 @@
 use crate::hash::Hasher;
 use crate::merkle::{Proof as LeafProof, Tree};
+use crate::starkom::proto::pcs::v6 as proto;
 use crate::utils;
 use anyhow::{Result, anyhow};
 use primitive_types::H256;
@@ -79,6 +80,10 @@ pub struct Commitment {
 }
 
 impl Commitment {
+    pub(crate) fn with_roots(roots: Vec<H256>) -> Self {
+        Self { roots }
+    }
+
     /// Returns the number of stored roots, equivalent to the number of Merkle trees known to the
     /// prover. These would in turn include the base Merkle tree of the committed evaluations (over
     /// the extended domain) and one subsequent tree for every folding round. The number of folding
@@ -226,6 +231,47 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
 
         Ok(())
     }
+
+    /// Serializes this query to a [`Query`](`proto::Query`) protobuf.
+    pub fn to_proto(&self) -> proto::Query {
+        proto::Query {
+            index: self.index as u64,
+            folds: self
+                .folds
+                .iter()
+                .map(|(left, right)| proto::query::Fold {
+                    left: Some(left.to_proto()),
+                    right: Some(right.to_proto()),
+                })
+                .collect(),
+        }
+    }
+
+    /// Deserializes a query from a [`Query`](`proto::Query`) protobuf.
+    ///
+    /// NOTE: this method does not validate the proof, it only deserializes it. The caller must
+    /// invoke [`Self::verify`] separately.
+    pub fn from_proto(
+        degree_bound: usize,
+        blowup_log2: usize,
+        proto: &proto::Query,
+    ) -> Result<Self> {
+        Ok(Self {
+            degree_bound,
+            blowup_log2,
+            index: proto.index as usize,
+            folds: proto
+                .folds
+                .iter()
+                .map(|fold| match (&fold.left, &fold.right) {
+                    (Some(left), Some(right)) => {
+                        Ok((LeafProof::from_proto(left)?, LeafProof::from_proto(right)?))
+                    }
+                    _ => Err(anyhow!("missing FRI folds")),
+                })
+                .collect::<Result<_>>()?,
+        })
+    }
 }
 
 /// A FRI prover.
@@ -336,7 +382,7 @@ impl<F: Field256, H: Hasher<F>> Prover<F, H> {
     }
 }
 
-#[cfg(all(test, feature = "bluesky", feature = "goldilocks"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::hash::{Keccak256Hash, Sha2Hash};
@@ -619,5 +665,23 @@ mod tests {
         let mut other = prover.query(QUERY_INDEX + 4);
         query.folds[1].0 = other.folds.remove(1).0;
         assert_rejected(query.verify(&commitment), "leaf value mismatch");
+    }
+
+    #[test]
+    fn test_serialization() {
+        let polynomials: Vec<Polynomial<BS>> = vec![vec![12, 34, 56, 78], vec![42, 43, 44, 45]]
+            .into_iter()
+            .map(|values| {
+                Polynomial::encode2(values.into_iter().map(|value: u64| value.into()).collect())
+            })
+            .collect();
+        let prover = Prover::<BS, Sha2Hash<BS>>::new(polynomials, 4, 2);
+        let commitment = prover.commit();
+        let query = prover.query(2);
+        let proto = query.to_proto();
+        let query = Query::<BS, Sha2Hash<BS>>::from_proto(4, 2, &proto).unwrap();
+        assert_eq!(query.indices(), (2, 10));
+        assert_eq!(query.len(), 3);
+        assert!(query.verify(&commitment).is_ok());
     }
 }

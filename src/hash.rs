@@ -1,3 +1,4 @@
+use anyhow::{Result, anyhow};
 use primitive_types::{H256, U128, U256, U512};
 use sha2::Digest;
 use starkom_ff::Field256;
@@ -11,6 +12,14 @@ pub trait MerkleHasher {
 
     /// Hashes a ternary Merkle tree node.
     fn hash_ternary(children: [H256; 3]) -> H256;
+
+    /// Loads a hash from its serialized byte form.
+    ///
+    /// For the SHA2 and Keccak256 backends this function simply defers to [`H256::from_slice`], but
+    /// algebraic hash backends will also need to check that the encoded value is in range. For
+    /// example, a Poseidon backend over the BlueSky field will check that the value is strictly
+    /// less than `0x7ffffffffffffffffffffffffffffffe0673ddf29e9b5547c000000000000001`.
+    fn load_hash(bytes: &[u8]) -> Result<H256>;
 }
 
 /// Describes a hash backend for our proof system.
@@ -147,6 +156,16 @@ mod internal {
             hasher.update(children[2].as_bytes());
             hasher.finalize()
         }
+
+        fn load_hash(bytes: &[u8]) -> Result<H256> {
+            if bytes.len() != 32 {
+                return Err(anyhow!(
+                    "invalid hash length (expected 32, got {})",
+                    bytes.len()
+                ));
+            }
+            Ok(H256::from_slice(bytes))
+        }
     }
 
     impl<H: LowLevelHash, F: Field256> Hasher<F> for HasherImpl<H, F> {
@@ -176,7 +195,7 @@ pub type Sha2Hash<F> = internal::HasherImpl<internal::LowLevelSha2Hash, F>;
 /// Keccak-256 hash backend.
 pub type Keccak256Hash<F> = internal::HasherImpl<internal::LowLevelKeccak256Hash, F>;
 
-#[cfg(all(test, feature = "bluesky", feature = "goldilocks"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use starkom_bluesky::Scalar as BS;
@@ -334,6 +353,38 @@ mod tests {
     fn test_keccak256_hash_ternary() {
         test_keccak256_hash_ternary_impl::<BS>();
         test_keccak256_hash_ternary_impl::<GL4>();
+    }
+
+    #[test]
+    fn test_load_sha2_hash() {
+        let hash1: H256 = "0x8c313b317b2ff13ecf3abea4e59dad76b24a13e7b5b8fa10a939fc2ab1713175"
+            .parse()
+            .unwrap();
+        let hash2: H256 = "0x51c39e4b5287d491be2e02080c39493b77be8fd3d032227815357c5360e3d230"
+            .parse()
+            .unwrap();
+        assert_eq!(Sha2Hash::<BS>::load_hash(hash1.as_bytes()).unwrap(), hash1);
+        assert_eq!(Sha2Hash::<BS>::load_hash(hash2.as_bytes()).unwrap(), hash2);
+        assert!(Sha2Hash::<BS>::load_hash(&hash1.as_bytes()[0..31]).is_err());
+    }
+
+    #[test]
+    fn test_load_keccak256_hash() {
+        let hash1: H256 = "0x8c313b317b2ff13ecf3abea4e59dad76b24a13e7b5b8fa10a939fc2ab1713175"
+            .parse()
+            .unwrap();
+        let hash2: H256 = "0x51c39e4b5287d491be2e02080c39493b77be8fd3d032227815357c5360e3d230"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            Keccak256Hash::<BS>::load_hash(hash1.as_bytes()).unwrap(),
+            hash1
+        );
+        assert_eq!(
+            Keccak256Hash::<BS>::load_hash(hash2.as_bytes()).unwrap(),
+            hash2
+        );
+        assert!(Keccak256Hash::<BS>::load_hash(&hash1.as_bytes()[0..31]).is_err());
     }
 
     #[test]

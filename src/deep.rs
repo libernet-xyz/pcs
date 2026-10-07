@@ -1,6 +1,7 @@
 use crate::fri;
 use crate::hash::Hasher;
 use crate::merkle::{Proof as LeafProof, Tree};
+use crate::starkom::proto::pcs::v6 as proto;
 use crate::utils;
 use anyhow::{Result, anyhow};
 use primitive_types::{H256, U256};
@@ -137,6 +138,42 @@ impl<F: Field256, H: Hasher<F>> Commitment<F, H> {
             indices.push(index.as_u64() as usize);
         }
         indices
+    }
+
+    /// Serializes this commitment to a [`Commitment`](`proto::Commitment`) protobuf.
+    pub fn to_proto(&self) -> proto::Commitment {
+        proto::Commitment {
+            tree_roots: self
+                .tree_roots
+                .iter()
+                .map(|&hash| hash.as_bytes().to_vec())
+                .collect(),
+            fri_roots: self
+                .inner
+                .roots()
+                .iter()
+                .map(|&hash| hash.as_bytes().to_vec())
+                .collect(),
+        }
+    }
+
+    /// Deserializes a commitment from a [`Commitment`](`proto::Commitment`) protobuf.
+    pub fn from_proto(proto: &proto::Commitment) -> Result<Self> {
+        Ok(Self {
+            tree_roots: proto
+                .tree_roots
+                .iter()
+                .map(|bytes| H::load_hash(bytes.as_slice()))
+                .collect::<Result<_>>()?,
+            inner: fri::Commitment::with_roots(
+                proto
+                    .fri_roots
+                    .iter()
+                    .map(|bytes| H::load_hash(bytes.as_slice()))
+                    .collect::<Result<_>>()?,
+            ),
+            _data: PhantomData,
+        })
     }
 }
 
@@ -476,6 +513,78 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
 
         Ok(())
     }
+
+    /// Serializes this proof to a [`Proof`](`proto::Proof`) protobuf.
+    pub fn to_proto(&self) -> proto::Proof {
+        proto::Proof {
+            degree_bound: self.degree_bound as u64,
+            blowup_log2: self.blowup_log2 as u32,
+            num_polys: self.num_polys as u64,
+            points: self
+                .points
+                .iter()
+                .map(|(&z, values)| proto::proof::Point {
+                    z: z.to_le_bytes().to_vec(),
+                    v: values
+                        .iter()
+                        .map(|value| value.to_le_bytes().to_vec())
+                        .collect(),
+                })
+                .collect(),
+            openings: self
+                .openings
+                .iter()
+                .map(|proofs| proto::proof::Opening {
+                    proofs: proofs.iter().map(|proof| proof.to_proto()).collect(),
+                })
+                .collect(),
+            queries: self.queries.iter().map(|query| query.to_proto()).collect(),
+        }
+    }
+
+    /// Deserializes a proof from a [`Proof`](`proto::Proof`) protobuf.
+    ///
+    /// NOTE: this method does not validate the proof, it only deserializes it. The caller must
+    /// invoke [`Self::verify`] separately.
+    pub fn from_proto(proto: &proto::Proof) -> Result<Self> {
+        let degree_bound = proto.degree_bound as usize;
+        let blowup_log2 = proto.blowup_log2 as usize;
+        Ok(Self {
+            degree_bound,
+            blowup_log2,
+            num_polys: proto.num_polys as usize,
+            points: proto
+                .points
+                .iter()
+                .map(|point| {
+                    Ok((
+                        utils::load_scalar(point.z.as_slice())?,
+                        point
+                            .v
+                            .iter()
+                            .map(|value| utils::load_scalar(value.as_slice()))
+                            .collect::<Result<_>>()?,
+                    ))
+                })
+                .collect::<Result<_>>()?,
+            openings: proto
+                .openings
+                .iter()
+                .map(|opening| {
+                    opening
+                        .proofs
+                        .iter()
+                        .map(LeafProof::from_proto)
+                        .collect::<Result<_>>()
+                })
+                .collect::<Result<_>>()?,
+            queries: proto
+                .queries
+                .iter()
+                .map(|query| fri::Query::from_proto(degree_bound, blowup_log2, query))
+                .collect::<Result<_>>()?,
+        })
+    }
 }
 
 /// A DEEP-FRI prover.
@@ -557,38 +666,36 @@ impl<F: Field256, H: Hasher<F>> Prover<F, H> {
     }
 }
 
-#[cfg(all(test, feature = "bluesky", feature = "goldilocks"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::hash::{Keccak256Hash, Sha2Hash};
     use starkom_bluesky::Scalar as BS;
     use starkom_goldilocks::GL4;
+    use std::fmt::Debug;
+    use std::str::FromStr;
+
+    fn parse<V: FromStr<Err: Debug>>(s: &'static str) -> V {
+        s.parse().unwrap()
+    }
 
     #[test]
     fn test_dsts() {
         assert_eq!(
             *TRANSCRIPT_DST,
-            "0x09f36235476a658841de9bcdd34e1ac31ec792e41def5de31aecb4eb3bb1816b"
-                .parse()
-                .unwrap()
+            parse("0x09f36235476a658841de9bcdd34e1ac31ec792e41def5de31aecb4eb3bb1816b")
         );
         assert_eq!(
             *QUERY_DST0,
-            "0xbbec7289b9fc3aade75412c031b62a769b205d1d73b29c9a06dbb91943e046bc"
-                .parse()
-                .unwrap()
+            parse("0xbbec7289b9fc3aade75412c031b62a769b205d1d73b29c9a06dbb91943e046bc")
         );
         assert_eq!(
             *QUERY_DST1,
-            "0x88209086b178c9f2fb9c2f813cd229e1a2528cb4f5e6cd618710dc9869f14ac5"
-                .parse()
-                .unwrap()
+            parse("0x88209086b178c9f2fb9c2f813cd229e1a2528cb4f5e6cd618710dc9869f14ac5")
         );
         assert_eq!(
             *RLC_DST,
-            "0x688ae37e5f05871810e7c6777e1c16c55ef4b14f072357586d7a298cefc11368"
-                .parse()
-                .unwrap()
+            parse("0x688ae37e5f05871810e7c6777e1c16c55ef4b14f072357586d7a298cefc11368")
         );
     }
 
@@ -961,5 +1068,73 @@ mod tests {
         let mut other_proof = other_prover.prove(&other_commitment);
         proof.openings[0][0] = other_proof.openings[0].remove(0);
         assert_rejected(proof.verify(&commitment), "invalid opening for index");
+    }
+
+    #[test]
+    fn test_commitment_serialization() {
+        let mut committer = Committer::<BS, Sha2Hash<BS>>::new(
+            4,
+            1,
+            vec![polynomial(&[12, 34, 56, 78]), polynomial(&[42, 43, 44, 45])],
+        );
+        committer.add_batch(vec![polynomial(&[90, 78, 56, 34])]);
+        let (commitment, _) =
+            committer.commit(BTreeSet::from([BS::from(123u16), BS::from(456u16)]));
+        assert_eq!(
+            commitment.tree_roots(),
+            [
+                parse("0xc47ed760edd5fc63ecb5c86240553f7e2fdabd0003ca62ab40d79e230ead9eb1"),
+                parse("0x13880d0002db3411382d144a40f86201f3b84b55c317bcb0b583f166100e8b37"),
+            ]
+        );
+        assert_eq!(
+            commitment.transcript_hash(1),
+            parse("0x8e58a20287b9d5f4743c73d0d57b2b1dcb5846f4b658d5463a393b0b44dafcfc")
+        );
+        assert_eq!(
+            commitment.transcript_hash(2),
+            parse("0x60d1b1e6e174c834b3ea7412cf09cdb5f3949f7b63f0c8f3f841b1cedc58c56a")
+        );
+        let proto = commitment.to_proto();
+        let commitment = Commitment::<BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
+        assert_eq!(commitment.degree_bound(), 4);
+        assert_eq!(
+            commitment.tree_roots(),
+            [
+                parse("0xc47ed760edd5fc63ecb5c86240553f7e2fdabd0003ca62ab40d79e230ead9eb1"),
+                parse("0x13880d0002db3411382d144a40f86201f3b84b55c317bcb0b583f166100e8b37"),
+            ]
+        );
+        assert_eq!(
+            commitment.transcript_hash(1),
+            parse("0x8e58a20287b9d5f4743c73d0d57b2b1dcb5846f4b658d5463a393b0b44dafcfc")
+        );
+        assert_eq!(
+            commitment.transcript_hash(2),
+            parse("0x60d1b1e6e174c834b3ea7412cf09cdb5f3949f7b63f0c8f3f841b1cedc58c56a")
+        );
+    }
+
+    #[test]
+    fn test_proof_serialization() {
+        let mut committer = Committer::<BS, Sha2Hash<BS>>::new(
+            4,
+            3,
+            vec![polynomial(&[12, 34, 56, 78]), polynomial(&[42, 43, 44, 45])],
+        );
+        committer.add_batch(vec![polynomial(&[90, 78, 56, 34])]);
+        let (commitment, prover) =
+            committer.commit(BTreeSet::from([BS::from(123u16), BS::from(456u16)]));
+        let proof = prover.prove(&commitment);
+        let proto = proof.to_proto();
+        let proof = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
+        assert_eq!(proof.degree_bound(), 4);
+        assert_eq!(proof.blowup_log2(), 3);
+        assert_eq!(proof.num_polys(), 3);
+        assert_eq!(
+            proof.points().keys().copied().collect::<BTreeSet<BS>>(),
+            BTreeSet::from([BS::from(123u16), BS::from(456u16)])
+        );
+        assert!(proof.verify(&commitment).is_ok());
     }
 }
