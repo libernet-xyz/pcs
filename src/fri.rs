@@ -1,5 +1,6 @@
 use crate::hash::Hasher;
 use crate::merkle::{Proof as LeafProof, Tree};
+use crate::starkom::proto::pcs::v6 as proto;
 use crate::utils;
 use anyhow::{Result, anyhow};
 use primitive_types::H256;
@@ -229,6 +230,44 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
         }
 
         Ok(())
+    }
+
+    /// Serializes this query to a [`Query`](`proto::Query`) protobuf.
+    pub fn to_proto(&self) -> proto::Query {
+        proto::Query {
+            index: self.index as u64,
+            folds: self
+                .folds
+                .iter()
+                .map(|(left, right)| proto::query::Fold {
+                    left: Some(left.to_proto()),
+                    right: Some(right.to_proto()),
+                })
+                .collect(),
+        }
+    }
+
+    /// Deserializes a query from a [`Query`](`proto::Query`) protobuf.
+    pub fn from_proto(
+        degree_bound: usize,
+        blowup_log2: usize,
+        proto: &proto::Query,
+    ) -> Result<Self> {
+        Ok(Self {
+            degree_bound,
+            blowup_log2,
+            index: proto.index as usize,
+            folds: proto
+                .folds
+                .iter()
+                .map(|fold| match (&fold.left, &fold.right) {
+                    (Some(left), Some(right)) => {
+                        Ok((LeafProof::from_proto(left)?, LeafProof::from_proto(right)?))
+                    }
+                    _ => Err(anyhow!("missing FRI folds")),
+                })
+                .collect::<Result<_>>()?,
+        })
     }
 }
 

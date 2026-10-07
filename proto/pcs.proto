@@ -37,7 +37,7 @@ message LeafProof {
 
 // A FRI query.
 message Query {
-    // The index of the queries leaf.
+    // The index of the queried leaf.
     uint64 index = 1;
 
     // A pair of Merkle proofs resulting froma folding round.
