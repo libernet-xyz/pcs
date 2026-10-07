@@ -663,4 +663,22 @@ mod tests {
         query.folds[1].0 = other.folds.remove(1).0;
         assert_rejected(query.verify(&commitment), "leaf value mismatch");
     }
+
+    #[test]
+    fn test_serialization() {
+        let polynomials: Vec<Polynomial<BS>> = vec![vec![12, 34, 56, 78], vec![42, 43, 44, 45]]
+            .into_iter()
+            .map(|values| {
+                Polynomial::encode2(values.into_iter().map(|value: u64| value.into()).collect())
+            })
+            .collect();
+        let prover = Prover::<BS, Sha2Hash<BS>>::new(polynomials, 4, 2);
+        let commitment = prover.commit();
+        let query = prover.query(2);
+        let proto = query.to_proto();
+        let query = Query::<BS, Sha2Hash<BS>>::from_proto(4, 2, &proto).unwrap();
+        assert_eq!(query.indices(), (2, 10));
+        assert_eq!(query.len(), 3);
+        assert!(query.verify(&commitment).is_ok());
+    }
 }
