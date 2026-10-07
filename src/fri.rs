@@ -248,6 +248,9 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
     }
 
     /// Deserializes a query from a [`Query`](`proto::Query`) protobuf.
+    ///
+    /// NOTE: this method does not validate the proof, it only deserializes it. The caller must
+    /// invoke [`Self::verify`] separately.
     pub fn from_proto(
         degree_bound: usize,
         blowup_log2: usize,

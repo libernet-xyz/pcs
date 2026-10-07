@@ -179,6 +179,9 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
     }
 
     /// Deserializes a Merkle proof from a [`LeafProof`](`proto::LeafProof`) protobuf.
+    ///
+    /// NOTE: this method does not validate the proof, it only deserializes it. The caller must
+    /// invoke [`Self::verify`] separately.
     pub(crate) fn from_proto(proto: &proto::LeafProof) -> Result<Self> {
         Ok(Self {
             leaf: proto
@@ -189,7 +192,7 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
             path: proto
                 .merkle_path
                 .iter()
-                .map(|hash| utils::load_hash(hash.as_slice()))
+                .map(|hash| H::load_hash(hash.as_slice()))
                 .collect::<Result<_>>()?,
             _data: PhantomData,
         })

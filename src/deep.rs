@@ -163,13 +163,13 @@ impl<F: Field256, H: Hasher<F>> Commitment<F, H> {
             tree_roots: proto
                 .tree_roots
                 .iter()
-                .map(|bytes| utils::load_hash(bytes.as_slice()))
+                .map(|bytes| H::load_hash(bytes.as_slice()))
                 .collect::<Result<_>>()?,
             inner: fri::Commitment::with_roots(
                 proto
                     .fri_roots
                     .iter()
-                    .map(|bytes| utils::load_hash(bytes.as_slice()))
+                    .map(|bytes| H::load_hash(bytes.as_slice()))
                     .collect::<Result<_>>()?,
             ),
             _data: PhantomData,

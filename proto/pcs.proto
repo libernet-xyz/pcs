@@ -6,6 +6,8 @@ package starkom.proto.pcs.v6;
 message Commitment {
     // Root hashes of the Merkle trees where the evaluations of all batched polynomials are stored.
     // There is one root hash per polynomial batch.
+    //
+    // Each root hash is stored as a 32 byte sequence.
     repeated bytes tree_roots = 1;
 
     // Merkle roots of the FRI folding argument.
@@ -13,6 +15,8 @@ message Commitment {
     // The first element is the root of the main Merkle tree, the second one is the root of the
     // Merkle tree from the first folding round, and so on until the last element which is the value
     // of the last folding round.
+    //
+    // Each root hash is stored as a 32 byte sequence.
     repeated bytes fri_roots = 2;
 }
 
@@ -22,6 +26,9 @@ message Commitment {
 // evaluations of one or more committed polynomials.
 message LeafProof {
     // The evaluations of the batched polynomials at the domain location corresponding to this leaf.
+    //
+    // Each scalar is stored in canonical (non-Montgomery) integer form, in little-endian byte
+    // order.
     repeated bytes leaf_values = 1;
 
     // The leaf-to-root Merkle path, excluding the root hash.
@@ -32,6 +39,8 @@ message LeafProof {
     // The first element of the array is the hash of the evaluations of the sibling leaf, the second
     // element is the hash of the sibling of the parent node, and so on until the sibling of the
     // child of the root.
+    //
+    // Each hash is stored as a 32 byte sequence.
     repeated bytes merkle_path = 2;
 }
 
@@ -70,6 +79,9 @@ message Proof {
         // Evaluations of every committed polynomial in `z`.
         //
         // This array must have exactly `num_polys` elements.
+        //
+        // Values are stored in canonical (non-Montgomery) integer form, in little-endian byte
+        // order.
         repeated bytes v = 2;
     }
 
