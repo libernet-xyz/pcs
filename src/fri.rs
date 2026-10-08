@@ -206,6 +206,13 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
             }
 
             left.check_leaf(pos.as_slice())?;
+            if right.leaf().len() != pos.len() {
+                return Err(anyhow!(
+                    "invalid right-hand side leaf size (got {}, want {})",
+                    right.leaf().len(),
+                    pos.len()
+                ));
+            }
             left.verify(index, root_hash)?;
             right.verify((index + n / 2) % n, root_hash)?;
 
@@ -665,6 +672,20 @@ mod tests {
         let mut other = prover.query(QUERY_INDEX + 4);
         query.folds[1].0 = other.folds.remove(1).0;
         assert_rejected(query.verify(&commitment), "leaf value mismatch");
+    }
+
+    #[test]
+    fn test_reject_short_partner_leaf() {
+        let prover = honest_prover();
+        let commitment = prover.commit();
+        let mut proto = prover.query(QUERY_INDEX).to_proto();
+        proto.folds[0].right.as_mut().unwrap().leaf_values.pop();
+        let query =
+            Query::<BS, Sha2Hash<BS>>::from_proto(DEGREE_BOUND, BLOWUP_LOG2, &proto).unwrap();
+        assert_rejected(
+            query.verify(&commitment),
+            "invalid right-hand side leaf size",
+        );
     }
 
     #[test]
