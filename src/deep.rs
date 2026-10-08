@@ -455,6 +455,15 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
                 num_polys
             ));
         }
+        for (&z, values) in &self.points {
+            if values.len() != self.num_polys {
+                return Err(anyhow!(
+                    "incorrect number of evaluations at {z} (got {}, want {})",
+                    values.len(),
+                    self.num_polys
+                ));
+            }
+        }
 
         let indices = commitment.get_query_indices(self.degree_bound, self.blowup_log2);
         if self.openings.len() != indices.len() {
@@ -1042,6 +1051,22 @@ mod tests {
         let z = *proof.points.keys().next().unwrap();
         proof.points.get_mut(&z).unwrap()[0] += BS::ONE;
         assert_rejected(proof.verify(&commitment), "algebraic check failed");
+    }
+
+    #[test]
+    fn test_reject_missing_evaluation() {
+        let (commitment, mut proof) = adversarial_setup();
+        let z = *proof.points.keys().next().unwrap();
+        proof.points.get_mut(&z).unwrap().pop();
+        assert_rejected(proof.verify(&commitment), "incorrect number of evaluations");
+    }
+
+    #[test]
+    fn test_reject_extra_evaluation() {
+        let (commitment, mut proof) = adversarial_setup();
+        let z = *proof.points.keys().next().unwrap();
+        proof.points.get_mut(&z).unwrap().push(BS::ZERO);
+        assert_rejected(proof.verify(&commitment), "incorrect number of evaluations");
     }
 
     #[test]
