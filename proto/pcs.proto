@@ -4,11 +4,19 @@ package starkom.proto.pcs.v6;
 
 // A batched DEEP-FRI polynomial commitment.
 message Commitment {
-  // Root hashes of the Merkle trees where the evaluations of all batched polynomials are stored.
-  // There is one root hash per polynomial batch.
-  //
-  // Each root hash is stored as a 32 byte sequence.
-  repeated bytes tree_roots = 1;
+  // Commitment data for a batch of polynomials whose evaluations are stored in the same Merkle
+  // tree.
+  message Batch {
+    // Root hash of the Merkle tree, stored as a 32 byte sequence.
+    bytes root = 1;
+
+    // Number of polynomials in the batch. Every leaf of the Merkle tree must have exactly this
+    // number of evaluations.
+    uint64 num_polys = 2;
+  }
+
+  // The polynomial batches, in commitment order.
+  repeated Batch batches = 1;
 
   // Merkle roots of the FRI folding argument.
   //

@@ -78,6 +78,9 @@ pub struct Commitment<F: Field256, H: Hasher<F>> {
     /// The root hashes of the Merkle trees where the evaluations of all batched polynomials are
     /// stored. There is one root hash per polynomial batch.
     tree_roots: Vec<H256>,
+    /// The number of polynomials in each batch, which is also the number of evaluations stored in
+    /// each leaf of the corresponding Merkle tree. There is one entry per polynomial batch.
+    batch_sizes: Vec<usize>,
     /// The underlying FRI commitment.
     inner: fri::Commitment,
     _data: PhantomData<(F, H)>,
@@ -87,6 +90,14 @@ impl<F: Field256, H: Hasher<F>> Commitment<F, H> {
     /// Returns the root hashes of the Merkle trees where all batched polynomials are stored.
     pub fn tree_roots(&self) -> &[H256] {
         self.tree_roots.as_slice()
+    }
+
+    /// Returns the number of polynomials in each batch, which is also the number of evaluations
+    /// stored in each leaf of the corresponding Merkle tree.
+    ///
+    /// The returned slice has one element for every [tree root](`Self::tree_roots`).
+    pub fn batch_sizes(&self) -> &[usize] {
+        self.batch_sizes.as_slice()
     }
 
     /// The degree bound this commitment attests to, implied by the number of FRI folding rounds.
@@ -143,10 +154,14 @@ impl<F: Field256, H: Hasher<F>> Commitment<F, H> {
     /// Serializes this commitment to a [`Commitment`](`proto::Commitment`) protobuf.
     pub fn to_proto(&self) -> proto::Commitment {
         proto::Commitment {
-            tree_roots: self
+            batches: self
                 .tree_roots
                 .iter()
-                .map(|&hash| hash.as_bytes().to_vec())
+                .zip(self.batch_sizes.iter())
+                .map(|(root, &num_polys)| proto::commitment::Batch {
+                    root: root.as_bytes().to_vec(),
+                    num_polys: num_polys as u64,
+                })
                 .collect(),
             fri_roots: self
                 .inner
@@ -161,9 +176,14 @@ impl<F: Field256, H: Hasher<F>> Commitment<F, H> {
     pub fn from_proto(proto: &proto::Commitment) -> Result<Self> {
         Ok(Self {
             tree_roots: proto
-                .tree_roots
+                .batches
                 .iter()
-                .map(|bytes| H::load_hash(bytes.as_slice()))
+                .map(|batch| H::load_hash(batch.root.as_slice()))
+                .collect::<Result<_>>()?,
+            batch_sizes: proto
+                .batches
+                .iter()
+                .map(|batch| Ok(usize::try_from(batch.num_polys)?))
                 .collect::<Result<_>>()?,
             inner: fri::Commitment::with_roots(
                 proto
@@ -358,6 +378,7 @@ impl<F: Field256, H: Hasher<F>> Committer<F, H> {
 
         let commitment = Commitment {
             tree_roots: self.trees.iter().map(Tree::root_hash).collect(),
+            batch_sizes: self.trees.iter().map(Tree::num_polys).collect(),
             inner: inner_prover.commit(),
             _data: Default::default(),
         };
@@ -426,6 +447,15 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
     pub fn verify(&self, commitment: &Commitment<F, H>) -> Result<()> {
         check_points_off_domain(self.points.keys().copied(), self.extended_domain_size())?;
 
+        let num_polys = commitment.batch_sizes().iter().copied().sum();
+        if self.num_polys != num_polys {
+            return Err(anyhow!(
+                "incorrect number of polynomials (got {}, want {})",
+                self.num_polys,
+                num_polys
+            ));
+        }
+
         let indices = commitment.get_query_indices(self.degree_bound, self.blowup_log2);
         if self.openings.len() != indices.len() {
             return Err(anyhow!(
@@ -474,9 +504,21 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
                     commitment.tree_roots().len()
                 ));
             }
-            for (&root_hash, opening) in commitment.tree_roots().iter().zip(openings.iter()) {
+            for ((&root_hash, &batch_size), opening) in commitment
+                .tree_roots()
+                .iter()
+                .zip(commitment.batch_sizes())
+                .zip(openings.iter())
+            {
                 if 1usize << opening.len() != self.extended_domain_size() {
                     return Err(anyhow!("invalid opening for index {index}"));
+                }
+                if opening.leaf().len() != batch_size {
+                    return Err(anyhow!(
+                        "incorrect batch size at index {index} (got {}, want {})",
+                        opening.leaf().len(),
+                        batch_size
+                    ));
                 }
                 opening.verify(index, root_hash)?;
             }
@@ -1005,11 +1047,12 @@ mod tests {
     #[test]
     fn test_reject_foreign_commitment() {
         let (_, proof) = adversarial_setup();
-        let committer = Committer::<BS, Sha2Hash<BS>>::new(
+        let mut committer = Committer::<BS, Sha2Hash<BS>>::new(
             ADVERSARIAL_DEGREE_BOUND,
             ADVERSARIAL_BLOWUP_LOG2,
-            vec![polynomial(&[99, 98, 97, 96])],
+            vec![polynomial(&[99, 98, 97, 96]), polynomial(&[95, 94, 93, 92])],
         );
+        committer.add_batch(vec![polynomial(&[91, 90, 89, 88])]);
         let (foreign, _) = committer.commit(BTreeSet::from([BS::from(123u16)]));
         assert_rejected(proof.verify(&foreign), "wrong query index");
     }
@@ -1071,6 +1114,20 @@ mod tests {
     }
 
     #[test]
+    fn test_reject_misreported_batch_sizes() {
+        let (mut commitment, proof) = adversarial_setup();
+        commitment.batch_sizes = vec![1, 2];
+        assert_rejected(proof.verify(&commitment), "incorrect batch size");
+    }
+
+    #[test]
+    fn test_reject_wrong_number_of_polynomials() {
+        let (commitment, mut proof) = adversarial_setup();
+        proof.num_polys += 1;
+        assert_rejected(proof.verify(&commitment), "incorrect number of polynomials");
+    }
+
+    #[test]
     fn test_commitment_serialization() {
         let mut committer = Committer::<BS, Sha2Hash<BS>>::new(
             4,
@@ -1087,6 +1144,7 @@ mod tests {
                 parse("0x13880d0002db3411382d144a40f86201f3b84b55c317bcb0b583f166100e8b37"),
             ]
         );
+        assert_eq!(commitment.batch_sizes(), [2, 1]);
         assert_eq!(
             commitment.transcript_hash(1),
             parse("0x8e58a20287b9d5f4743c73d0d57b2b1dcb5846f4b658d5463a393b0b44dafcfc")
@@ -1105,6 +1163,7 @@ mod tests {
                 parse("0x13880d0002db3411382d144a40f86201f3b84b55c317bcb0b583f166100e8b37"),
             ]
         );
+        assert_eq!(commitment.batch_sizes(), [2, 1]);
         assert_eq!(
             commitment.transcript_hash(1),
             parse("0x8e58a20287b9d5f4743c73d0d57b2b1dcb5846f4b658d5463a393b0b44dafcfc")
@@ -1126,8 +1185,10 @@ mod tests {
         let (commitment, prover) =
             committer.commit(BTreeSet::from([BS::from(123u16), BS::from(456u16)]));
         let proof = prover.prove(&commitment);
-        let proto = proof.to_proto();
-        let proof = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
+        let commitment_proto = commitment.to_proto();
+        let proof_proto = proof.to_proto();
+        let commitment = Commitment::<BS, Sha2Hash<BS>>::from_proto(&commitment_proto).unwrap();
+        let proof = Proof::<BS, Sha2Hash<BS>>::from_proto(&proof_proto).unwrap();
         assert_eq!(proof.degree_bound(), 4);
         assert_eq!(proof.blowup_log2(), 3);
         assert_eq!(proof.num_polys(), 3);
