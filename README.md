@@ -25,9 +25,12 @@ implementation that works with any field with sufficient 2-adicity.
 > The [`starkom-plonk`][starkom-plonk] crate does both when its
 > [blinding system][plonk-options-blind] is enabled.
 
-Starkom's zkSTARK suite currently provides five fields and all work correctly with this PCS: the
-[BLS12-381 scalar field][bls12-381], [BlueSky][bluesky], [Schraderbrau][schraderbrau],
-[Goldilocks][goldilocks], and [KoalaBear][koalabear].
+This PCS is field-agnostic, the only requirement is that the field implements the
+[`Field256` trait from the `starkom-ff` crate][field256]. Starkom's zkSTARK suite currently provides
+five fields and all work correctly with this PCS: the [BLS12-381 scalar field][bls12-381],
+[BlueSky][bluesky], [Schraderbrau][schraderbrau], [Goldilocks][goldilocks], and
+[KoalaBear][koalabear]. Note that Goldilocks and KoalaBear are small fields but you can use their
+256-bit extensions, respectively [`GL4`][gl4] and [`KB8`][kb8].
 
 Two hash backends are provided, one using SHA2-256 and one using Keccak-256, and both are
 implemented in the most EVM-friendly possible way. Check out Starkom's [EVM verifier][evm-verifier].
@@ -35,7 +38,10 @@ implemented in the most EVM-friendly possible way. Check out Starkom's [EVM veri
 [bls12-381]: https://docs.rs/starkom-ff/latest/starkom_ff/bls12_381/struct.Scalar.html
 [bluesky]: https://docs.rs/starkom-bluesky
 [evm-verifier]: https://github.com/libernet-xyz/evm-verifier
+[field256]: https://docs.rs/starkom-ff/latest/starkom_ff/trait.Field256.html
+[gl4]: https://docs.rs/starkom-goldilocks/latest/starkom_goldilocks/gl4/struct.Scalar.html
 [goldilocks]: https://docs.rs/starkom-goldilocks
+[kb8]: https://docs.rs/starkom-koalabear/latest/starkom_koalabear/kb8/struct.Scalar.html
 [koalabear]: https://docs.rs/starkom-koalabear
 [num_queries]: https://docs.rs/starkom-pcs/latest/starkom_pcs/fn.num_queries.html
 [plonk-options-blind]: https://docs.rs/starkom-plonk/latest/starkom_plonk/struct.Options.html#structfield.blind
