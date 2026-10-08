@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package starkom.proto.pcs.v6;
+package starkom.proto.pcs.v7;
 
 // A batched DEEP-FRI polynomial commitment.
 message Commitment {

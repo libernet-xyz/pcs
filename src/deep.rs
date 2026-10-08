@@ -1,7 +1,7 @@
 use crate::fri;
 use crate::hash::Hasher;
 use crate::merkle::{Proof as LeafProof, Tree};
-use crate::starkom::proto::pcs::v6 as proto;
+use crate::starkom::proto::pcs::v7 as proto;
 use crate::utils;
 use anyhow::{Result, anyhow};
 use primitive_types::{H256, U256};
