@@ -170,7 +170,13 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
     pub fn verify(&self, commitment: &Commitment) -> Result<()> {
         let mut n = self.degree_bound << self.blowup_log2;
         assert!(n.is_power_of_two());
-        assert!(self.index < n);
+
+        if self.index >= n {
+            return Err(anyhow!(
+                "invalid query index {}: the domain size is {n}",
+                self.index
+            ));
+        }
 
         let mut k = n.trailing_zeros() as usize;
 
@@ -256,6 +262,9 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
 
     /// Deserializes a query from a [`Query`](`proto::Query`) protobuf.
     ///
+    /// REQUIRES: `degree_bound` must be a power of 2, `blowup_log2` must be greater than 0, and the
+    /// size of the extended domain must fit within the 2-adicity of `F::BaseField`.
+    ///
     /// NOTE: this method does not validate the proof, it only deserializes it. The caller must
     /// invoke [`Self::verify`] separately.
     pub fn from_proto(
@@ -263,6 +272,9 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
         blowup_log2: usize,
         proto: &proto::Query,
     ) -> Result<Self> {
+        assert!(degree_bound.is_power_of_two());
+        assert!(blowup_log2 > 0);
+        assert!(degree_bound.trailing_zeros() as usize + blowup_log2 <= F::BaseField::S);
         if proto.folds.is_empty() {
             return Err(anyhow!("the FRI query has no folds"));
         }
@@ -689,6 +701,17 @@ mod tests {
             query.verify(&commitment),
             "invalid right-hand side leaf size",
         );
+    }
+
+    #[test]
+    fn test_reject_out_of_range_query_index() {
+        let prover = honest_prover();
+        let commitment = prover.commit();
+        let mut proto = prover.query(QUERY_INDEX).to_proto();
+        proto.index = (DEGREE_BOUND << BLOWUP_LOG2) as u64;
+        let query =
+            Query::<BS, Sha2Hash<BS>>::from_proto(DEGREE_BOUND, BLOWUP_LOG2, &proto).unwrap();
+        assert_rejected(query.verify(&commitment), "invalid query index");
     }
 
     #[test]

@@ -451,33 +451,15 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
 
     /// Verifies this proof against the given commitment.
     pub fn verify(&self, commitment: &Commitment<F, H>) -> Result<()> {
-        if !self.degree_bound.is_power_of_two() {
-            return Err(anyhow!(
-                "invalid degree bound {} (not a power of two)",
-                self.degree_bound
-            ));
-        }
-        let degree_bound_log2 = self.degree_bound.trailing_zeros() as usize;
-        if commitment.inner.len() != degree_bound_log2 + 1 {
+        check_points_off_domain(self.points.keys().copied(), self.extended_domain_size())?;
+
+        if commitment.inner.len() != self.degree_bound.trailing_zeros() as usize + 1 {
             return Err(anyhow!(
                 "the degree bound {} doesn't match the {} FRI roots of the commitment",
                 self.degree_bound,
                 commitment.inner.len()
             ));
         }
-        if self.blowup_log2 == 0 {
-            return Err(anyhow!("invalid blowup factor 2^0"));
-        }
-        if degree_bound_log2 + self.blowup_log2 > F::BaseField::S {
-            return Err(anyhow!(
-                "invalid extended domain size 2^{{{}+{}}} (exceeds the 2-adicity of the field, {})",
-                degree_bound_log2,
-                self.blowup_log2,
-                F::BaseField::S
-            ));
-        }
-
-        check_points_off_domain(self.points.keys().copied(), self.extended_domain_size())?;
 
         let num_polys = commitment.batch_sizes().iter().copied().sum();
         if self.num_polys != num_polys {
@@ -635,6 +617,26 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
     pub fn from_proto(proto: &proto::Proof) -> Result<Self> {
         let degree_bound = proto.degree_bound as usize;
         let blowup_log2 = proto.blowup_log2 as usize;
+
+        if !degree_bound.is_power_of_two() {
+            return Err(anyhow!(
+                "invalid degree bound {} (not a power of two)",
+                degree_bound
+            ));
+        }
+        if blowup_log2 == 0 {
+            return Err(anyhow!("invalid blowup factor 2^0"));
+        }
+        let degree_bound_log2 = degree_bound.trailing_zeros() as usize;
+        if degree_bound_log2 + blowup_log2 > F::BaseField::S {
+            return Err(anyhow!(
+                "invalid extended domain size 2^{{{}+{}}} (exceeds the 2-adicity of the field, {})",
+                degree_bound_log2,
+                blowup_log2,
+                F::BaseField::S
+            ));
+        }
+
         Ok(Self {
             degree_bound,
             blowup_log2,
@@ -1080,23 +1082,35 @@ mod tests {
 
     #[test]
     fn test_reject_zero_degree_bound() {
-        let (commitment, mut proof) = adversarial_setup();
-        proof.degree_bound = 0;
-        assert_rejected(proof.verify(&commitment), "not a power of two");
+        let (_, proof) = adversarial_setup();
+        let mut proto = proof.to_proto();
+        proto.degree_bound = 0;
+        assert_rejected(
+            Proof::<BS, Sha2Hash<BS>>::from_proto(&proto).map(|_| ()),
+            "not a power of two",
+        );
     }
 
     #[test]
     fn test_reject_zero_blowup_factor() {
-        let (commitment, mut proof) = adversarial_setup();
-        proof.blowup_log2 = 0;
-        assert_rejected(proof.verify(&commitment), "invalid blowup factor");
+        let (_, proof) = adversarial_setup();
+        let mut proto = proof.to_proto();
+        proto.blowup_log2 = 0;
+        assert_rejected(
+            Proof::<BS, Sha2Hash<BS>>::from_proto(&proto).map(|_| ()),
+            "invalid blowup factor",
+        );
     }
 
     #[test]
     fn test_reject_oversized_domain() {
-        let (commitment, mut proof) = adversarial_setup();
-        proof.blowup_log2 = 64;
-        assert_rejected(proof.verify(&commitment), "invalid extended domain size");
+        let (_, proof) = adversarial_setup();
+        let mut proto = proof.to_proto();
+        proto.blowup_log2 = 64;
+        assert_rejected(
+            Proof::<BS, Sha2Hash<BS>>::from_proto(&proto).map(|_| ()),
+            "invalid extended domain size",
+        );
     }
 
     #[test]
