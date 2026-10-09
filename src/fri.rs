@@ -75,7 +75,7 @@ impl<F: Field256, H: Hasher<F>> FoldableTree<F, H> for Tree<F, H> {
 pub struct Commitment {
     /// The first element in the array is the root of the main Merkle tree, the second one is the
     /// root of the Merkle tree from the first folding round, and so on until the last element which
-    /// is the value of the last folding round.
+    /// is the Merkle root of the last folding round.
     roots: Vec<H256>,
 }
 

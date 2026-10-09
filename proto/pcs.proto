@@ -21,8 +21,8 @@ message Commitment {
   // Merkle roots of the FRI folding argument.
   //
   // The first element is the root of the main Merkle tree, the second one is the root of the Merkle
-  // tree from the first folding round, and so on until the last element which is the value of the
-  // last folding round.
+  // tree from the first folding round, and so on until the last element which is the Merkle root of
+  // the last folding round.
   //
   // This list cannot be empty because there needs to be at least the initial (unfolded) Merkle
   // tree.
