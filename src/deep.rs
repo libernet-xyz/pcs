@@ -174,6 +174,12 @@ impl<F: Field256, H: Hasher<F>> Commitment<F, H> {
 
     /// Deserializes a commitment from a [`Commitment`](`proto::Commitment`) protobuf.
     pub fn from_proto(proto: &proto::Commitment) -> Result<Self> {
+        if proto.batches.is_empty() {
+            return Err(anyhow!("the commitment has no polynomial batches"));
+        }
+        if proto.fri_roots.is_empty() {
+            return Err(anyhow!("the commitment has no FRI roots"));
+        }
         Ok(Self {
             tree_roots: proto
                 .batches
@@ -1217,6 +1223,28 @@ mod tests {
         let (commitment, mut proof) = adversarial_setup();
         proof.num_polys += 1;
         assert_rejected(proof.verify(&commitment), "incorrect number of polynomials");
+    }
+
+    #[test]
+    fn test_reject_commitment_without_batches() {
+        let (commitment, _) = adversarial_setup();
+        let mut proto = commitment.to_proto();
+        proto.batches.clear();
+        assert_rejected(
+            Commitment::<BS, Sha2Hash<BS>>::from_proto(&proto).map(|_| ()),
+            "the commitment has no polynomial batches",
+        );
+    }
+
+    #[test]
+    fn test_reject_commitment_without_fri_roots() {
+        let (commitment, _) = adversarial_setup();
+        let mut proto = commitment.to_proto();
+        proto.fri_roots.clear();
+        assert_rejected(
+            Commitment::<BS, Sha2Hash<BS>>::from_proto(&proto).map(|_| ()),
+            "the commitment has no FRI roots",
+        );
     }
 
     #[test]

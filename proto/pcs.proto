@@ -15,7 +15,7 @@ message Commitment {
     uint64 num_polys = 2;
   }
 
-  // The polynomial batches, in commitment order.
+  // The polynomial batches, in commitment order. There must be at least one batch.
   repeated Batch batches = 1;
 
   // Merkle roots of the FRI folding argument.
@@ -23,6 +23,9 @@ message Commitment {
   // The first element is the root of the main Merkle tree, the second one is the root of the Merkle
   // tree from the first folding round, and so on until the last element which is the value of the
   // last folding round.
+  //
+  // This list cannot be empty because there needs to be at least the initial (unfolded) Merkle
+  // tree.
   //
   // Each root hash is stored as a 32 byte sequence.
   repeated bytes fri_roots = 2;
@@ -69,6 +72,10 @@ message Query {
   }
 
   // List of Merkle proofs resulting from the folding rounds.
+  //
+  // This list actually contains one entry for every Merkle tree in the folding argument, not one
+  // for every fold, so there must be at least one element. The number of Merkle trees is equal to
+  // the number of folds plus one.
   repeated Fold folds = 2;
 }
 

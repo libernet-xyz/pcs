@@ -263,6 +263,9 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
         blowup_log2: usize,
         proto: &proto::Query,
     ) -> Result<Self> {
+        if proto.folds.is_empty() {
+            return Err(anyhow!("the FRI query has no folds"));
+        }
         Ok(Self {
             degree_bound,
             blowup_log2,
