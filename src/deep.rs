@@ -445,6 +445,39 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
 
     /// Verifies this proof against the given commitment.
     pub fn verify(&self, commitment: &Commitment<F, H>) -> Result<()> {
+        if !self.degree_bound.is_power_of_two() {
+            return Err(anyhow!(
+                "invalid degree bound {} (not a power of two)",
+                self.degree_bound
+            ));
+        }
+        if self.degree_bound > F::BaseField::S {
+            return Err(anyhow!(
+                "invalid degree bound {} (exceeds the 2-adicity of the field, {})",
+                self.degree_bound,
+                F::BaseField::S
+            ));
+        }
+        let degree_bound_log2 = self.degree_bound.trailing_zeros() as usize;
+        if commitment.inner.len() != degree_bound_log2 + 1 {
+            return Err(anyhow!(
+                "the degree bound {} doesn't match the {} FRI roots of the commitment",
+                self.degree_bound,
+                commitment.inner.len()
+            ));
+        }
+        if self.blowup_log2 == 0 {
+            return Err(anyhow!("invalid blowup factor 2^0"));
+        }
+        if degree_bound_log2 + self.blowup_log2 > F::BaseField::S {
+            return Err(anyhow!(
+                "invalid extended domain size 2^{{{}+{}}} (exceeds the 2-adicity of the field, {})",
+                degree_bound_log2,
+                self.blowup_log2,
+                F::BaseField::S
+            ));
+        }
+
         check_points_off_domain(self.points.keys().copied(), self.extended_domain_size())?;
 
         let num_polys = commitment.batch_sizes().iter().copied().sum();
@@ -1037,6 +1070,34 @@ mod tests {
     fn test_accept_untampered_proof() {
         let (commitment, proof) = adversarial_setup();
         assert!(proof.verify(&commitment).is_ok());
+    }
+
+    #[test]
+    fn test_reject_mismatched_degree_bound() {
+        let (commitment, mut proof) = adversarial_setup();
+        proof.degree_bound *= 2;
+        assert_rejected(proof.verify(&commitment), "FRI roots of the commitment");
+    }
+
+    #[test]
+    fn test_reject_zero_degree_bound() {
+        let (commitment, mut proof) = adversarial_setup();
+        proof.degree_bound = 0;
+        assert_rejected(proof.verify(&commitment), "not a power of two");
+    }
+
+    #[test]
+    fn test_reject_zero_blowup_factor() {
+        let (commitment, mut proof) = adversarial_setup();
+        proof.blowup_log2 = 0;
+        assert_rejected(proof.verify(&commitment), "invalid blowup factor");
+    }
+
+    #[test]
+    fn test_reject_oversized_domain() {
+        let (commitment, mut proof) = adversarial_setup();
+        proof.blowup_log2 = 64;
+        assert_rejected(proof.verify(&commitment), "invalid extended domain size");
     }
 
     #[test]
