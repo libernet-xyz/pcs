@@ -452,13 +452,6 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
             ));
         }
         let degree_bound_log2 = self.degree_bound.trailing_zeros() as usize;
-        if degree_bound_log2 > F::BaseField::S {
-            return Err(anyhow!(
-                "invalid degree bound {} (exceeds the 2-adicity of the field, 2^{})",
-                self.degree_bound,
-                F::BaseField::S
-            ));
-        }
         if commitment.inner.len() != degree_bound_log2 + 1 {
             return Err(anyhow!(
                 "the degree bound {} doesn't match the {} FRI roots of the commitment",
@@ -471,7 +464,7 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
         }
         if degree_bound_log2 + self.blowup_log2 > F::BaseField::S {
             return Err(anyhow!(
-                "invalid extended domain size 2^{{{}+{}}} (exceeds the 2-adicity of the field, 2^{})",
+                "invalid extended domain size 2^{{{}+{}}} (exceeds the 2-adicity of the field, {})",
                 degree_bound_log2,
                 self.blowup_log2,
                 F::BaseField::S
