@@ -455,6 +455,9 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
                 num_polys
             ));
         }
+        if self.points.is_empty() {
+            return Err(anyhow!("the proof doesn't open any points"));
+        }
         for (&z, values) in &self.points {
             if values.len() != self.num_polys {
                 return Err(anyhow!(
@@ -1051,6 +1054,16 @@ mod tests {
         let z = *proof.points.keys().next().unwrap();
         proof.points.get_mut(&z).unwrap()[0] += BS::ONE;
         assert_rejected(proof.verify(&commitment), "algebraic check failed");
+    }
+
+    #[test]
+    fn test_reject_no_points() {
+        let (commitment, mut proof) = adversarial_setup();
+        proof.points.clear();
+        assert_rejected(
+            proof.verify(&commitment),
+            "the proof doesn't open any points",
+        );
     }
 
     #[test]
