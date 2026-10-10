@@ -1,6 +1,6 @@
 use crate::hash::Hasher;
 use crate::merkle::{Proof as LeafProof, Tree};
-use crate::starkom::proto::pcs::v6 as proto;
+use crate::starkom::proto::pcs::v7 as proto;
 use crate::utils;
 use anyhow::{Result, anyhow};
 use primitive_types::H256;
@@ -75,7 +75,7 @@ impl<F: Field256, H: Hasher<F>> FoldableTree<F, H> for Tree<F, H> {
 pub struct Commitment {
     /// The first element in the array is the root of the main Merkle tree, the second one is the
     /// root of the Merkle tree from the first folding round, and so on until the last element which
-    /// is the value of the last folding round.
+    /// is the Merkle root of the last folding round.
     roots: Vec<H256>,
 }
 
@@ -170,7 +170,13 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
     pub fn verify(&self, commitment: &Commitment) -> Result<()> {
         let mut n = self.degree_bound << self.blowup_log2;
         assert!(n.is_power_of_two());
-        assert!(self.index < n);
+
+        if self.index >= n {
+            return Err(anyhow!(
+                "invalid query index {}: the domain size is {n}",
+                self.index
+            ));
+        }
 
         let mut k = n.trailing_zeros() as usize;
 
@@ -206,6 +212,13 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
             }
 
             left.check_leaf(pos.as_slice())?;
+            if right.leaf().len() != pos.len() {
+                return Err(anyhow!(
+                    "invalid right-hand side leaf size (got {}, want {})",
+                    right.leaf().len(),
+                    pos.len()
+                ));
+            }
             left.verify(index, root_hash)?;
             right.verify((index + n / 2) % n, root_hash)?;
 
@@ -249,6 +262,9 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
 
     /// Deserializes a query from a [`Query`](`proto::Query`) protobuf.
     ///
+    /// REQUIRES: `degree_bound` must be a power of 2, `blowup_log2` must be greater than 0, and the
+    /// size of the extended domain must fit within the 2-adicity of `F::BaseField`.
+    ///
     /// NOTE: this method does not validate the proof, it only deserializes it. The caller must
     /// invoke [`Self::verify`] separately.
     pub fn from_proto(
@@ -256,6 +272,12 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
         blowup_log2: usize,
         proto: &proto::Query,
     ) -> Result<Self> {
+        assert!(degree_bound.is_power_of_two());
+        assert!(blowup_log2 > 0);
+        assert!(degree_bound.trailing_zeros() as usize + blowup_log2 <= F::BaseField::S);
+        if proto.folds.is_empty() {
+            return Err(anyhow!("the FRI query has no folds"));
+        }
         Ok(Self {
             degree_bound,
             blowup_log2,
@@ -665,6 +687,31 @@ mod tests {
         let mut other = prover.query(QUERY_INDEX + 4);
         query.folds[1].0 = other.folds.remove(1).0;
         assert_rejected(query.verify(&commitment), "leaf value mismatch");
+    }
+
+    #[test]
+    fn test_reject_short_partner_leaf() {
+        let prover = honest_prover();
+        let commitment = prover.commit();
+        let mut proto = prover.query(QUERY_INDEX).to_proto();
+        proto.folds[0].right.as_mut().unwrap().leaf_values.pop();
+        let query =
+            Query::<BS, Sha2Hash<BS>>::from_proto(DEGREE_BOUND, BLOWUP_LOG2, &proto).unwrap();
+        assert_rejected(
+            query.verify(&commitment),
+            "invalid right-hand side leaf size",
+        );
+    }
+
+    #[test]
+    fn test_reject_out_of_range_query_index() {
+        let prover = honest_prover();
+        let commitment = prover.commit();
+        let mut proto = prover.query(QUERY_INDEX).to_proto();
+        proto.index = (DEGREE_BOUND << BLOWUP_LOG2) as u64;
+        let query =
+            Query::<BS, Sha2Hash<BS>>::from_proto(DEGREE_BOUND, BLOWUP_LOG2, &proto).unwrap();
+        assert_rejected(query.verify(&commitment), "invalid query index");
     }
 
     #[test]

@@ -1,20 +1,31 @@
 syntax = "proto3";
 
-package starkom.proto.pcs.v6;
+package starkom.proto.pcs.v7;
 
 // A batched DEEP-FRI polynomial commitment.
 message Commitment {
-  // Root hashes of the Merkle trees where the evaluations of all batched polynomials are stored.
-  // There is one root hash per polynomial batch.
-  //
-  // Each root hash is stored as a 32 byte sequence.
-  repeated bytes tree_roots = 1;
+  // Commitment data for a batch of polynomials whose evaluations are stored in the same Merkle
+  // tree.
+  message Batch {
+    // Root hash of the Merkle tree, stored as a 32 byte sequence.
+    bytes root = 1;
+
+    // Number of polynomials in the batch. Every leaf of the Merkle tree must have exactly this
+    // number of evaluations.
+    uint64 num_polys = 2;
+  }
+
+  // The polynomial batches, in commitment order. There must be at least one batch.
+  repeated Batch batches = 1;
 
   // Merkle roots of the FRI folding argument.
   //
   // The first element is the root of the main Merkle tree, the second one is the root of the Merkle
-  // tree from the first folding round, and so on until the last element which is the value of the
-  // last folding round.
+  // tree from the first folding round, and so on until the last element which is the Merkle root of
+  // the last folding round.
+  //
+  // This list cannot be empty because there needs to be at least the initial (unfolded) Merkle
+  // tree.
   //
   // Each root hash is stored as a 32 byte sequence.
   repeated bytes fri_roots = 2;
@@ -48,8 +59,8 @@ message LeafProof {
 // NOTE: the proven degree bound and the blowup factor are not stored here because all queries in a
 // proof refer to `Proof.degree_bound` and `Proof.blowup_log2`.
 //
-// NOTE: the number of evaluations in each contained `LeafProof` must match `Proof.num_polys` from
-// the containing proof.
+// NOTE: the number of evaluations in each contained `LeafProof` must match the number of points in
+// the containing `Proof`.
 message Query {
   // The index of the queried leaf.
   uint64 index = 1;
@@ -61,13 +72,20 @@ message Query {
   }
 
   // List of Merkle proofs resulting from the folding rounds.
+  //
+  // This list actually contains one entry for every Merkle tree in the folding argument, not one
+  // for every fold, so there must be at least one element. The number of Merkle trees is equal to
+  // the number of folds plus one.
   repeated Fold folds = 2;
 }
 
 // A batched DEEP-FRI proof.
 message Proof {
-  // The proven degree bound. If the proof is valid the degree of all batched polynomials is
-  // guaranteed to be strictly less than this value.
+  // The proven degree bound.
+  //
+  // NOTE: honest provers commit polynomials of degree strictly less than this value, but a valid
+  // proof only guarantees a degree at most equal to it, because FRI bounds the degree of the DEEP
+  // quotients (f(X) - f(z)) / (X - z) rather than that of the committed polynomials f(X).
   uint64 degree_bound = 1;
 
   // The base-2 logarithm of the blowup factor.

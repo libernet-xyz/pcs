@@ -1,7 +1,7 @@
 use crate::fri;
 use crate::hash::Hasher;
 use crate::merkle::{Proof as LeafProof, Tree};
-use crate::starkom::proto::pcs::v6 as proto;
+use crate::starkom::proto::pcs::v7 as proto;
 use crate::utils;
 use anyhow::{Result, anyhow};
 use primitive_types::{H256, U256};
@@ -78,6 +78,9 @@ pub struct Commitment<F: Field256, H: Hasher<F>> {
     /// The root hashes of the Merkle trees where the evaluations of all batched polynomials are
     /// stored. There is one root hash per polynomial batch.
     tree_roots: Vec<H256>,
+    /// The number of polynomials in each batch, which is also the number of evaluations stored in
+    /// each leaf of the corresponding Merkle tree. There is one entry per polynomial batch.
+    batch_sizes: Vec<usize>,
     /// The underlying FRI commitment.
     inner: fri::Commitment,
     _data: PhantomData<(F, H)>,
@@ -87,6 +90,14 @@ impl<F: Field256, H: Hasher<F>> Commitment<F, H> {
     /// Returns the root hashes of the Merkle trees where all batched polynomials are stored.
     pub fn tree_roots(&self) -> &[H256] {
         self.tree_roots.as_slice()
+    }
+
+    /// Returns the number of polynomials in each batch, which is also the number of evaluations
+    /// stored in each leaf of the corresponding Merkle tree.
+    ///
+    /// The returned slice has one element for every [tree root](`Self::tree_roots`).
+    pub fn batch_sizes(&self) -> &[usize] {
+        self.batch_sizes.as_slice()
     }
 
     /// The degree bound this commitment attests to, implied by the number of FRI folding rounds.
@@ -143,10 +154,14 @@ impl<F: Field256, H: Hasher<F>> Commitment<F, H> {
     /// Serializes this commitment to a [`Commitment`](`proto::Commitment`) protobuf.
     pub fn to_proto(&self) -> proto::Commitment {
         proto::Commitment {
-            tree_roots: self
+            batches: self
                 .tree_roots
                 .iter()
-                .map(|&hash| hash.as_bytes().to_vec())
+                .zip(self.batch_sizes.iter())
+                .map(|(root, &num_polys)| proto::commitment::Batch {
+                    root: root.as_bytes().to_vec(),
+                    num_polys: num_polys as u64,
+                })
                 .collect(),
             fri_roots: self
                 .inner
@@ -159,11 +174,22 @@ impl<F: Field256, H: Hasher<F>> Commitment<F, H> {
 
     /// Deserializes a commitment from a [`Commitment`](`proto::Commitment`) protobuf.
     pub fn from_proto(proto: &proto::Commitment) -> Result<Self> {
+        if proto.batches.is_empty() {
+            return Err(anyhow!("the commitment has no polynomial batches"));
+        }
+        if proto.fri_roots.is_empty() {
+            return Err(anyhow!("the commitment has no FRI roots"));
+        }
         Ok(Self {
             tree_roots: proto
-                .tree_roots
+                .batches
                 .iter()
-                .map(|bytes| H::load_hash(bytes.as_slice()))
+                .map(|batch| H::load_hash(batch.root.as_slice()))
+                .collect::<Result<_>>()?,
+            batch_sizes: proto
+                .batches
+                .iter()
+                .map(|batch| Ok(usize::try_from(batch.num_polys)?))
                 .collect::<Result<_>>()?,
             inner: fri::Commitment::with_roots(
                 proto
@@ -358,6 +384,7 @@ impl<F: Field256, H: Hasher<F>> Committer<F, H> {
 
         let commitment = Commitment {
             tree_roots: self.trees.iter().map(Tree::root_hash).collect(),
+            batch_sizes: self.trees.iter().map(Tree::num_polys).collect(),
             inner: inner_prover.commit(),
             _data: Default::default(),
         };
@@ -375,8 +402,9 @@ impl<F: Field256, H: Hasher<F>> Committer<F, H> {
 /// A DEEP-FRI proof.
 #[derive(Debug, Clone)]
 pub struct Proof<F: Field256, H: Hasher<F>> {
-    /// The proven degree bound. If the proof is valid the degree of all batched polynomials is
-    /// guaranteed to be strictly less than this value.
+    /// The proven degree bound. Honest provers commit polynomials of degree strictly less than this
+    /// value, but a valid proof only guarantees a degree at most equal to it (see
+    /// [`Self::verify`]).
     degree_bound: usize,
     /// The base-2 logarithm of the blowup factor.
     blowup_log2: usize,
@@ -397,6 +425,9 @@ pub struct Proof<F: Field256, H: Hasher<F>> {
 
 impl<F: Field256, H: Hasher<F>> Proof<F, H> {
     /// Returns the proven degree bound.
+    ///
+    /// NOTE: a valid proof guarantees that the committed polynomials have degree *at most* this
+    /// value, not strictly less than it. See [`Self::verify`] for details.
     pub fn degree_bound(&self) -> usize {
         self.degree_bound
     }
@@ -423,8 +454,53 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
     }
 
     /// Verifies this proof against the given commitment.
+    ///
+    /// If verification succeeds, the committed polynomials have degree *at most*
+    /// [`Self::degree_bound`] and their evaluations at the [opened points](`Self::points`) are the
+    /// ones claimed by the proof.
+    ///
+    /// WARNING: honest provers commit polynomials of degree *strictly less* than
+    /// [`Self::degree_bound`], but a valid proof only guarantees a degree *at most* equal to it.
+    /// FRI bounds the degree of the DEEP quotients `(f(X) - f(z)) / (X - z)` rather than that of
+    /// the committed polynomials `f(X)`, and each quotient has one degree less than its polynomial.
+    /// This slack is common to DEEP-FRI implementations (cfr. the description of the "knowledge
+    /// extractor" in Section 5.5 of the ethSTARK documentation) and is harmless for protocols whose
+    /// constraints only depend on the values of the polynomials over the multiplicative subgroup
+    /// `H` of size `degree_bound`, such as PLONK and AIR. A polynomial of degree `degree_bound`
+    /// equals one of lower degree plus a multiple of `X^degree_bound - 1`, which vanishes on `H`.
+    /// Protocols whose soundness depends on the exact degree bound, such as univariate sumcheck,
+    /// must take the slack into account.
     pub fn verify(&self, commitment: &Commitment<F, H>) -> Result<()> {
         check_points_off_domain(self.points.keys().copied(), self.extended_domain_size())?;
+
+        if commitment.inner.len() != self.degree_bound.trailing_zeros() as usize + 1 {
+            return Err(anyhow!(
+                "the degree bound {} doesn't match the {} FRI roots of the commitment",
+                self.degree_bound,
+                commitment.inner.len()
+            ));
+        }
+
+        let num_polys = commitment.batch_sizes().iter().copied().sum();
+        if self.num_polys != num_polys {
+            return Err(anyhow!(
+                "incorrect number of polynomials (got {}, want {})",
+                self.num_polys,
+                num_polys
+            ));
+        }
+        if self.points.is_empty() {
+            return Err(anyhow!("the proof doesn't open any points"));
+        }
+        for (&z, values) in &self.points {
+            if values.len() != self.num_polys {
+                return Err(anyhow!(
+                    "incorrect number of evaluations at {z} (got {}, want {})",
+                    values.len(),
+                    self.num_polys
+                ));
+            }
+        }
 
         let indices = commitment.get_query_indices(self.degree_bound, self.blowup_log2);
         if self.openings.len() != indices.len() {
@@ -474,9 +550,21 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
                     commitment.tree_roots().len()
                 ));
             }
-            for (&root_hash, opening) in commitment.tree_roots().iter().zip(openings.iter()) {
+            for ((&root_hash, &batch_size), opening) in commitment
+                .tree_roots()
+                .iter()
+                .zip(commitment.batch_sizes())
+                .zip(openings.iter())
+            {
                 if 1usize << opening.len() != self.extended_domain_size() {
                     return Err(anyhow!("invalid opening for index {index}"));
+                }
+                if opening.leaf().len() != batch_size {
+                    return Err(anyhow!(
+                        "incorrect batch size at index {index} (got {}, want {})",
+                        opening.leaf().len(),
+                        batch_size
+                    ));
                 }
                 opening.verify(index, root_hash)?;
             }
@@ -549,6 +637,26 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
     pub fn from_proto(proto: &proto::Proof) -> Result<Self> {
         let degree_bound = proto.degree_bound as usize;
         let blowup_log2 = proto.blowup_log2 as usize;
+
+        if !degree_bound.is_power_of_two() {
+            return Err(anyhow!(
+                "invalid degree bound {} (not a power of two)",
+                degree_bound
+            ));
+        }
+        if blowup_log2 == 0 {
+            return Err(anyhow!("invalid blowup factor 2^0"));
+        }
+        let degree_bound_log2 = degree_bound.trailing_zeros() as usize;
+        if degree_bound_log2 + blowup_log2 > F::BaseField::S {
+            return Err(anyhow!(
+                "invalid extended domain size 2^{{{}+{}}} (exceeds the 2-adicity of the field, {})",
+                degree_bound_log2,
+                blowup_log2,
+                F::BaseField::S
+            ));
+        }
+
         Ok(Self {
             degree_bound,
             blowup_log2,
@@ -986,6 +1094,46 @@ mod tests {
     }
 
     #[test]
+    fn test_reject_mismatched_degree_bound() {
+        let (commitment, mut proof) = adversarial_setup();
+        proof.degree_bound *= 2;
+        assert_rejected(proof.verify(&commitment), "FRI roots of the commitment");
+    }
+
+    #[test]
+    fn test_reject_zero_degree_bound() {
+        let (_, proof) = adversarial_setup();
+        let mut proto = proof.to_proto();
+        proto.degree_bound = 0;
+        assert_rejected(
+            Proof::<BS, Sha2Hash<BS>>::from_proto(&proto).map(|_| ()),
+            "not a power of two",
+        );
+    }
+
+    #[test]
+    fn test_reject_zero_blowup_factor() {
+        let (_, proof) = adversarial_setup();
+        let mut proto = proof.to_proto();
+        proto.blowup_log2 = 0;
+        assert_rejected(
+            Proof::<BS, Sha2Hash<BS>>::from_proto(&proto).map(|_| ()),
+            "invalid blowup factor",
+        );
+    }
+
+    #[test]
+    fn test_reject_oversized_domain() {
+        let (_, proof) = adversarial_setup();
+        let mut proto = proof.to_proto();
+        proto.blowup_log2 = 64;
+        assert_rejected(
+            Proof::<BS, Sha2Hash<BS>>::from_proto(&proto).map(|_| ()),
+            "invalid extended domain size",
+        );
+    }
+
+    #[test]
     fn test_reject_on_domain_point() {
         let (commitment, mut proof) = adversarial_setup();
         let values = proof.points.values().next().unwrap().clone();
@@ -1003,13 +1151,40 @@ mod tests {
     }
 
     #[test]
+    fn test_reject_no_points() {
+        let (commitment, mut proof) = adversarial_setup();
+        proof.points.clear();
+        assert_rejected(
+            proof.verify(&commitment),
+            "the proof doesn't open any points",
+        );
+    }
+
+    #[test]
+    fn test_reject_missing_evaluation() {
+        let (commitment, mut proof) = adversarial_setup();
+        let z = *proof.points.keys().next().unwrap();
+        proof.points.get_mut(&z).unwrap().pop();
+        assert_rejected(proof.verify(&commitment), "incorrect number of evaluations");
+    }
+
+    #[test]
+    fn test_reject_extra_evaluation() {
+        let (commitment, mut proof) = adversarial_setup();
+        let z = *proof.points.keys().next().unwrap();
+        proof.points.get_mut(&z).unwrap().push(BS::ZERO);
+        assert_rejected(proof.verify(&commitment), "incorrect number of evaluations");
+    }
+
+    #[test]
     fn test_reject_foreign_commitment() {
         let (_, proof) = adversarial_setup();
-        let committer = Committer::<BS, Sha2Hash<BS>>::new(
+        let mut committer = Committer::<BS, Sha2Hash<BS>>::new(
             ADVERSARIAL_DEGREE_BOUND,
             ADVERSARIAL_BLOWUP_LOG2,
-            vec![polynomial(&[99, 98, 97, 96])],
+            vec![polynomial(&[99, 98, 97, 96]), polynomial(&[95, 94, 93, 92])],
         );
+        committer.add_batch(vec![polynomial(&[91, 90, 89, 88])]);
         let (foreign, _) = committer.commit(BTreeSet::from([BS::from(123u16)]));
         assert_rejected(proof.verify(&foreign), "wrong query index");
     }
@@ -1071,6 +1246,42 @@ mod tests {
     }
 
     #[test]
+    fn test_reject_misreported_batch_sizes() {
+        let (mut commitment, proof) = adversarial_setup();
+        commitment.batch_sizes = vec![1, 2];
+        assert_rejected(proof.verify(&commitment), "incorrect batch size");
+    }
+
+    #[test]
+    fn test_reject_wrong_number_of_polynomials() {
+        let (commitment, mut proof) = adversarial_setup();
+        proof.num_polys += 1;
+        assert_rejected(proof.verify(&commitment), "incorrect number of polynomials");
+    }
+
+    #[test]
+    fn test_reject_commitment_without_batches() {
+        let (commitment, _) = adversarial_setup();
+        let mut proto = commitment.to_proto();
+        proto.batches.clear();
+        assert_rejected(
+            Commitment::<BS, Sha2Hash<BS>>::from_proto(&proto).map(|_| ()),
+            "the commitment has no polynomial batches",
+        );
+    }
+
+    #[test]
+    fn test_reject_commitment_without_fri_roots() {
+        let (commitment, _) = adversarial_setup();
+        let mut proto = commitment.to_proto();
+        proto.fri_roots.clear();
+        assert_rejected(
+            Commitment::<BS, Sha2Hash<BS>>::from_proto(&proto).map(|_| ()),
+            "the commitment has no FRI roots",
+        );
+    }
+
+    #[test]
     fn test_commitment_serialization() {
         let mut committer = Committer::<BS, Sha2Hash<BS>>::new(
             4,
@@ -1087,6 +1298,7 @@ mod tests {
                 parse("0x13880d0002db3411382d144a40f86201f3b84b55c317bcb0b583f166100e8b37"),
             ]
         );
+        assert_eq!(commitment.batch_sizes(), [2, 1]);
         assert_eq!(
             commitment.transcript_hash(1),
             parse("0x8e58a20287b9d5f4743c73d0d57b2b1dcb5846f4b658d5463a393b0b44dafcfc")
@@ -1105,6 +1317,7 @@ mod tests {
                 parse("0x13880d0002db3411382d144a40f86201f3b84b55c317bcb0b583f166100e8b37"),
             ]
         );
+        assert_eq!(commitment.batch_sizes(), [2, 1]);
         assert_eq!(
             commitment.transcript_hash(1),
             parse("0x8e58a20287b9d5f4743c73d0d57b2b1dcb5846f4b658d5463a393b0b44dafcfc")
@@ -1126,8 +1339,10 @@ mod tests {
         let (commitment, prover) =
             committer.commit(BTreeSet::from([BS::from(123u16), BS::from(456u16)]));
         let proof = prover.prove(&commitment);
-        let proto = proof.to_proto();
-        let proof = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
+        let commitment_proto = commitment.to_proto();
+        let proof_proto = proof.to_proto();
+        let commitment = Commitment::<BS, Sha2Hash<BS>>::from_proto(&commitment_proto).unwrap();
+        let proof = Proof::<BS, Sha2Hash<BS>>::from_proto(&proof_proto).unwrap();
         assert_eq!(proof.degree_bound(), 4);
         assert_eq!(proof.blowup_log2(), 3);
         assert_eq!(proof.num_polys(), 3);
