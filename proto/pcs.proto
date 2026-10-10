@@ -81,8 +81,11 @@ message Query {
 
 // A batched DEEP-FRI proof.
 message Proof {
-  // The proven degree bound. If the proof is valid the degree of all batched polynomials is
-  // guaranteed to be strictly less than this value.
+  // The proven degree bound.
+  //
+  // NOTE: honest provers commit polynomials of degree strictly less than this value, but a valid
+  // proof only guarantees a degree at most equal to it, because FRI bounds the degree of the DEEP
+  // quotients (f(X) - f(z)) / (X - z) rather than that of the committed polynomials f(X).
   uint64 degree_bound = 1;
 
   // The base-2 logarithm of the blowup factor.

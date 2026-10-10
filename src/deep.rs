@@ -402,8 +402,9 @@ impl<F: Field256, H: Hasher<F>> Committer<F, H> {
 /// A DEEP-FRI proof.
 #[derive(Debug, Clone)]
 pub struct Proof<F: Field256, H: Hasher<F>> {
-    /// The proven degree bound. If the proof is valid the degree of all batched polynomials is
-    /// guaranteed to be strictly less than this value.
+    /// The proven degree bound. Honest provers commit polynomials of degree strictly less than this
+    /// value, but a valid proof only guarantees a degree at most equal to it (see
+    /// [`Self::verify`]).
     degree_bound: usize,
     /// The base-2 logarithm of the blowup factor.
     blowup_log2: usize,
@@ -424,6 +425,9 @@ pub struct Proof<F: Field256, H: Hasher<F>> {
 
 impl<F: Field256, H: Hasher<F>> Proof<F, H> {
     /// Returns the proven degree bound.
+    ///
+    /// NOTE: a valid proof guarantees that the committed polynomials have degree *at most* this
+    /// value, not strictly less than it. See [`Self::verify`] for details.
     pub fn degree_bound(&self) -> usize {
         self.degree_bound
     }
@@ -450,6 +454,22 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
     }
 
     /// Verifies this proof against the given commitment.
+    ///
+    /// If verification succeeds, the committed polynomials have degree *at most*
+    /// [`Self::degree_bound`] and their evaluations at the [opened points](`Self::points`) are the
+    /// ones claimed by the proof.
+    ///
+    /// WARNING: honest provers commit polynomials of degree *strictly less* than
+    /// [`Self::degree_bound`], but a valid proof only guarantees a degree *at most* equal to it.
+    /// FRI bounds the degree of the DEEP quotients `(f(X) - f(z)) / (X - z)` rather than that of
+    /// the committed polynomials `f(X)`, and each quotient has one degree less than its polynomial.
+    /// This slack is common to DEEP-FRI implementations (cfr. the description of the "knowledge
+    /// extractor" in Section 5.5 of the ethSTARK documentation) and is harmless for protocols whose
+    /// constraints only depend on the values of the polynomials over the multiplicative subgroup
+    /// `H` of size `degree_bound`, such as PLONK and AIR. A polynomial of degree `degree_bound`
+    /// equals one of lower degree plus a multiple of `X^degree_bound - 1`, which vanishes on `H`.
+    /// Protocols whose soundness depends on the exact degree bound, such as univariate sumcheck,
+    /// must take the slack into account.
     pub fn verify(&self, commitment: &Commitment<F, H>) -> Result<()> {
         check_points_off_domain(self.points.keys().copied(), self.extended_domain_size())?;
 
