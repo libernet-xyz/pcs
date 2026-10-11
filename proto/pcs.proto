@@ -110,7 +110,9 @@ message Proof {
   // The points opened by the proof.
   repeated Point points = 4;
 
-  message Opening { repeated LeafProof proofs = 1; }
+  message Opening {
+    repeated LeafProof proofs = 1;
+  }
 
   // Merkle proofs for the points at the query positions, relative to the raw Merkle trees (not the
   // FRI folds). There's one entry for every FRI query (`openings.len() == queries.len()`).
