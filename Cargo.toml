@@ -6,7 +6,7 @@ license = "Apache-2.0"
 repository = "https://github.com/libernet-xyz/pcs.git"
 readme = "README.md"
 edition = "2024"
-links = "starkom-pcs-v7"
+links = "starkom-pcs-v8"
 
 [package.metadata.docs.rs]
 all-features = true

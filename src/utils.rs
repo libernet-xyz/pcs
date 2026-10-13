@@ -3,6 +3,35 @@ use primitive_types::H256;
 use sha2::Digest;
 use starkom_ff::Field;
 
+/// Authority used in the type URLs of all protobuf messages that go into `google.protobuf.Any`
+/// fields.
+pub(crate) const TYPE_URL_AUTHORITY: &str = "type.starkom.io";
+
+/// Implements [`prost::Name`] for a protobuf message type, overriding
+/// [`type_url`](`prost::Name::type_url`) so that it's prefixed with [`TYPE_URL_AUTHORITY`] rather
+/// than a bare slash.
+///
+/// The arguments are the message type, its simple name as it appears in the `.proto` file, and the
+/// name of its package.
+macro_rules! prost_name {
+    ($type:ty, $name:literal, $package:literal) => {
+        impl ::prost::Name for $type {
+            const NAME: &'static str = $name;
+            const PACKAGE: &'static str = $package;
+
+            fn type_url() -> String {
+                format!(
+                    "{}/{}",
+                    $crate::utils::TYPE_URL_AUTHORITY,
+                    <Self as ::prost::Name>::full_name()
+                )
+            }
+        }
+    };
+}
+
+pub(crate) use prost_name;
+
 pub(crate) fn make_dst(s: &'static [u8]) -> H256 {
     let mut hasher = sha3::Sha3_256::new();
     hasher.update(s);

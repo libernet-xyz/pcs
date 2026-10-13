@@ -5,7 +5,6 @@ use crate::starkom::proto::pcs::v8 as proto;
 use crate::utils;
 use anyhow::{Result, anyhow};
 use primitive_types::{H256, U256};
-use prost::Name;
 use prost_types::Any;
 use starkom_ff::{Field, Field256};
 use starkom_poly::Polynomial;
@@ -72,6 +71,27 @@ fn rlc<F: Field>(values: impl IntoIterator<Item = F>, alpha: F) -> F {
         pow *= alpha;
     }
     rlc
+}
+
+/// Checks that the `hash_backend` field of a protobuf identifies the hash backend `T`.
+///
+/// Only the fully qualified type name is compared: the authority in front of it is ignored.
+fn check_hash_backend<T: prost::Name + Default>(
+    hash_backend: &Option<prost_types::Any>,
+) -> Result<()> {
+    match hash_backend {
+        Some(hash_backend) => {
+            hash_backend.to_msg::<T>().map_err(|_| {
+                anyhow!(
+                    "incorrect hash backend (got {}, want {})",
+                    hash_backend.type_url,
+                    T::type_url()
+                )
+            })?;
+            Ok(())
+        }
+        None => Err(anyhow!("hash backend not specified")),
+    }
 }
 
 /// A batched DEEP-FRI polynomial commitment (see [`Committer`] for details).
@@ -177,21 +197,7 @@ impl<F: Field256, H: Hasher<F>> Commitment<F, H> {
 
     /// Deserializes a commitment from a [`Commitment`](`proto::Commitment`) protobuf.
     pub fn from_proto(proto: &proto::Commitment) -> Result<Self> {
-        match &proto.hash_backend {
-            Some(hash_backend) => {
-                let expected_type_url = H::ProtoTag::type_url();
-                if hash_backend.type_url != expected_type_url {
-                    Err(anyhow!(
-                        "incorrect hash backend (got {}, want {})",
-                        hash_backend.type_url,
-                        expected_type_url,
-                    ))
-                } else {
-                    Ok(())
-                }
-            }
-            None => Err(anyhow!("hash backend not specified")),
-        }?;
+        check_hash_backend::<H::ProtoTag>(&proto.hash_backend)?;
 
         if proto.batches.is_empty() {
             return Err(anyhow!("the commitment has no polynomial batches"));
@@ -656,21 +662,7 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
     /// NOTE: this method does not validate the proof, it only deserializes it. The caller must
     /// invoke [`Self::verify`] separately.
     pub fn from_proto(proto: &proto::Proof) -> Result<Self> {
-        match &proto.hash_backend {
-            Some(hash_backend) => {
-                let expected_type_url = H::ProtoTag::type_url();
-                if hash_backend.type_url != expected_type_url {
-                    Err(anyhow!(
-                        "incorrect hash backend (got {}, want {})",
-                        hash_backend.type_url,
-                        expected_type_url,
-                    ))
-                } else {
-                    Ok(())
-                }
-            }
-            None => Err(anyhow!("hash backend not specified")),
-        }?;
+        check_hash_backend::<H::ProtoTag>(&proto.hash_backend)?;
 
         let degree_bound = proto.degree_bound as usize;
         let blowup_log2 = proto.blowup_log2 as usize;
@@ -1315,6 +1307,46 @@ mod tests {
         assert_rejected(
             Commitment::<BS, Sha2Hash<BS>>::from_proto(&proto).map(|_| ()),
             "the commitment has no FRI roots",
+        );
+    }
+
+    #[test]
+    fn test_reject_commitment_without_hash_backend() {
+        let (commitment, _) = adversarial_setup();
+        let mut proto = commitment.to_proto();
+        proto.hash_backend = None;
+        assert_rejected(
+            Commitment::<BS, Sha2Hash<BS>>::from_proto(&proto).map(|_| ()),
+            "hash backend not specified",
+        );
+    }
+
+    #[test]
+    fn test_reject_proof_without_hash_backend() {
+        let (_, proof) = adversarial_setup();
+        let mut proto = proof.to_proto();
+        proto.hash_backend = None;
+        assert_rejected(
+            Proof::<BS, Sha2Hash<BS>>::from_proto(&proto).map(|_| ()),
+            "hash backend not specified",
+        );
+    }
+
+    #[test]
+    fn test_reject_commitment_with_wrong_hash_backend() {
+        let (commitment, _) = adversarial_setup();
+        assert_rejected(
+            Commitment::<BS, Keccak256Hash<BS>>::from_proto(&commitment.to_proto()).map(|_| ()),
+            "incorrect hash backend",
+        );
+    }
+
+    #[test]
+    fn test_reject_proof_with_wrong_hash_backend() {
+        let (_, proof) = adversarial_setup();
+        assert_rejected(
+            Proof::<BS, Keccak256Hash<BS>>::from_proto(&proof.to_proto()).map(|_| ()),
+            "incorrect hash backend",
         );
     }
 
