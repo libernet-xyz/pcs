@@ -74,8 +74,6 @@ fn rlc<F: Field>(values: impl IntoIterator<Item = F>, alpha: F) -> F {
 }
 
 /// Checks that the `hash_backend` field of a protobuf identifies the hash backend `T`.
-///
-/// Only the fully qualified type name is compared: the authority in front of it is ignored.
 fn check_hash_backend<T: prost::Name + Default>(
     hash_backend: &Option<prost_types::Any>,
 ) -> Result<()> {
