@@ -98,7 +98,7 @@ message Query {
 
 // A batched DEEP-FRI proof.
 message Proof {
-  // Hash backend used for this commitment.
+  // Hash backend used for this proof.
   //
   // It can be `Sha2HashBackend`, `KeccakHashBackend`, or any other user-defined tag with a
   // corresponding backend implementation.
