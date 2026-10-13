@@ -1,3 +1,4 @@
+use crate::starkom::proto::pcs::v8 as proto;
 use anyhow::{Result, anyhow};
 use primitive_types::{H256, U128, U256, U512};
 use sha2::Digest;
@@ -5,8 +6,22 @@ use starkom_ff::Field256;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 
+impl prost::Name for proto::Sha2HashBackend {
+    const NAME: &'static str = "Sha2HashBackend";
+    const PACKAGE: &'static str = "starkom.proto.pcs.v8";
+}
+
+impl prost::Name for proto::KeccakHashBackend {
+    const NAME: &'static str = "KeccakHashBackend";
+    const PACKAGE: &'static str = "starkom.proto.pcs.v8";
+}
+
 /// Describes a hash backend for hashing internal Merkle tree nodes.
 pub trait MerkleHasher {
+    /// Protobuf message type used to identify the hash backend used in [proofs](`proto::Proof`) and
+    /// [commitments](`proto::Commitment`).
+    type ProtoTag: prost::Message + prost::Name + Default;
+
     /// Hashes a binary Merkle tree node.
     fn hash_binary(left: H256, right: H256) -> H256;
 
@@ -63,6 +78,7 @@ mod internal {
     use super::*;
 
     pub trait LowLevelHash: Debug + Default {
+        type ProtoTag: prost::Message + prost::Name + Default;
         fn update(&mut self, bytes: &[u8]);
         fn finalize(self) -> H256;
     }
@@ -73,6 +89,8 @@ mod internal {
     }
 
     impl LowLevelHash for LowLevelSha2Hash {
+        type ProtoTag = proto::Sha2HashBackend;
+
         fn update(&mut self, bytes: &[u8]) {
             self.hasher.update(bytes);
         }
@@ -88,6 +106,8 @@ mod internal {
     }
 
     impl LowLevelHash for LowLevelKeccak256Hash {
+        type ProtoTag = proto::KeccakHashBackend;
+
         fn update(&mut self, bytes: &[u8]) {
             self.hasher.update(bytes);
         }
@@ -142,6 +162,8 @@ mod internal {
     }
 
     impl<H: LowLevelHash, F: Field256> MerkleHasher for HasherImpl<H, F> {
+        type ProtoTag = H::ProtoTag;
+
         fn hash_binary(left: H256, right: H256) -> H256 {
             let mut hasher = H::default();
             hasher.update(left.as_bytes());

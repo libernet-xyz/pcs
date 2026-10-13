@@ -6,8 +6,8 @@
 pub mod starkom {
     pub mod proto {
         pub mod pcs {
-            pub mod v7 {
-                include!(concat!(env!("OUT_DIR"), "/starkom.proto.pcs.v7.rs"));
+            pub mod v8 {
+                include!(concat!(env!("OUT_DIR"), "/starkom.proto.pcs.v8.rs"));
             }
         }
     }

@@ -1,10 +1,12 @@
 use crate::fri;
 use crate::hash::Hasher;
 use crate::merkle::{Proof as LeafProof, Tree};
-use crate::starkom::proto::pcs::v7 as proto;
+use crate::starkom::proto::pcs::v8 as proto;
 use crate::utils;
 use anyhow::{Result, anyhow};
 use primitive_types::{H256, U256};
+use prost::Name;
+use prost_types::Any;
 use starkom_ff::{Field, Field256};
 use starkom_poly::Polynomial;
 use std::collections::{BTreeMap, BTreeSet};
@@ -154,6 +156,7 @@ impl<F: Field256, H: Hasher<F>> Commitment<F, H> {
     /// Serializes this commitment to a [`Commitment`](`proto::Commitment`) protobuf.
     pub fn to_proto(&self) -> proto::Commitment {
         proto::Commitment {
+            hash_backend: Some(Any::from_msg(&H::ProtoTag::default()).unwrap()),
             batches: self
                 .tree_roots
                 .iter()
@@ -174,12 +177,29 @@ impl<F: Field256, H: Hasher<F>> Commitment<F, H> {
 
     /// Deserializes a commitment from a [`Commitment`](`proto::Commitment`) protobuf.
     pub fn from_proto(proto: &proto::Commitment) -> Result<Self> {
+        match &proto.hash_backend {
+            Some(hash_backend) => {
+                let expected_type_url = H::ProtoTag::type_url();
+                if hash_backend.type_url != expected_type_url {
+                    Err(anyhow!(
+                        "incorrect hash backend (got {}, want {})",
+                        hash_backend.type_url,
+                        expected_type_url,
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            None => Err(anyhow!("hash backend not specified")),
+        }?;
+
         if proto.batches.is_empty() {
             return Err(anyhow!("the commitment has no polynomial batches"));
         }
         if proto.fri_roots.is_empty() {
             return Err(anyhow!("the commitment has no FRI roots"));
         }
+
         Ok(Self {
             tree_roots: proto
                 .batches
@@ -605,6 +625,7 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
     /// Serializes this proof to a [`Proof`](`proto::Proof`) protobuf.
     pub fn to_proto(&self) -> proto::Proof {
         proto::Proof {
+            hash_backend: Some(Any::from_msg(&H::ProtoTag::default()).unwrap()),
             degree_bound: self.degree_bound as u64,
             blowup_log2: self.blowup_log2 as u32,
             num_polys: self.num_polys as u64,
@@ -635,6 +656,22 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
     /// NOTE: this method does not validate the proof, it only deserializes it. The caller must
     /// invoke [`Self::verify`] separately.
     pub fn from_proto(proto: &proto::Proof) -> Result<Self> {
+        match &proto.hash_backend {
+            Some(hash_backend) => {
+                let expected_type_url = H::ProtoTag::type_url();
+                if hash_backend.type_url != expected_type_url {
+                    Err(anyhow!(
+                        "incorrect hash backend (got {}, want {})",
+                        hash_backend.type_url,
+                        expected_type_url,
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            None => Err(anyhow!("hash backend not specified")),
+        }?;
+
         let degree_bound = proto.degree_bound as usize;
         let blowup_log2 = proto.blowup_log2 as usize;
 
