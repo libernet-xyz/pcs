@@ -1,9 +1,26 @@
 syntax = "proto3";
 
-package starkom.proto.pcs.v7;
+import "google/protobuf/any.proto";
+
+package starkom.proto.pcs.v8;
+
+// Identifier for the Starkom-provided SHA2-256 hash backend.
+message Sha2HashBackend {}
+
+// Identifier for the Starkom-provided Keccak-256 hash backend.
+message KeccakHashBackend {}
 
 // A batched DEEP-FRI polynomial commitment.
 message Commitment {
+  // Hash backend used for this commitment.
+  //
+  // It can be `Sha2HashBackend`, `KeccakHashBackend`, or any other user-defined tag with a
+  // corresponding backend implementation.
+  //
+  // NOTE: in order to warrant 128-bit security in a quantum setting, all backends are required to
+  // use a ~256-bit cryptographic hash.
+  .google.protobuf.Any hash_backend = 1;
+
   // Commitment data for a batch of polynomials whose evaluations are stored in the same Merkle
   // tree.
   message Batch {
@@ -16,7 +33,7 @@ message Commitment {
   }
 
   // The polynomial batches, in commitment order. There must be at least one batch.
-  repeated Batch batches = 1;
+  repeated Batch batches = 2;
 
   // Merkle roots of the FRI folding argument.
   //
@@ -28,7 +45,7 @@ message Commitment {
   // tree.
   //
   // Each root hash is stored as a 32 byte sequence.
-  repeated bytes fri_roots = 2;
+  repeated bytes fri_roots = 3;
 }
 
 // A Merkle proof.
@@ -81,18 +98,27 @@ message Query {
 
 // A batched DEEP-FRI proof.
 message Proof {
+  // Hash backend used for this proof.
+  //
+  // It can be `Sha2HashBackend`, `KeccakHashBackend`, or any other user-defined tag with a
+  // corresponding backend implementation.
+  //
+  // NOTE: in order to warrant 128-bit security in a quantum setting, all backends are required to
+  // use a ~256-bit cryptographic hash.
+  .google.protobuf.Any hash_backend = 1;
+
   // The proven degree bound.
   //
   // NOTE: honest provers commit polynomials of degree strictly less than this value, but a valid
   // proof only guarantees a degree at most equal to it, because FRI bounds the degree of the DEEP
   // quotients (f(X) - f(z)) / (X - z) rather than that of the committed polynomials f(X).
-  uint64 degree_bound = 1;
+  uint64 degree_bound = 2;
 
   // The base-2 logarithm of the blowup factor.
-  uint32 blowup_log2 = 2;
+  uint32 blowup_log2 = 3;
 
   // Number of committed polynomials.
-  uint64 num_polys = 3;
+  uint64 num_polys = 4;
 
   // A point opened by the proof.
   message Point {
@@ -108,7 +134,7 @@ message Proof {
   }
 
   // The points opened by the proof.
-  repeated Point points = 4;
+  repeated Point points = 5;
 
   message Opening {
     repeated LeafProof proofs = 1;
@@ -116,8 +142,8 @@ message Proof {
 
   // Merkle proofs for the points at the query positions, relative to the raw Merkle trees (not the
   // FRI folds). There's one entry for every FRI query (`openings.len() == queries.len()`).
-  repeated Opening openings = 5;
+  repeated Opening openings = 6;
 
   // FRI queries on the DEEP quotients.
-  repeated Query queries = 6;
+  repeated Query queries = 7;
 }
