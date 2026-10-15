@@ -28,17 +28,54 @@ static QUERY_DST1: LazyLock<H256> = LazyLock::new(|| utils::make_dst(b"starkom/d
 /// Domain separator tag for the Fiat-Shamir challenge used to build the random linear combination.
 static RLC_DST: LazyLock<H256> = LazyLock::new(|| utils::make_dst(b"starkom/deep/rlc"));
 
+/// Domain separator tag for the proof-of-work hash used for grinding.
+static POW_DST: LazyLock<H256> = LazyLock::new(|| utils::make_dst(b"starkom/deep/pow"));
+
 /// Returns the number of FRI queries required to achieve 128-bit security using a blowup factor of
-/// `2^blowup_log2`.
-pub fn num_queries(blowup_log2: usize) -> usize {
-    LAMBDA.div_ceil(blowup_log2)
+/// `2^blowup_log2` and `grinding_bits` bits of grinding.
+///
+/// Every query provides `blowup_log2` bits of security and grinding provides the rest. At least
+/// one query is always required.
+pub fn num_queries(blowup_log2: usize, grinding_bits: usize) -> usize {
+    LAMBDA
+        .saturating_sub(grinding_bits)
+        .div_ceil(blowup_log2)
+        .max(1)
 }
 
-/// Encodes a `usize` into a `H256` for use in various transcript hashes.
-fn encode_usize(value: usize) -> H256 {
-    let mut bytes = [0u8; 32];
-    bytes[24..32].copy_from_slice(&(value as u64).to_be_bytes());
-    H256::from_slice(&bytes)
+/// Computes the proof-of-work hash of a nonce.
+///
+/// `seed` is the hash of the full commitment transcript returned by [`Commitment::query_seed`], so
+/// that changing any commitment requires redoing the proof of work.
+fn proof_of_work<F: Field256, H: Hasher<F>>(seed: H256, nonce: u64) -> H256 {
+    H::hash_transcript(*POW_DST, &[seed, utils::encode_u64(nonce)])
+}
+
+/// Checks that a proof-of-work hash, interpreted as a big-endian 256-bit integer, has at least
+/// `grinding_bits` leading zero bits.
+fn check_proof_of_work(pow: H256, grinding_bits: usize) -> bool {
+    U256::from_big_endian(pow.as_bytes()).leading_zeros() as usize >= grinding_bits
+}
+
+/// Derives the FRI query indices from a proof-of-work hash via Fiat-Shamir.
+///
+/// The indices are derived from the proof-of-work hash rather than from the query seed, so that a
+/// cheating prover has to find a new valid nonce for every set of indices it wants to try. A single
+/// nonce covers all queries: one nonce per query would allow grinding every index independently,
+/// which defeats the purpose.
+fn get_query_indices<F: Field256, H: Hasher<F>>(
+    pow: H256,
+    degree_bound: usize,
+    blowup_log2: usize,
+    grinding_bits: usize,
+) -> Vec<usize> {
+    let n = U256::from((degree_bound << blowup_log2) as u64);
+    (0..num_queries(blowup_log2, grinding_bits))
+        .map(|i| {
+            let hash = H::challenge(*QUERY_DST1, &[pow, utils::encode_usize(i)]);
+            (hash.to_u256() % n).as_u64() as usize
+        })
+        .collect()
 }
 
 /// Checks that none of the given points lies inside the evaluation domain of size `n`.
@@ -141,34 +178,27 @@ impl<F: Field256, H: Hasher<F>> Commitment<F, H> {
         assert!(batch_count <= self.tree_roots.len());
         H::hash_transcript(
             *TRANSCRIPT_DST,
-            std::iter::once(encode_usize(batch_count))
+            std::iter::once(utils::encode_usize(batch_count))
                 .chain(self.tree_roots[..batch_count].iter().copied())
                 .collect::<Vec<H256>>()
                 .as_slice(),
         )
     }
 
-    /// Returns the FRI query indices derived via Fiat-Shamir from the full commitment transcript
-    /// (all polynomial and FRI Merkle root hashes).
-    fn get_query_indices(&self, degree_bound: usize, blowup_log2: usize) -> Vec<usize> {
-        let n = U256::from((degree_bound << blowup_log2) as u64);
-        let k = num_queries(blowup_log2);
-        let mut indices = Vec::with_capacity(k);
-        let seed = H::hash_transcript(
+    /// Hashes the full commitment transcript (all polynomial and FRI Merkle root hashes).
+    ///
+    /// The returned seed is the input of the proof of work, which in turn determines the FRI query
+    /// indices (see [`get_query_indices`]).
+    fn query_seed(&self) -> H256 {
+        H::hash_transcript(
             *QUERY_DST0,
-            std::iter::once(encode_usize(self.tree_roots.len()))
+            std::iter::once(utils::encode_usize(self.tree_roots.len()))
                 .chain(self.tree_roots.iter().copied())
-                .chain(std::iter::once(encode_usize(self.inner.len())))
+                .chain(std::iter::once(utils::encode_usize(self.inner.len())))
                 .chain(self.inner.roots().iter().copied())
                 .collect::<Vec<H256>>()
                 .as_slice(),
-        );
-        for i in 0..k {
-            let hash = H::challenge(*QUERY_DST1, &[seed, encode_usize(i)]);
-            let index = hash.to_u256() % n;
-            indices.push(index.as_u64() as usize);
-        }
-        indices
+        )
     }
 
     /// Serializes this commitment to a [`Commitment`](`proto::Commitment`) protobuf.
@@ -242,6 +272,8 @@ pub struct Committer<F: Field256, H: Hasher<F>> {
     degree_bound: usize,
     /// The base-2 logarithm of the blowup factor.
     blowup_log2: usize,
+    /// The number of grinding bits.
+    grinding_bits: usize,
     /// All polynomials batched so far.
     polynomials: Vec<Polynomial<F>>,
     /// The Merkle trees built so far.
@@ -251,21 +283,32 @@ pub struct Committer<F: Field256, H: Hasher<F>> {
 }
 
 impl<F: Field256, H: Hasher<F>> Committer<F, H> {
-    /// Constructs a [`Committer`] with the given degree bound, blowup factor, and first batch of
-    /// polynomials.
+    /// Constructs a [`Committer`] with the given degree bound, blowup factor, number of grinding
+    /// bits, and first batch of polynomials.
     ///
     /// We require specifying the first batch because our DEEP-FRI protocol requires at least one
     /// committed polynomial to work.
     ///
     /// `degree_bound` must be a power of 2 less than or equal to `2^(F::BaseField::S)`, and
     /// `blowup_log2` must not be zero.
-    pub fn new(degree_bound: usize, blowup_log2: usize, polynomials: Vec<Polynomial<F>>) -> Self {
+    ///
+    /// `grinding_bits` sets the difficulty of the proof of work: the prover grinds a nonce whose
+    /// proof-of-work hash has at least that many leading zero bits, which takes `2^grinding_bits`
+    /// hash evaluations on average. Every `blowup_log2` bits of grinding save one FRI query (see
+    /// [`num_queries`]). Pass 0 to disable grinding.
+    pub fn new(
+        degree_bound: usize,
+        blowup_log2: usize,
+        grinding_bits: usize,
+        polynomials: Vec<Polynomial<F>>,
+    ) -> Self {
         assert!(degree_bound.is_power_of_two());
         assert!(blowup_log2 > 0);
         assert!(!polynomials.is_empty());
         let mut committer = Self {
             degree_bound,
             blowup_log2,
+            grinding_bits,
             polynomials: vec![],
             trees: vec![],
         };
@@ -307,7 +350,7 @@ impl<F: Field256, H: Hasher<F>> Committer<F, H> {
     pub fn transcript_hash(&self) -> H256 {
         H::hash_transcript(
             *TRANSCRIPT_DST,
-            std::iter::once(encode_usize(self.trees.len()))
+            std::iter::once(utils::encode_usize(self.trees.len()))
                 .chain(self.trees.iter().map(Tree::root_hash))
                 .collect::<Vec<H256>>()
                 .as_slice(),
@@ -371,10 +414,10 @@ impl<F: Field256, H: Hasher<F>> Committer<F, H> {
 
         let alpha = H::challenge(
             *RLC_DST,
-            std::iter::once(encode_usize(self.trees.len()))
+            std::iter::once(utils::encode_usize(self.trees.len()))
                 .chain(self.trees.iter().map(Tree::root_hash))
-                .chain(std::iter::once(encode_usize(self.polynomials.len())))
-                .chain(std::iter::once(encode_usize(points.len())))
+                .chain(std::iter::once(utils::encode_usize(self.polynomials.len())))
+                .chain(std::iter::once(utils::encode_usize(points.len())))
                 .chain(points.iter().flat_map(|(z, values)| {
                     std::iter::once(z)
                         .chain(values.iter())
@@ -415,6 +458,7 @@ impl<F: Field256, H: Hasher<F>> Committer<F, H> {
         let prover = Prover {
             degree_bound: self.degree_bound,
             blowup_log2: self.blowup_log2,
+            grinding_bits: self.grinding_bits,
             trees: self.trees,
             points,
             inner_prover,
@@ -432,6 +476,10 @@ pub struct Proof<F: Field256, H: Hasher<F>> {
     degree_bound: usize,
     /// The base-2 logarithm of the blowup factor.
     blowup_log2: usize,
+    /// The number of grinding bits.
+    grinding_bits: usize,
+    /// The proof-of-work nonce found by the prover.
+    nonce: u64,
     /// Number of committed polynomials.
     num_polys: usize,
     /// The opened points. Keys are (off-domain) X-coordinates, values are the corresponding
@@ -443,7 +491,7 @@ pub struct Proof<F: Field256, H: Hasher<F>> {
     /// tree.
     openings: Vec<Vec<LeafProof<F, H>>>,
     /// FRI queries on the DEEP quotients. The number of queries is calculated by [`num_queries`]
-    /// above and is tuned so as to achieve 128-bit security.
+    /// above and is tuned to achieve 128-bit security together with grinding.
     queries: Vec<fri::Query<F, H>>,
 }
 
@@ -464,6 +512,20 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
     /// Returns the size of the extended evaluation domain.
     pub fn extended_domain_size(&self) -> usize {
         self.degree_bound << self.blowup_log2
+    }
+
+    /// Returns the number of grinding bits used in the proof.
+    ///
+    /// Soundness doesn't depend on this value because the number of queries is automatically
+    /// derived from it, but callers should still check it against the expected one along with other
+    /// proof parameters.
+    pub fn grinding_bits(&self) -> usize {
+        self.grinding_bits
+    }
+
+    /// Returns the proof-of-work nonce found by the prover.
+    pub fn nonce(&self) -> u64 {
+        self.nonce
     }
 
     /// Returns the number of committed polynomials.
@@ -526,7 +588,12 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
             }
         }
 
-        let indices = commitment.get_query_indices(self.degree_bound, self.blowup_log2);
+        let pow = proof_of_work::<F, H>(commitment.query_seed(), self.nonce);
+        if !check_proof_of_work(pow, self.grinding_bits) {
+            return Err(anyhow!("insufficient proof of work"));
+        }
+        let indices =
+            get_query_indices::<F, H>(pow, self.degree_bound, self.blowup_log2, self.grinding_bits);
         if self.openings.len() != indices.len() {
             return Err(anyhow!(
                 "incorrect number of openings (got {}, want {})",
@@ -544,10 +611,10 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
 
         let alpha = H::challenge(
             *RLC_DST,
-            std::iter::once(encode_usize(commitment.tree_roots().len()))
+            std::iter::once(utils::encode_usize(commitment.tree_roots().len()))
                 .chain(commitment.tree_roots().iter().copied())
-                .chain(std::iter::once(encode_usize(self.num_polys)))
-                .chain(std::iter::once(encode_usize(self.points.len())))
+                .chain(std::iter::once(utils::encode_usize(self.num_polys)))
+                .chain(std::iter::once(utils::encode_usize(self.points.len())))
                 .chain(self.points.iter().flat_map(|(z, values)| {
                     std::iter::once(z)
                         .chain(values.iter())
@@ -632,6 +699,8 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
             hash_backend: Some(Any::from_msg(&H::ProtoTag::default()).unwrap()),
             degree_bound: self.degree_bound as u64,
             blowup_log2: self.blowup_log2 as u32,
+            grinding_bits: self.grinding_bits as u32,
+            nonce: self.nonce,
             num_polys: self.num_polys as u64,
             points: self
                 .points
@@ -687,6 +756,8 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
         Ok(Self {
             degree_bound,
             blowup_log2,
+            grinding_bits: proto.grinding_bits as usize,
+            nonce: proto.nonce,
             num_polys: proto.num_polys as usize,
             points: proto
                 .points
@@ -731,6 +802,8 @@ pub struct Prover<F: Field256, H: Hasher<F>> {
     degree_bound: usize,
     /// The base-2 logarithm of the blowup factor.
     blowup_log2: usize,
+    /// The number of grinding bits.
+    grinding_bits: usize,
     /// Raw Merkle trees for the committed polynomials, one for each batch.
     trees: Vec<Tree<F, H>>,
     /// The opened points.
@@ -778,10 +851,28 @@ impl<F: Field256, H: Hasher<F>> Prover<F, H> {
         &self.points
     }
 
+    /// Carries out an exhaustive search for a valid nonce, stopping when one is found.
+    ///
+    /// This is our proof-of-work algorithm.
+    fn grind_nonce(&self, seed: H256) -> (u64, H256) {
+        for nonce in 0..=u64::MAX {
+            let pow = proof_of_work::<F, H>(seed, nonce);
+            if check_proof_of_work(pow, self.grinding_bits) {
+                return (nonce, pow);
+            }
+        }
+        panic!("no valid proof-of-work nonce found");
+    }
+
     /// Makes a DEEP-FRI proof opening the committed polynomials at the points specified at
     /// commitment time (see [`Committer::commit()`]).
+    ///
+    /// This includes grinding a proof-of-work nonce, which takes
+    /// 2^[`grinding_bits`](`Self::grinding_bits`) hash evaluations on average.
     pub fn prove(&self, commitment: &Commitment<F, H>) -> Proof<F, H> {
-        let indices = commitment.get_query_indices(self.degree_bound, self.blowup_log2);
+        let (nonce, pow) = self.grind_nonce(commitment.query_seed());
+        let indices =
+            get_query_indices::<F, H>(pow, self.degree_bound, self.blowup_log2, self.grinding_bits);
         let openings = indices
             .iter()
             .map(|&index| self.trees.iter().map(|tree| tree.query(index)).collect())
@@ -793,6 +884,8 @@ impl<F: Field256, H: Hasher<F>> Prover<F, H> {
         Proof {
             degree_bound: self.degree_bound,
             blowup_log2: self.blowup_log2,
+            grinding_bits: self.grinding_bits,
+            nonce,
             num_polys: self.num_polys(),
             points: self.points.clone(),
             openings,
@@ -832,13 +925,69 @@ mod tests {
             *RLC_DST,
             parse("0x688ae37e5f05871810e7c6777e1c16c55ef4b14f072357586d7a298cefc11368")
         );
+        assert_eq!(
+            *POW_DST,
+            parse("0xd659450ee50ebd3de60604eff7a514c5873b63b66073b1164b1cb61b7b113a51")
+        );
+    }
+
+    #[test]
+    fn test_num_queries() {
+        assert_eq!(num_queries(1, 0), 128);
+        assert_eq!(num_queries(4, 0), 32);
+        assert_eq!(num_queries(6, 0), 22);
+        assert_eq!(num_queries(4, 20), 27);
+        assert_eq!(num_queries(6, 20), 18);
+        assert_eq!(num_queries(4, 1), 32);
+        assert_eq!(num_queries(4, 4), 31);
+        assert_eq!(num_queries(4, 128), 1);
+        assert_eq!(num_queries(4, 256), 1);
+    }
+
+    #[test]
+    fn test_check_proof_of_work() {
+        let zero = H256::zero();
+        let one = H256::from_low_u64_be(1);
+        let top_bit = H256::from_slice(&(U256::one() << 255).to_big_endian());
+        let byte = H256::from_slice(&(U256::one() << 236).to_big_endian());
+        assert!(check_proof_of_work(top_bit, 0));
+        assert!(!check_proof_of_work(top_bit, 1));
+        assert!(check_proof_of_work(byte, 19));
+        assert!(!check_proof_of_work(byte, 20));
+        assert!(check_proof_of_work(one, 255));
+        assert!(!check_proof_of_work(one, 256));
+        assert!(check_proof_of_work(zero, 256));
+        assert!(!check_proof_of_work(zero, 257));
     }
 
     fn test_prover_impl<F: Field256, H: Hasher<F>>(
+        polynomial_batches: Vec<Vec<Polynomial<F>>>,
+        points: &[u16],
+        degree_bound: usize,
+        blowup_log2: usize,
+    ) {
+        test_prover_with_grinding_impl::<F, H>(
+            polynomial_batches.clone(),
+            points,
+            degree_bound,
+            blowup_log2,
+            0,
+        );
+        test_prover_with_grinding_impl::<F, H>(
+            polynomial_batches,
+            points,
+            degree_bound,
+            blowup_log2,
+            8,
+        );
+    }
+
+    fn test_prover_with_grinding_impl<F: Field256, H: Hasher<F>>(
         mut polynomial_batches: Vec<Vec<Polynomial<F>>>,
         points: &[u16],
         degree_bound: usize,
         blowup_log2: usize,
+        grinding_bits: usize,
     ) {
         let num_batches = polynomial_batches.len();
         let num_polys = polynomial_batches.iter().map(|batch| batch.len()).sum();
@@ -853,7 +1002,8 @@ mod tests {
             )
         }));
         let first_batch = polynomial_batches.remove(0);
-        let mut committer = Committer::<F, H>::new(degree_bound, blowup_log2, first_batch);
+        let mut committer =
+            Committer::<F, H>::new(degree_bound, blowup_log2, grinding_bits, first_batch);
         let transcript_hashes: Vec<H256> = std::iter::once(committer.transcript_hash())
             .chain(polynomial_batches.into_iter().map(|batch| {
                 committer.add_batch(batch);
@@ -878,6 +1028,12 @@ mod tests {
         assert_eq!(proof.blowup_log2(), blowup_log2);
         assert_eq!(proof.extended_domain_size(), degree_bound << blowup_log2);
         assert_eq!(proof.num_polys(), num_polys);
+        assert_eq!(proof.grinding_bits(), grinding_bits);
+        assert!(check_proof_of_work(
+            proof_of_work::<F, H>(commitment.query_seed(), proof.nonce()),
+            grinding_bits
+        ));
+        assert_eq!(proof.queries.len(), num_queries(blowup_log2, grinding_bits));
         assert!(proof.verify(&commitment).is_ok());
         assert_eq!(*proof.points(), points);
     }
@@ -1089,15 +1245,27 @@ mod tests {
 
     const ADVERSARIAL_DEGREE_BOUND: usize = 4;
     const ADVERSARIAL_BLOWUP_LOG2: usize = 2;
+    const ADVERSARIAL_GRINDING_BITS: usize = 8;
 
     fn polynomial(coefficients: &[u16]) -> Polynomial<BS> {
         Polynomial::with_coefficients(coefficients.iter().copied().map(BS::from).collect())
     }
 
     fn adversarial_setup() -> (Commitment<BS, Sha2Hash<BS>>, Proof<BS, Sha2Hash<BS>>) {
+        adversarial_setup_with_grinding(0)
+    }
+
+    fn grinding_setup() -> (Commitment<BS, Sha2Hash<BS>>, Proof<BS, Sha2Hash<BS>>) {
+        adversarial_setup_with_grinding(ADVERSARIAL_GRINDING_BITS)
+    }
+
+    fn adversarial_setup_with_grinding(
+        grinding_bits: usize,
+    ) -> (Commitment<BS, Sha2Hash<BS>>, Proof<BS, Sha2Hash<BS>>) {
         let mut committer = Committer::<BS, Sha2Hash<BS>>::new(
             ADVERSARIAL_DEGREE_BOUND,
             ADVERSARIAL_BLOWUP_LOG2,
+            grinding_bits,
             vec![polynomial(&[12, 34, 56, 78]), polynomial(&[42, 43, 44, 45])],
         );
         committer.add_batch(vec![polynomial(&[90, 78, 56, 34])]);
@@ -1209,6 +1377,7 @@ mod tests {
         let mut committer = Committer::<BS, Sha2Hash<BS>>::new(
             ADVERSARIAL_DEGREE_BOUND,
             ADVERSARIAL_BLOWUP_LOG2,
+            0,
             vec![polynomial(&[99, 98, 97, 96]), polynomial(&[95, 94, 93, 92])],
         );
         committer.add_batch(vec![polynomial(&[91, 90, 89, 88])]);
@@ -1264,6 +1433,7 @@ mod tests {
         let committer = Committer::<BS, Sha2Hash<BS>>::new(
             ADVERSARIAL_DEGREE_BOUND * 2,
             ADVERSARIAL_BLOWUP_LOG2,
+            0,
             vec![polynomial(&[11, 22, 33, 44])],
         );
         let (other_commitment, other_prover) = committer.commit(BTreeSet::from([BS::from(123u16)]));
@@ -1353,6 +1523,7 @@ mod tests {
         let mut committer = Committer::<BS, Sha2Hash<BS>>::new(
             4,
             1,
+            0,
             vec![polynomial(&[12, 34, 56, 78]), polynomial(&[42, 43, 44, 45])],
         );
         committer.add_batch(vec![polynomial(&[90, 78, 56, 34])]);
@@ -1400,12 +1571,14 @@ mod tests {
         let mut committer = Committer::<BS, Sha2Hash<BS>>::new(
             4,
             3,
+            8,
             vec![polynomial(&[12, 34, 56, 78]), polynomial(&[42, 43, 44, 45])],
         );
         committer.add_batch(vec![polynomial(&[90, 78, 56, 34])]);
         let (commitment, prover) =
             committer.commit(BTreeSet::from([BS::from(123u16), BS::from(456u16)]));
         let proof = prover.prove(&commitment);
+        let nonce = proof.nonce();
         let commitment_proto = commitment.to_proto();
         let proof_proto = proof.to_proto();
         let commitment = Commitment::<BS, Sha2Hash<BS>>::from_proto(&commitment_proto).unwrap();
@@ -1413,10 +1586,79 @@ mod tests {
         assert_eq!(proof.degree_bound(), 4);
         assert_eq!(proof.blowup_log2(), 3);
         assert_eq!(proof.num_polys(), 3);
+        assert_eq!(proof.grinding_bits(), 8);
+        assert_eq!(proof.nonce(), nonce);
         assert_eq!(
             proof.points().keys().copied().collect::<BTreeSet<BS>>(),
             BTreeSet::from([BS::from(123u16), BS::from(456u16)])
         );
         assert!(proof.verify(&commitment).is_ok());
+    }
+
+    /// Returns the smallest nonce greater than `proof.nonce` that satisfies (`valid == true`) or
+    /// fails (`valid == false`) the proof of work of `proof` against `commitment`.
+    fn find_nonce(
+        commitment: &Commitment<BS, Sha2Hash<BS>>,
+        proof: &Proof<BS, Sha2Hash<BS>>,
+        valid: bool,
+    ) -> u64 {
+        let seed = commitment.query_seed();
+        (proof.nonce + 1..)
+            .find(|&nonce| {
+                let pow = proof_of_work::<BS, Sha2Hash<BS>>(seed, nonce);
+                check_proof_of_work(pow, proof.grinding_bits) == valid
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn test_accept_ground_proof() {
+        let (commitment, proof) = grinding_setup();
+        assert_eq!(
+            proof.queries.len(),
+            num_queries(ADVERSARIAL_BLOWUP_LOG2, proof.grinding_bits())
+        );
+        assert!(proof.queries.len() < num_queries(ADVERSARIAL_BLOWUP_LOG2, 0));
+        assert!(proof.verify(&commitment).is_ok());
+    }
+
+    #[test]
+    fn test_reject_invalid_nonce() {
+        let (commitment, mut proof) = grinding_setup();
+        proof.nonce = find_nonce(&commitment, &proof, false);
+        assert_rejected(proof.verify(&commitment), "insufficient proof of work");
+    }
+
+    #[test]
+    fn test_reject_other_valid_nonce() {
+        let (commitment, mut proof) = grinding_setup();
+        proof.nonce = find_nonce(&commitment, &proof, true);
+        assert_rejected(proof.verify(&commitment), "wrong query index");
+    }
+
+    #[test]
+    fn test_reject_overstated_grinding() {
+        let (commitment, mut proof) = grinding_setup();
+        proof.grinding_bits = 256;
+        assert_rejected(proof.verify(&commitment), "insufficient proof of work");
+    }
+
+    #[test]
+    fn test_reject_understated_grinding() {
+        let (commitment, mut proof) = grinding_setup();
+        proof.grinding_bits = 0;
+        assert_rejected(proof.verify(&commitment), "incorrect number of openings");
+    }
+
+    #[test]
+    fn test_ground_proof_serialization() {
+        let (commitment, proof) = grinding_setup();
+        let proto = proof.to_proto();
+        assert_eq!(proto.grinding_bits, ADVERSARIAL_GRINDING_BITS as u32);
+        assert_eq!(proto.nonce, proof.nonce());
+        let decoded = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
+        assert_eq!(decoded.grinding_bits(), ADVERSARIAL_GRINDING_BITS);
+        assert_eq!(decoded.nonce(), proof.nonce());
+        assert!(decoded.verify(&commitment).is_ok());
     }
 }

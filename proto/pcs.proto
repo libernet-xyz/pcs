@@ -117,8 +117,18 @@ message Proof {
   // The base-2 logarithm of the blowup factor.
   uint32 blowup_log2 = 3;
 
+  // Number of grinding bits.
+  //
+  // A nonce is valid if the proof-of-work hash, interpreted as a big-endian integer, has at least
+  // this many leading zero bits. This also determines the number of queries, because grinding
+  // provides part of the target security level.
+  uint32 grinding_bits = 4;
+
+  // The proof-of-work nonce found by the prover.
+  uint64 nonce = 5;
+
   // Number of committed polynomials.
-  uint64 num_polys = 4;
+  uint64 num_polys = 6;
 
   // A point opened by the proof.
   message Point {
@@ -134,7 +144,7 @@ message Proof {
   }
 
   // The points opened by the proof.
-  repeated Point points = 5;
+  repeated Point points = 7;
 
   message Opening {
     repeated LeafProof proofs = 1;
@@ -142,8 +152,8 @@ message Proof {
 
   // Merkle proofs for the points at the query positions, relative to the raw Merkle trees (not the
   // FRI folds). There's one entry for every FRI query (`openings.len() == queries.len()`).
-  repeated Opening openings = 6;
+  repeated Opening openings = 8;
 
   // FRI queries on the DEEP quotients.
-  repeated Query queries = 7;
+  repeated Query queries = 9;
 }
