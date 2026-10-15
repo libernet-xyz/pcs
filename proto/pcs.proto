@@ -2,7 +2,7 @@ syntax = "proto3";
 
 import "google/protobuf/any.proto";
 
-package starkom.proto.pcs.v8;
+package starkom.proto.pcs.v9;
 
 // Identifier for the Starkom-provided SHA2-256 hash backend.
 message Sha2HashBackend {}
