@@ -28,6 +28,10 @@ static QUERY_DST1: LazyLock<H256> = LazyLock::new(|| utils::make_dst(b"starkom/d
 /// Domain separator tag for the Fiat-Shamir challenge used to build the random linear combination.
 static RLC_DST: LazyLock<H256> = LazyLock::new(|| utils::make_dst(b"starkom/deep/rlc"));
 
+/// Domain separator tag for the Fiat-Shamir challenge used to combine the DEEP quotients of all
+/// opened points into a single polynomial.
+static QUOTIENT_DST: LazyLock<H256> = LazyLock::new(|| utils::make_dst(b"starkom/deep/quotient"));
+
 /// Domain separator tag for the proof-of-work hash used for grinding.
 static POW_DST: LazyLock<H256> = LazyLock::new(|| utils::make_dst(b"starkom/deep/pow"));
 
@@ -182,6 +186,35 @@ fn rlc<F: Field>(values: impl IntoIterator<Item = F>, alpha: F) -> F {
     rlc
 }
 
+/// Derives the two Fiat-Shamir challenges of the DEEP layer.
+///
+/// The first challenge uses [`RLC_DST`] and is used by the caller to combine all committed
+/// polynomials, while the second one uses [`QUOTIENT_DST`] and is used to combine all DEEP
+/// quotients.
+///
+/// Both challenges are bound to all Merkle roots of the committed polynomials and to all opened
+/// points and their claimed evaluations.
+fn deep_challenges<F: Field256, H: Hasher<F>>(
+    tree_roots: &[H256],
+    num_polys: usize,
+    points: &BTreeMap<F, Vec<F>>,
+) -> (F, F) {
+    let transcript: Vec<H256> = std::iter::once(utils::encode_usize(tree_roots.len()))
+        .chain(tree_roots.iter().copied())
+        .chain(std::iter::once(utils::encode_usize(num_polys)))
+        .chain(std::iter::once(utils::encode_usize(points.len())))
+        .chain(points.iter().flat_map(|(z, values)| {
+            std::iter::once(z)
+                .chain(values.iter())
+                .map(|value| H256::from_slice(&value.to_be_bytes()))
+        }))
+        .collect();
+    (
+        H::challenge(*RLC_DST, transcript.as_slice()),
+        H::challenge(*QUOTIENT_DST, transcript.as_slice()),
+    )
+}
+
 /// Checks that the `hash_backend` field of a protobuf identifies the hash backend `T`.
 fn check_hash_backend<T: prost::Name + Default>(
     hash_backend: &Option<prost_types::Any>,
@@ -230,7 +263,7 @@ impl<F: Field256, H: Hasher<F>> Commitment<F, H> {
     }
 
     /// The degree bound this commitment attests to, implied by the number of FRI folding rounds.
-    /// Always equals [`Proof::degree_bound`].
+    /// Always equals the [`degree_bound`](`Options::degree_bound`) of the [`Proof`].
     pub fn degree_bound(&self) -> usize {
         1usize << (self.inner.len() - 1)
     }
@@ -412,7 +445,7 @@ impl<F: Field256, H: Hasher<F>> Committer<F, H> {
     /// for the batch.
     ///
     /// REQUIRES: the degree of all specified polynomials must be strictly less than
-    /// [`Self::degree_bound()`].
+    /// the [`degree_bound`](`Options::degree_bound`).
     pub fn add_batch(&mut self, polynomials: Vec<Polynomial<F>>) -> usize {
         assert!(!polynomials.is_empty());
 
@@ -444,6 +477,10 @@ impl<F: Field256, H: Hasher<F>> Committer<F, H> {
     /// `points` is the set of points to open in the [`Prover`]. The contained scalars are
     /// (off-domain) X-coordinates; the corresponding Y-coordinates will be computed automatically
     /// for every batched polynomial.
+    ///
+    /// The DEEP quotients of all opened points are combined into a single polynomial with a random
+    /// linear combination, so the FRI folding argument always works on one polynomial regardless
+    /// of the number of points.
     pub fn commit(self, points: BTreeSet<F>) -> (Commitment<F, H>, Prover<F, H>) {
         check_points_off_domain(points.iter().copied(), self.options.extended_domain_size())
             .unwrap();
@@ -461,20 +498,9 @@ impl<F: Field256, H: Hasher<F>> Committer<F, H> {
             })
             .collect();
 
-        let alpha = H::challenge(
-            *RLC_DST,
-            std::iter::once(utils::encode_usize(self.trees.len()))
-                .chain(self.trees.iter().map(Tree::root_hash))
-                .chain(std::iter::once(utils::encode_usize(self.polynomials.len())))
-                .chain(std::iter::once(utils::encode_usize(points.len())))
-                .chain(points.iter().flat_map(|(z, values)| {
-                    std::iter::once(z)
-                        .chain(values.iter())
-                        .map(|value| H256::from_slice(&value.to_be_bytes()))
-                }))
-                .collect::<Vec<H256>>()
-                .as_slice(),
-        );
+        let tree_roots: Vec<H256> = self.trees.iter().map(Tree::root_hash).collect();
+        let (alpha, beta) =
+            deep_challenges::<F, H>(tree_roots.as_slice(), self.polynomials.len(), &points);
 
         let combined = {
             let mut combined = Polynomial::default();
@@ -486,24 +512,27 @@ impl<F: Field256, H: Hasher<F>> Committer<F, H> {
             combined
         };
 
-        let quotients = points
-            .iter()
-            .map(|(&z, values)| {
+        let quotient = {
+            let mut quotient = Polynomial::default();
+            let mut pow = F::ONE;
+            for (&z, values) in &points {
                 let value = rlc(values.iter().copied(), alpha);
-                let (quotient, remainder) = (combined.clone() - value).horner(z);
+                let (point_quotient, remainder) = (combined.clone() - value).horner(z);
                 assert_eq!(remainder, F::ZERO);
-                quotient
-            })
-            .collect();
+                quotient += point_quotient * pow;
+                pow *= beta;
+            }
+            quotient
+        };
 
         let inner_prover = fri::Prover::<F, H>::new(
-            quotients,
+            vec![quotient],
             self.options.degree_bound,
             self.options.blowup_log2,
         );
 
         let commitment = Commitment {
-            tree_roots: self.trees.iter().map(Tree::root_hash).collect(),
+            tree_roots,
             batch_sizes: self.trees.iter().map(Tree::num_polys).collect(),
             inner: inner_prover.commit(),
             _data: Default::default(),
@@ -535,8 +564,9 @@ pub struct Proof<F: Field256, H: Hasher<F>> {
     /// (`openings.len() == queries.len()`), and the inner arrays contain one proof for every Merkle
     /// tree.
     openings: Vec<Vec<LeafProof<F, H>>>,
-    /// FRI queries on the DEEP quotients. The number of queries is calculated by [`num_queries`]
-    /// above and is tuned to achieve 128-bit security together with grinding.
+    /// FRI queries on the combined DEEP quotient (see [`Committer::commit`]). The number of queries
+    /// is calculated by [`num_queries`] above and is tuned to achieve 128-bit security together
+    /// with grinding.
     queries: Vec<fri::Query<F, H>>,
 }
 
@@ -569,11 +599,11 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
     /// Verifies this proof against the given commitment.
     ///
     /// If verification succeeds, the committed polynomials have degree *at most*
-    /// [`Self::degree_bound`] and their evaluations at the [opened points](`Self::points`) are the
-    /// ones claimed by the proof.
+    /// [`Options::degree_bound`] and their evaluations at the [opened points](`Self::points`) are
+    /// the ones claimed by the proof.
     ///
     /// WARNING: honest provers commit polynomials of degree *strictly less* than
-    /// [`Self::degree_bound`], but a valid proof only guarantees a degree *at most* equal to it.
+    /// [`Options::degree_bound`], but a valid proof only guarantees a degree *at most* equal to it.
     /// FRI bounds the degree of the DEEP quotients `(f(X) - f(z)) / (X - z)` rather than that of
     /// the committed polynomials `f(X)`, and each quotient has one degree less than its polynomial.
     /// This slack is common to DEEP-FRI implementations (cfr. the description of the "knowledge
@@ -638,20 +668,8 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
             ));
         }
 
-        let alpha = H::challenge(
-            *RLC_DST,
-            std::iter::once(utils::encode_usize(commitment.tree_roots().len()))
-                .chain(commitment.tree_roots().iter().copied())
-                .chain(std::iter::once(utils::encode_usize(self.num_polys)))
-                .chain(std::iter::once(utils::encode_usize(self.points.len())))
-                .chain(self.points.iter().flat_map(|(z, values)| {
-                    std::iter::once(z)
-                        .chain(values.iter())
-                        .map(|&value| H256::from_slice(&value.to_be_bytes()))
-                }))
-                .collect::<Vec<H256>>()
-                .as_slice(),
-        );
+        let (alpha, beta) =
+            deep_challenges::<F, H>(commitment.tree_roots(), self.num_polys, &self.points);
 
         for ((query, openings), &expected_index) in
             (self.queries.iter().zip(self.openings.iter())).zip(indices.iter())
@@ -702,20 +720,27 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
             );
 
             let (quotients, _) = query.values();
-            if quotients.len() != self.points.len() {
+            if quotients.len() != 1 {
                 return Err(anyhow!(
-                    "the number of evaluation claims doesn't match the number of FRI quotients (got {}, want {})",
-                    quotients.len(),
-                    self.points.len()
+                    "the FRI query at index {index} must open exactly one polynomial (got {})",
+                    quotients.len()
                 ));
             }
 
             let x = query.x();
-            for ((&z, values), &quotient) in self.points.iter().zip(quotients.iter()) {
-                let v = rlc(values.iter().copied(), alpha);
-                if quotient * (x - z) != combined - v {
-                    return Err(anyhow!("algebraic check failed at query index {index}"));
-                }
+            let claims: Vec<(F, F)> = self
+                .points
+                .iter()
+                .map(|(&z, values)| (z, rlc(values.iter().copied(), alpha)))
+                .collect();
+            let expected = rlc(
+                claims
+                    .iter()
+                    .map(|&(z, v)| (combined - v) * (x - z).invert_vartime().unwrap()),
+                beta,
+            );
+            if quotients[0] != expected {
+                return Err(anyhow!("algebraic check failed at query index {index}"));
             }
         }
 
@@ -821,8 +846,7 @@ pub struct Prover<F: Field256, H: Hasher<F>> {
     /// The keys of the map are the (off-domain) X-coordinates of the points, while values are lists
     /// of polynomial evaluations at that point (one for every committed polynomial).
     points: BTreeMap<F, Vec<F>>,
-    /// The underlying FRI prover for the DEEP quotients. There's one quotient for every opened
-    /// point, and all quotients are batched into the same FRI folding argument.
+    /// The underlying FRI prover for the DEEP quotient.
     inner_prover: fri::Prover<F, H>,
 }
 
@@ -926,6 +950,10 @@ mod tests {
         assert_eq!(
             *RLC_DST,
             parse("0x688ae37e5f05871810e7c6777e1c16c55ef4b14f072357586d7a298cefc11368")
+        );
+        assert_eq!(
+            *QUOTIENT_DST,
+            parse("0xa7f91ddaa061a34288a9146bf5afc157211da6ec200650dd93daa9cb4c5b4808")
         );
         assert_eq!(
             *POW_DST,
@@ -1203,6 +1231,12 @@ mod tests {
             grinding_bits
         ));
         assert_eq!(proof.queries.len(), num_queries(blowup_log2, grinding_bits));
+        assert!(
+            proof
+                .queries
+                .iter()
+                .all(|query| query.values().0.len() == 1)
+        );
         assert!(proof.verify(&commitment).is_ok());
         assert_eq!(*proof.points(), points);
     }
@@ -1594,10 +1628,18 @@ mod tests {
         let (commitment, mut proof) = adversarial_setup();
         let values = proof.points.values().next().unwrap().clone();
         proof.points.insert(BS::from(789u16), values);
-        assert_rejected(
-            proof.verify(&commitment),
-            "doesn't match the number of FRI quotients",
-        );
+        assert_rejected(proof.verify(&commitment), "algebraic check failed");
+    }
+
+    #[test]
+    fn test_reject_swapped_evaluations() {
+        let (commitment, mut proof) = adversarial_setup();
+        let mut values: Vec<Vec<BS>> = proof.points.values().cloned().collect();
+        values.reverse();
+        for (evaluations, swapped) in proof.points.values_mut().zip(values) {
+            *evaluations = swapped;
+        }
+        assert_rejected(proof.verify(&commitment), "algebraic check failed");
     }
 
     #[test]

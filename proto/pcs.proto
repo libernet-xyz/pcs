@@ -154,6 +154,7 @@ message Proof {
   // FRI folds). There's one entry for every FRI query (`openings.len() == queries.len()`).
   repeated Opening openings = 8;
 
-  // FRI queries on the DEEP quotients.
+  // FRI queries on the combined DEEP quotient, that is the random linear combination of the DEEP
+  // quotients of all opened points. Every FRI leaf therefore holds exactly one value.
   repeated Query queries = 9;
 }
