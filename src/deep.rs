@@ -728,15 +728,11 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
             }
 
             let x = query.x();
-            let claims: Vec<(F, F)> = self
-                .points
-                .iter()
-                .map(|(&z, values)| (z, rlc(values.iter().copied(), alpha)))
-                .collect();
             let expected = rlc(
-                claims
+                self.points
                     .iter()
-                    .map(|&(z, v)| (combined - v) * (x - z).invert_vartime().unwrap()),
+                    .map(|(&z, values)| (z, rlc(values.iter().copied(), alpha)))
+                    .map(|(z, v)| (combined - v) * (x - z).invert_vartime().unwrap()),
                 beta,
             );
             if quotients[0] != expected {
