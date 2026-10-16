@@ -729,10 +729,10 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
 
             let x = query.x();
             let expected = rlc(
-                self.points
-                    .iter()
-                    .map(|(&z, values)| (z, rlc(values.iter().copied(), alpha)))
-                    .map(|(z, v)| (combined - v) * (x - z).invert_vartime().unwrap()),
+                self.points.iter().map(|(&z, values)| {
+                    let v = rlc(values.iter().copied(), alpha);
+                    (combined - v) * (x - z).invert_vartime().unwrap()
+                }),
                 beta,
             );
             if quotients[0] != expected {
