@@ -82,15 +82,65 @@ pub(crate) fn merklify<H: MerkleHasher>(mut hashes: &mut [H256], mut n: usize) {
     }
 }
 
+/// Returns the Merkle path of the leaf at `index`, that is the sibling hashes from the leaf up to,
+/// but excluding, the root.
+///
+/// `tree` must contain a full Merkle tree with `n` leaves, stored as described in [`merklify`]. `n`
+/// must be a power of two and `index` must be less than `n`.
+pub(crate) fn merkle_path(mut tree: &[H256], mut n: usize, mut index: usize) -> Vec<H256> {
+    assert!(n.is_power_of_two());
+    assert!(index < n);
+    let mut path = Vec::with_capacity(n.trailing_zeros() as usize);
+    while n > 1 {
+        path.push(tree[index ^ 1]);
+        tree = &tree[n..];
+        n /= 2;
+        index >>= 1;
+    }
+    path
+}
+
+/// Recomputes a Merkle root from a leaf and its Merkle path, and checks it against `root_hash`.
+///
+/// `leaf` is the 32-byte leaf at position `index`: the hash of the leaf values for vector leaves
+/// (see [`Proof`]), or the leaf itself for trees whose leaves are single 32-byte values, like the
+/// FRI ones.
+pub(crate) fn verify_path<H: MerkleHasher>(
+    leaf: H256,
+    path: &[H256],
+    mut index: usize,
+    root_hash: H256,
+) -> Result<()> {
+    let mut hash = leaf;
+    for &sibling in path {
+        hash = if index & 1 != 0 {
+            H::hash_binary(sibling, hash)
+        } else {
+            H::hash_binary(hash, sibling)
+        };
+        index >>= 1;
+    }
+    if index != 0 {
+        return Err(anyhow!("invalid index"));
+    }
+    if hash != root_hash {
+        return Err(anyhow!(
+            "root hash mismatch (got {}, want {})",
+            hash,
+            root_hash
+        ));
+    }
+    Ok(())
+}
+
 /// A Merkle proof.
 ///
-/// A FRI `Query` uses several of these: two from the main Merkle tree and two for each folding
-/// round.
+/// The DEEP layer uses these to open the committed polynomial batches at the queried positions.
 ///
 /// NOTE: this object only stores the sister hashes of the Merkle path and the opened leaf values,
 /// it doesn't store the lookup key and the root hash anywhere because those pieces of information
-/// are reconstructed separately during the verification of a whole `Query`. In particular, all root
-/// hashes are stored in the `Commitment`.
+/// are reconstructed separately during the verification of a whole [`Proof`](`crate::deep::Proof`).
+/// In particular, all root hashes are stored in the [`Commitment`](`crate::deep::Commitment`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Proof<F: Field256, H: Hasher<F>> {
     leaf: Vec<F>,
@@ -104,16 +154,6 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
         self.leaf.as_slice()
     }
 
-    /// Checks the leaf of this proof against the provided slice.
-    ///
-    /// The two must match or an error is returned.
-    pub(crate) fn check_leaf(&self, expected: &[F]) -> Result<()> {
-        if expected.len() != self.leaf.len() || self.leaf.as_slice() != expected {
-            return Err(anyhow!("leaf value mismatch"));
-        }
-        Ok(())
-    }
-
     /// Returns the length of the Merkle path, corresponding to the height of the tree minus 1 (the
     /// root hash is not included in this count).
     pub(crate) fn len(&self) -> usize {
@@ -121,50 +161,14 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
     }
 
     /// Verifies the proof against the given root hash.
-    pub(crate) fn verify(&self, mut index: usize, root_hash: H256) -> Result<()> {
-        let mut hash = hash_leaf::<F, H>(get_leaf_dst::<F>(), self.leaf.iter().copied());
-        for &sibling in &self.path {
-            hash = if index & 1 != 0 {
-                H::hash_binary(sibling, hash)
-            } else {
-                H::hash_binary(hash, sibling)
-            };
-            index >>= 1;
-        }
-        if index != 0 {
-            return Err(anyhow!("invalid index"));
-        }
-        if hash != root_hash {
-            return Err(anyhow!(
-                "root hash mismatch (got {}, want {})",
-                hash,
-                root_hash
-            ));
-        }
-        Ok(())
+    pub(crate) fn verify(&self, index: usize, root_hash: H256) -> Result<()> {
+        let leaf = hash_leaf::<F, H>(get_leaf_dst::<F>(), self.leaf.iter().copied());
+        verify_path::<H>(leaf, self.path.as_slice(), index, root_hash)
     }
 
-    /// Returns a boolean indicating whether or not the committed polynomials are constant.
-    ///
-    /// This function is used in low degree testing to check when the folding process collapses to
-    /// degree-0 polynomials.
-    ///
-    /// Note that some polynomials may collapse earlier than others, and this function returns false
-    /// if one or more haven't collapsed yet. So it returns true if and only if all have collapsed.
-    pub(crate) fn is_constant(&self) -> bool {
-        let mut hash = hash_leaf::<F, H>(get_leaf_dst::<F>(), self.leaf.iter().copied());
-        for &sibling in &self.path {
-            if sibling != hash {
-                return false;
-            }
-            hash = H::hash_binary(hash, hash);
-        }
-        true
-    }
-
-    /// Serializes this Merkle proof to a [`LeafProof`](`proto::LeafProof`) protobuf.
-    pub(crate) fn to_proto(&self) -> proto::LeafProof {
-        proto::LeafProof {
+    /// Serializes this Merkle proof to a [`MerkleProof`](`proto::MerkleProof`) protobuf.
+    pub(crate) fn to_proto(&self) -> proto::MerkleProof {
+        proto::MerkleProof {
             leaf_values: self
                 .leaf
                 .iter()
@@ -178,11 +182,11 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
         }
     }
 
-    /// Deserializes a Merkle proof from a [`LeafProof`](`proto::LeafProof`) protobuf.
+    /// Deserializes a Merkle proof from a [`MerkleProof`](`proto::MerkleProof`) protobuf.
     ///
     /// NOTE: this method does not validate the proof, it only deserializes it. The caller must
     /// invoke [`Self::verify`] separately.
-    pub(crate) fn from_proto(proto: &proto::LeafProof) -> Result<Self> {
+    pub(crate) fn from_proto(proto: &proto::MerkleProof) -> Result<Self> {
         Ok(Self {
             leaf: proto
                 .leaf_values
@@ -273,32 +277,12 @@ impl<F: Field256, H: Hasher<F>> Tree<F, H> {
         self.leaves.iter().map(|values| values[index]).collect()
     }
 
-    /// Returns the value at a given leaf for a specific polynomial.
-    ///
-    /// `polynomial_index` must be less than [`Self::num_polys()`] and `leaf_index` must be less
-    /// than [`Self::num_leaves()`].
-    pub(crate) fn leaf_value(&self, polynomial_index: usize, leaf_index: usize) -> F {
-        self.leaves[polynomial_index][leaf_index]
-    }
-
     /// Returns a Merkle proof for the leaf at `index`.
-    pub(crate) fn query(&self, mut index: usize) -> Proof<F, H> {
-        let mut n = self.num_leaves();
-        assert!(n.is_power_of_two());
-        assert!(index < n);
-        let leaf = self.leaf(index);
-        let mut path = Vec::with_capacity(n.trailing_zeros() as usize);
-        let mut hashes = self.hashes.as_slice();
-        while n > 1 {
-            path.push(hashes[index ^ 1]);
-            hashes = &hashes[n..];
-            n /= 2;
-            index >>= 1;
-        }
+    pub(crate) fn query(&self, index: usize) -> Proof<F, H> {
         Proof {
-            leaf,
-            path,
-            _data: Default::default(),
+            leaf: self.leaf(index),
+            path: merkle_path(self.hashes.as_slice(), self.num_leaves(), index),
+            _data: PhantomData,
         }
     }
 }
@@ -318,6 +302,52 @@ mod tests {
 
     fn parse<V: FromStr<Err: Debug>>(s: &'static str) -> V {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn test_merkle_path() {
+        let leaves: Vec<H256> = (0..8u64).map(H256::from_low_u64_be).collect();
+        let mut tree = leaves.clone();
+        tree.resize(15, H256::zero());
+        merklify::<Sha2Hash<BS>>(tree.as_mut_slice(), 8);
+        assert_eq!(
+            merkle_path(tree.as_slice(), 8, 5),
+            [leaves[4], tree[8 + 3], tree[12]]
+        );
+        assert_eq!(
+            merkle_path(tree.as_slice(), 8, 0),
+            [leaves[1], tree[8 + 1], tree[13]]
+        );
+        assert_eq!(merkle_path(&[leaves[0]], 1, 0), []);
+    }
+
+    fn merklify_leaves(leaves: &[H256]) -> Vec<H256> {
+        let mut tree = leaves.to_vec();
+        tree.resize(leaves.len() * 2 - 1, H256::zero());
+        merklify::<Sha2Hash<BS>>(tree.as_mut_slice(), leaves.len());
+        tree
+    }
+
+    #[test]
+    fn test_verify_path() {
+        let leaves: Vec<H256> = (0..8u64).map(H256::from_low_u64_be).collect();
+        let hashes = merklify_leaves(leaves.as_slice());
+        let root = *hashes.last().unwrap();
+        for (index, &leaf) in leaves.iter().enumerate() {
+            let path = merkle_path(hashes.as_slice(), 8, index);
+            assert!(verify_path::<Sha2Hash<BS>>(leaf, &path, index, root).is_ok());
+            let other = (index + 1) % 8;
+            assert!(verify_path::<Sha2Hash<BS>>(leaf, &path, other, root).is_err());
+            assert!(verify_path::<Sha2Hash<BS>>(leaves[other], &path, index, root).is_err());
+        }
+        let path = merkle_path(hashes.as_slice(), 8, 3);
+        assert!(
+            verify_path::<Sha2Hash<BS>>(leaves[3], &path, 3 + 8, root)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid index")
+        );
+        assert!(verify_path::<Sha2Hash<BS>>(leaves[0], &[], 0, leaves[0]).is_ok());
     }
 
     #[test]
@@ -551,7 +581,7 @@ mod tests {
                     .all(|(&lhs, values)| lhs == values[i])
             );
             for j in 0..k {
-                assert_eq!(tree.leaf_value(j, i), evaluations[j][i]);
+                assert_eq!(tree.leaf(i)[j], evaluations[j][i]);
             }
         }
     }
@@ -870,11 +900,9 @@ mod tests {
         let proto = proof.to_proto();
         let proof = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
         assert_eq!(proof.len(), 2);
-        assert!(!proof.is_constant());
-        assert!(
-            proof
-                .check_leaf(&[from_const(56), from_const(34), from_const(44)])
-                .is_ok()
+        assert_eq!(
+            proof.leaf(),
+            [from_const(56), from_const(34), from_const(44)]
         );
         assert!(proof.verify(0, tree.root_hash()).is_err());
         assert!(proof.verify(1, tree.root_hash()).is_err());

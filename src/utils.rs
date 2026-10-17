@@ -49,6 +49,28 @@ pub(crate) fn encode_u64(value: u64) -> H256 {
     H256::from_slice(&bytes)
 }
 
+/// Encodes a field element into a `H256` as the big-endian representation of its canonical integer
+/// value (see [`Field::to_u256`]).
+///
+/// Big-endian is the native byte order of the EVM, so encoded values can be loaded from calldata
+/// and hashed by a Solidity verifier without any byte swapping.
+pub(crate) fn encode_scalar<F: Field>(value: F) -> H256 {
+    H256::from_slice(&value.to_u256().to_big_endian())
+}
+
+/// Decodes a field element encoded by [`encode_scalar`].
+///
+/// Returns an error if the encoded integer is not a canonical field element, i.e. if it's not less
+/// than the field order.
+pub(crate) fn decode_scalar<F: Field>(hash: H256) -> Result<F> {
+    F::try_from_be_bytes(hash.as_bytes())
+        .into_option()
+        .context(format!(
+            "invalid scalar (exceeds the [0, {}) range)",
+            F::MODULUS
+        ))
+}
+
 /// Encodes a `usize` into a `H256` for use in various transcript hashes.
 ///
 /// Same as [`encode_u64`], so the encoding doesn't depend on the platform's pointer width.
@@ -82,6 +104,49 @@ mod tests {
 
     fn parse_hash(s: &'static str) -> H256 {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn test_encode_scalar() {
+        assert_eq!(encode_scalar(Scalar::from(0u64)), H256::zero());
+        assert_eq!(
+            encode_scalar(Scalar::from(0x0102030405060708u64)),
+            parse_hash("0x0000000000000000000000000000000000000000000000000102030405060708")
+        );
+        let value: Scalar = "0x1fcc49bb3722a3a6ac41aa0aac6ed68f218a7240ca2a9befd4e3243251f7ecaf"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            encode_scalar(value),
+            parse_hash("0x1fcc49bb3722a3a6ac41aa0aac6ed68f218a7240ca2a9befd4e3243251f7ecaf")
+        );
+    }
+
+    fn test_decode_scalar_impl<F: Field256>() {
+        assert_eq!(decode_scalar::<F>(encode_scalar(F::ZERO)).unwrap(), F::ZERO);
+        assert_eq!(decode_scalar::<F>(encode_scalar(F::ONE)).unwrap(), F::ONE);
+        assert_eq!(
+            decode_scalar::<F>(encode_scalar(F::from(42u64))).unwrap(),
+            F::from(42u64)
+        );
+        assert_eq!(
+            decode_scalar::<F>(encode_scalar(F::from(u64::MAX))).unwrap(),
+            F::from(u64::MAX)
+        );
+        assert_eq!(decode_scalar::<F>(encode_scalar(F::MAX)).unwrap(), F::MAX);
+        let modulus: U256 = F::MODULUS.parse().unwrap();
+        let encoded_max = H256::from_slice(&(modulus - 1).to_big_endian());
+        let max = decode_scalar::<F>(encoded_max).unwrap();
+        assert_eq!(encode_scalar(max), encoded_max);
+        let encoded_modulus = H256::from_slice(&modulus.to_big_endian());
+        assert!(decode_scalar::<F>(encoded_modulus).is_err());
+    }
+
+    #[test]
+    fn test_decode_scalar() {
+        test_decode_scalar_impl::<Scalar>();
+        test_decode_scalar_impl::<starkom_bluesky::Scalar>();
+        test_decode_scalar_impl::<starkom_goldilocks::GL4>();
     }
 
     #[test]

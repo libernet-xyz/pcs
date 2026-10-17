@@ -526,7 +526,7 @@ impl<F: Field256, H: Hasher<F>> Committer<F, H> {
         };
 
         let inner_prover = fri::Prover::<F, H>::new(
-            vec![quotient],
+            quotient,
             self.options.degree_bound,
             self.options.blowup_log2,
         );
@@ -719,13 +719,7 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
                 alpha,
             );
 
-            let (quotients, _) = query.values();
-            if quotients.len() != 1 {
-                return Err(anyhow!(
-                    "the FRI query at index {index} must open exactly one polynomial (got {})",
-                    quotients.len()
-                ));
-            }
+            let (quotient, _) = query.values();
 
             let x = query.x();
             let expected = rlc(
@@ -735,7 +729,7 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
                 }),
                 beta,
             );
-            if quotients[0] != expected {
+            if quotient != expected {
                 return Err(anyhow!("algebraic check failed at query index {index}"));
             }
         }
@@ -1227,12 +1221,6 @@ mod tests {
             grinding_bits
         ));
         assert_eq!(proof.queries.len(), num_queries(blowup_log2, grinding_bits));
-        assert!(
-            proof
-                .queries
-                .iter()
-                .all(|query| query.values().0.len() == 1)
-        );
         assert!(proof.verify(&commitment).is_ok());
         assert_eq!(*proof.points(), points);
     }

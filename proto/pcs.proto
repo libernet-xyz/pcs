@@ -50,9 +50,10 @@ message Commitment {
 
 // A Merkle proof.
 //
-// The Merkle trees used in Starkom have vector leaves: each leaf is an array containing the
-// evaluations of one or more committed polynomials.
-message LeafProof {
+// The Merkle trees of the polynomial batches have vector leaves: each leaf is an array containing
+// the evaluations of one or more committed polynomials, and the Merkle tree is built on the hashes
+// of the leaves. The FRI trees are different, see `Query.Fold`.
+message MerkleProof {
   // The evaluations of the batched polynomials at the domain location corresponding to this leaf.
   //
   // Each scalar is stored in canonical (non-Montgomery) integer form, in little-endian byte order.
@@ -75,17 +76,25 @@ message LeafProof {
 //
 // NOTE: the proven degree bound and the blowup factor are not stored here because all queries in a
 // proof refer to `Proof.degree_bound` and `Proof.blowup_log2`.
-//
-// NOTE: the number of evaluations in each contained `LeafProof` must match the number of points in
-// the containing `Proof`.
 message Query {
   // The index of the queried leaf.
   uint64 index = 1;
 
-  // A pair of Merkle proofs resulting froma folding round.
+  // A pair of Merkle proofs resulting from a folding round: the queried position and its partner.
+  //
+  // The FRI layer works on a single polynomial, so the leaves of its Merkle trees are the
+  // evaluations themselves rather than hashes of them: each leaf is a canonical field element
+  // stored as a 32 byte big-endian integer, which a Solidity verifier can hash without any byte
+  // swapping.
+  //
+  // Therefore, in these `MerkleProof`s, `leaf_values` must contain exactly one element: the opened
+  // evaluation, stored in little-endian order like all other scalars in this file (note that this
+  // is the opposite of the byte order of the leaves in the Merkle tree). Similarly, the first
+  // element of `merkle_path` is the sibling leaf itself, that is another evaluation stored as a 32
+  // byte big-endian integer, rather than its hash.
   message Fold {
-    LeafProof left = 1;
-    LeafProof right = 2;
+    MerkleProof left = 1;
+    MerkleProof right = 2;
   }
 
   // List of Merkle proofs resulting from the folding rounds.
@@ -147,7 +156,7 @@ message Proof {
   repeated Point points = 7;
 
   message Opening {
-    repeated LeafProof proofs = 1;
+    repeated MerkleProof proofs = 1;
   }
 
   // Merkle proofs for the points at the query positions, relative to the raw Merkle trees (not the
