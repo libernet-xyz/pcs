@@ -60,7 +60,7 @@ impl<F: Field256, H: Hasher<F>> LeafProof<F, H> {
     ///
     /// Equivalent to `(proof.value(), proof.partner())`.
     fn leaves(&self) -> (F, F) {
-        (self.value, utils::decode_scalar(self.path[0]).unwrap())
+        (self.value, self.partner())
     }
 
     /// Verifies the proof against the given root hash.
@@ -68,7 +68,7 @@ impl<F: Field256, H: Hasher<F>> LeafProof<F, H> {
     /// `index` is the index of the opened evaluation in the evaluation domain, not the position of
     /// the leaf in the tree (see [`Tree`]).
     ///
-    /// REQUIRES: `index` must be a valid index in the evaluation domain.
+    /// REQUIRES: `index` must be less than `2^self.len()`.
     fn verify(&self, index: usize, root_hash: H256) -> Result<()> {
         merkle::verify_path::<H>(
             utils::encode_scalar(self.value),
@@ -108,23 +108,26 @@ impl<F: Field256, H: Hasher<F>> LeafProof<F, H> {
     }
 
     /// Deserializes a proof from a [`MerkleProof`](`proto::MerkleProof`) protobuf.
-    ///
-    /// Returns an error if the leaf doesn't have exactly one value, if the value is not a canonical
-    /// field element, or if any hash is invalid.
     fn from_proto(proto: &proto::MerkleProof) -> Result<Self> {
+        let value = match proto.leaf_values.as_slice() {
+            [value] => utils::load_scalar(value.as_slice()),
+            values => Err(anyhow!(
+                "invalid FRI leaf size (got {}, want 1)",
+                values.len()
+            )),
+        }?;
+        let path: Vec<H256> = proto
+            .merkle_path
+            .iter()
+            .map(|hash| H::load_hash(hash.as_slice()))
+            .collect::<Result<_>>()?;
+        match path.first() {
+            Some(&partner) => utils::decode_scalar::<F>(partner)?,
+            None => return Err(anyhow!("missing FRI partner")),
+        };
         Ok(Self {
-            value: match proto.leaf_values.as_slice() {
-                [value] => utils::load_scalar(value.as_slice()),
-                values => Err(anyhow!(
-                    "invalid FRI leaf size (got {}, want 1)",
-                    values.len()
-                )),
-            }?,
-            path: proto
-                .merkle_path
-                .iter()
-                .map(|hash| H::load_hash(hash.as_slice()))
-                .collect::<Result<_>>()?,
+            value,
+            path,
             _data: PhantomData,
         })
     }
@@ -254,6 +257,8 @@ pub struct Query<F: Field256, H: Hasher<F>> {
     /// The base-2 logarithm of the blowup factor.
     blowup_log2: usize,
     /// The index of the element we're opening (the partner index is inferred automatically).
+    ///
+    /// Always less than the size of the extended domain.
     index: usize,
     /// Proves a pair of "partner" values at each folding round with one [`LeafProof`] for every
     /// round, opening the queried index explicitly and its partner as the sibling leaf. The proof
@@ -308,13 +313,6 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
     pub fn verify(&self, commitment: &Commitment) -> Result<()> {
         let mut n = self.degree_bound << self.blowup_log2;
         assert!(n.is_power_of_two());
-
-        if self.index >= n {
-            return Err(anyhow!(
-                "invalid query index {}: the domain size is {n}",
-                self.index
-            ));
-        }
 
         let mut k = n.trailing_zeros() as usize;
 
@@ -378,6 +376,10 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
     /// REQUIRES: `degree_bound` must be a power of 2, `blowup_log2` must be greater than 0, and the
     /// size of the extended domain must fit within the 2-adicity of `F::BaseField`.
     ///
+    /// The query index must be less than the size of the extended domain, and every opened value,
+    /// including the partner in the first element of each Merkle path, must be a canonical field
+    /// element, otherwise an error is returned.
+    ///
     /// NOTE: this method does not validate the proof, it only deserializes it. The caller must
     /// invoke [`Self::verify`] separately.
     pub fn from_proto(
@@ -388,6 +390,13 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
         assert!(degree_bound.is_power_of_two());
         assert!(blowup_log2 > 0);
         assert!(degree_bound.trailing_zeros() as usize + blowup_log2 <= F::BaseField::S);
+        let n = degree_bound << blowup_log2;
+        if proto.index >= n as u64 {
+            return Err(anyhow!(
+                "invalid query index {}: the extended domain size is {n}",
+                proto.index
+            ));
+        }
         if proto.folds.is_empty() {
             return Err(anyhow!("the FRI query has no folds"));
         }
@@ -758,14 +767,6 @@ mod tests {
         let tree = Tree::<BS, Sha2Hash<BS>>::new(sample_values().as_slice());
         let proof = tree.query(3);
         let result = proof.verify(7, tree.root_hash());
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_leaf_proof_verify_with_out_of_range_index() {
-        let tree = Tree::<BS, Sha2Hash<BS>>::new(sample_values().as_slice());
-        let proof = tree.query(3);
-        let result = proof.verify(3 + 8, tree.root_hash());
         assert!(result.is_err());
     }
 
@@ -1165,10 +1166,19 @@ mod tests {
     fn test_reject_out_of_range_query_index() {
         let prover =
             Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2);
-        let commitment = prover.commit();
-        let mut query = prover.query(QUERY_INDEX);
-        query.index = DEGREE_BOUND << BLOWUP_LOG2;
-        let result = query.verify(&commitment);
+        let mut proto = prover.query(QUERY_INDEX).to_proto();
+        proto.index = (QUERY_INDEX + (DEGREE_BOUND << BLOWUP_LOG2)) as u64;
+        let result = Query::<BS, Sha2Hash<BS>>::from_proto(DEGREE_BOUND, BLOWUP_LOG2, &proto);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_huge_query_index() {
+        let prover =
+            Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2);
+        let mut proto = prover.query(QUERY_INDEX).to_proto();
+        proto.index = u64::MAX;
+        let result = Query::<BS, Sha2Hash<BS>>::from_proto(DEGREE_BOUND, BLOWUP_LOG2, &proto);
         assert!(result.is_err());
     }
 
