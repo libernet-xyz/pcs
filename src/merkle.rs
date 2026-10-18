@@ -334,11 +334,6 @@ mod tests {
         &[78, 56, 34, 12, 90, 78, 56, 34],
     ];
 
-    /// A tree committing to [`SAMPLE_COLUMNS`].
-    fn sample_tree<F: Field256, H: Hasher<F>>() -> Tree<F, H> {
-        Tree::new(make_columns(&SAMPLE_COLUMNS))
-    }
-
     #[test]
     fn test_leaf_dst_bluesky() {
         assert_eq!(
@@ -803,7 +798,7 @@ mod tests {
 
     #[test]
     fn test_tree_leaves() {
-        let tree = sample_tree::<BS, Sha2Hash<BS>>();
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
         assert_eq!(tree.leaf(0), make_values::<BS>(&[12, 42, 78]));
         assert_eq!(tree.leaf(1), make_values::<BS>(&[34, 43, 56]));
         assert_eq!(tree.leaf(2), make_values::<BS>(&[56, 44, 34]));
@@ -816,14 +811,14 @@ mod tests {
 
     #[test]
     fn test_query_leaf() {
-        let tree = sample_tree::<BS, Sha2Hash<BS>>();
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
         let proof = tree.query(5);
         assert_eq!(proof.leaf(), make_values::<BS>(&[12, 47, 78]));
     }
 
     #[test]
     fn test_query_path() {
-        let tree = sample_tree::<BS, Sha2Hash<BS>>();
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
         let proof = tree.query(5);
         assert_eq!(proof.len(), 3);
         assert_eq!(
@@ -834,7 +829,7 @@ mod tests {
 
     #[test]
     fn test_query_path_starts_with_sibling_leaf_hash() {
-        let tree = sample_tree::<BS, Sha2Hash<BS>>();
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
         let proof = tree.query(5);
         assert_eq!(
             proof.path[0],
@@ -852,7 +847,7 @@ mod tests {
 
     #[test]
     fn test_proof_verify() {
-        let tree = sample_tree::<BS, Sha2Hash<BS>>();
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
         let proof = tree.query(5);
         let result = proof.verify(5, tree.root_hash());
         assert!(result.is_ok());
@@ -860,7 +855,7 @@ mod tests {
 
     #[test]
     fn test_proof_verify_with_wrong_index() {
-        let tree = sample_tree::<BS, Sha2Hash<BS>>();
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
         let proof = tree.query(5);
         let result = proof.verify(4, tree.root_hash());
         assert!(result.is_err());
@@ -868,7 +863,7 @@ mod tests {
 
     #[test]
     fn test_proof_verify_with_out_of_range_index() {
-        let tree = sample_tree::<BS, Sha2Hash<BS>>();
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
         let proof = tree.query(5);
         let result = proof.verify(5 + 8, tree.root_hash());
         assert!(result.is_err());
@@ -876,7 +871,7 @@ mod tests {
 
     #[test]
     fn test_proof_verify_with_wrong_root() {
-        let tree = sample_tree::<BS, Sha2Hash<BS>>();
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
         let proof = tree.query(5);
         let result = proof.verify(5, tree.hashes[0]);
         assert!(result.is_err());
@@ -891,7 +886,7 @@ mod tests {
     }
 
     fn test_all_proofs_verify_impl<F: Field256, H: Hasher<F>>() {
-        let tree = sample_tree::<F, H>();
+        let tree = Tree::<F, H>::new(make_columns(&SAMPLE_COLUMNS));
         let results: Vec<bool> = (0..8)
             .map(|index| tree.query(index).verify(index, tree.root_hash()).is_ok())
             .collect();
@@ -908,7 +903,7 @@ mod tests {
 
     #[test]
     fn test_proof_to_proto() {
-        let tree = sample_tree::<BS, Sha2Hash<BS>>();
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
         let proof = tree.query(2);
         let proto = proof.to_proto();
         assert_eq!(
@@ -931,7 +926,8 @@ mod tests {
 
     #[test]
     fn test_proof_from_proto() {
-        let proof = sample_tree::<BS, Sha2Hash<BS>>().query(2);
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
+        let proof = tree.query(2);
         let proto = proof.to_proto();
         let decoded = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
         assert_eq!(decoded, proof);
@@ -939,7 +935,8 @@ mod tests {
 
     #[test]
     fn test_proof_from_proto_with_non_canonical_value() {
-        let mut proto = sample_tree::<BS, Sha2Hash<BS>>().query(2).to_proto();
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
+        let mut proto = tree.query(2).to_proto();
         let modulus: U256 = BS::MODULUS.parse().unwrap();
         proto.leaf_values[1] = modulus.to_little_endian().to_vec();
         let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto);
@@ -948,7 +945,8 @@ mod tests {
 
     #[test]
     fn test_proof_from_proto_with_long_value() {
-        let mut proto = sample_tree::<BS, Sha2Hash<BS>>().query(2).to_proto();
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
+        let mut proto = tree.query(2).to_proto();
         proto.leaf_values[0].resize(33, 0);
         let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto);
         assert!(result.is_err());
@@ -956,7 +954,8 @@ mod tests {
 
     #[test]
     fn test_proof_from_proto_with_short_hash() {
-        let mut proto = sample_tree::<BS, Sha2Hash<BS>>().query(2).to_proto();
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
+        let mut proto = tree.query(2).to_proto();
         proto.merkle_path[1].pop();
         let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto);
         assert!(result.is_err());

@@ -761,7 +761,7 @@ mod tests {
         Polynomial::with_coefficients(coefficients.iter().copied().map(F::from).collect())
     }
 
-    /// The polynomial committed by [`honest_prover`].
+    /// The polynomial committed by the prover in most of the tests.
     fn honest_polynomial() -> Polynomial<BS> {
         make_polynomial(&[12, 34, 56, 78, 90, 12, 34, 56])
     }
@@ -771,19 +771,8 @@ mod tests {
         make_polynomial(&[90, 78, 56, 34, 12, 90, 78, 56])
     }
 
-    /// A prover for [`honest_polynomial`].
-    fn honest_prover() -> Prover<BS, Sha2Hash<BS>> {
-        Prover::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2)
-    }
-
-    /// Deserializes a query with the same parameters as [`honest_prover`].
-    fn load_query(proto: &proto::Query) -> Result<Query<BS, Sha2Hash<BS>>> {
-        Query::from_proto(DEGREE_BOUND, BLOWUP_LOG2, proto)
-    }
-
     #[test]
     fn test_sha2_commitment_roots() {
-        // Pinned roots: changing them changes the protocol.
         let prover = Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), 8, 2);
         let commitment = prover.commit();
         assert_eq!(
@@ -799,7 +788,6 @@ mod tests {
 
     #[test]
     fn test_keccak256_commitment_roots() {
-        // Pinned roots: changing them changes the protocol.
         let prover = Prover::<BS, Keccak256Hash<BS>>::new(honest_polynomial(), 8, 2);
         let commitment = prover.commit();
         assert_eq!(
@@ -815,7 +803,8 @@ mod tests {
 
     #[test]
     fn test_prover_parameters() {
-        let prover = honest_prover();
+        let prover =
+            Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2);
         assert_eq!(prover.degree_bound(), DEGREE_BOUND);
         assert_eq!(prover.extended_domain_size(), DEGREE_BOUND << BLOWUP_LOG2);
         assert_eq!(prover.size(), DEGREE_BOUND << BLOWUP_LOG2);
@@ -823,16 +812,12 @@ mod tests {
 
     #[test]
     fn test_prover_root_hash() {
-        let prover = honest_prover();
+        let prover =
+            Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2);
         let root_hash = prover.root_hash();
         assert_eq!(root_hash, prover.commit().root());
     }
 
-    /// Queries every index of the extended domain of a polynomial with the given coefficients and
-    /// checks the resulting queries.
-    ///
-    /// There's one query per evaluation, so this iterates over them rather than unrolling the
-    /// assertions.
     fn test_queries_impl<F: Field256, H: Hasher<F>>(
         coefficients: &[u64],
         degree_bound: usize,
@@ -855,7 +840,6 @@ mod tests {
         }
     }
 
-    /// Runs [`test_queries_impl`] with every combination of field and hash backend.
     fn test_queries(coefficients: &[u64], degree_bound: usize, blowup_log2: usize) {
         test_queries_impl::<BS, Sha2Hash<BS>>(coefficients, degree_bound, blowup_log2);
         test_queries_impl::<BS, Keccak256Hash<BS>>(coefficients, degree_bound, blowup_log2);
@@ -940,7 +924,8 @@ mod tests {
 
     #[test]
     fn test_accept_untampered_proof() {
-        let prover = honest_prover();
+        let prover =
+            Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2);
         let query = prover.query(QUERY_INDEX);
         let result = query.verify(&prover.commit());
         assert!(result.is_ok());
@@ -948,7 +933,9 @@ mod tests {
 
     #[test]
     fn test_reject_foreign_commitment() {
-        let query = honest_prover().query(QUERY_INDEX);
+        let prover =
+            Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2);
+        let query = prover.query(QUERY_INDEX);
         let foreign = Prover::<BS, Sha2Hash<BS>>::new(foreign_polynomial(), 8, 2).commit();
         let result = query.verify(&foreign);
         assert!(result.is_err());
@@ -956,7 +943,8 @@ mod tests {
 
     #[test]
     fn test_reject_corrupted_root() {
-        let prover = honest_prover();
+        let prover =
+            Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2);
         let mut commitment = prover.commit();
         commitment.roots[2] = H256::repeat_byte(0xAA);
         let result = prover.query(QUERY_INDEX).verify(&commitment);
@@ -965,7 +953,8 @@ mod tests {
 
     #[test]
     fn test_reject_truncated_folds() {
-        let prover = honest_prover();
+        let prover =
+            Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2);
         let commitment = prover.commit();
         let mut query = prover.query(QUERY_INDEX);
         query.folds.truncate(3);
@@ -975,7 +964,8 @@ mod tests {
 
     #[test]
     fn test_reject_truncated_commitment() {
-        let prover = honest_prover();
+        let prover =
+            Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2);
         let mut commitment = prover.commit();
         commitment.roots.truncate(3);
         let result = prover.query(QUERY_INDEX).verify(&commitment);
@@ -984,7 +974,8 @@ mod tests {
 
     #[test]
     fn test_reject_extra_folds() {
-        let prover = honest_prover();
+        let prover =
+            Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2);
         let commitment = prover.commit();
         let mut query = prover.query(QUERY_INDEX);
         let mut donor = prover.query(QUERY_INDEX);
@@ -995,7 +986,8 @@ mod tests {
 
     #[test]
     fn test_reject_folding_stopped_early() {
-        let prover = honest_prover();
+        let prover =
+            Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2);
         let mut commitment = prover.commit();
         let mut query = prover.query(QUERY_INDEX);
         commitment.roots.truncate(3);
@@ -1006,7 +998,8 @@ mod tests {
 
     #[test]
     fn test_reject_wrong_left_proof_height() {
-        let prover = honest_prover();
+        let prover =
+            Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2);
         let commitment = prover.commit();
         let mut query = prover.query(QUERY_INDEX);
         let mut donor = prover.query(QUERY_INDEX);
@@ -1017,7 +1010,8 @@ mod tests {
 
     #[test]
     fn test_reject_wrong_right_proof_height() {
-        let prover = honest_prover();
+        let prover =
+            Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2);
         let commitment = prover.commit();
         let mut query = prover.query(QUERY_INDEX);
         let mut donor = prover.query(QUERY_INDEX);
@@ -1028,7 +1022,8 @@ mod tests {
 
     #[test]
     fn test_reject_swapped_partners() {
-        let prover = honest_prover();
+        let prover =
+            Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2);
         let commitment = prover.commit();
         let mut query = prover.query(QUERY_INDEX);
         let pair = &mut query.folds[0];
@@ -1039,7 +1034,8 @@ mod tests {
 
     #[test]
     fn test_reject_foreign_leaf_proof() {
-        let prover = honest_prover();
+        let prover =
+            Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2);
         let commitment = prover.commit();
         let mut query = prover.query(QUERY_INDEX);
         let mut other = prover.query(QUERY_INDEX + 4);
@@ -1050,7 +1046,8 @@ mod tests {
 
     #[test]
     fn test_reject_extra_path_hash() {
-        let prover = honest_prover();
+        let prover =
+            Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2);
         let commitment = prover.commit();
         let mut query = prover.query(QUERY_INDEX);
         query.folds[0].0.path.push(H256::zero());
@@ -1060,7 +1057,8 @@ mod tests {
 
     #[test]
     fn test_reject_out_of_range_query_index() {
-        let prover = honest_prover();
+        let prover =
+            Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2);
         let commitment = prover.commit();
         let mut query = prover.query(QUERY_INDEX);
         query.index = DEGREE_BOUND << BLOWUP_LOG2;
@@ -1070,68 +1068,85 @@ mod tests {
 
     #[test]
     fn test_reject_missing_partner_proof() {
-        let mut proto = honest_prover().query(QUERY_INDEX).to_proto();
+        let prover =
+            Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2);
+        let mut proto = prover.query(QUERY_INDEX).to_proto();
         proto.folds[0].right = None;
-        let result = load_query(&proto);
+        let result = Query::<BS, Sha2Hash<BS>>::from_proto(DEGREE_BOUND, BLOWUP_LOG2, &proto);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_reject_missing_proof() {
-        let mut proto = honest_prover().query(QUERY_INDEX).to_proto();
+        let prover =
+            Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2);
+        let mut proto = prover.query(QUERY_INDEX).to_proto();
         proto.folds[2].left = None;
-        let result = load_query(&proto);
+        let result = Query::<BS, Sha2Hash<BS>>::from_proto(DEGREE_BOUND, BLOWUP_LOG2, &proto);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_reject_leaf_without_values() {
-        let mut proto = honest_prover().query(QUERY_INDEX).to_proto();
+        let prover =
+            Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2);
+        let mut proto = prover.query(QUERY_INDEX).to_proto();
         proto.folds[2].right.as_mut().unwrap().leaf_values.clear();
-        let result = load_query(&proto);
+        let result = Query::<BS, Sha2Hash<BS>>::from_proto(DEGREE_BOUND, BLOWUP_LOG2, &proto);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_reject_leaf_with_two_values() {
-        let mut proto = honest_prover().query(QUERY_INDEX).to_proto();
+        let prover =
+            Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2);
+        let mut proto = prover.query(QUERY_INDEX).to_proto();
         let leaf_values = &mut proto.folds[0].left.as_mut().unwrap().leaf_values;
         leaf_values.push(leaf_values[0].clone());
-        let result = load_query(&proto);
+        let result = Query::<BS, Sha2Hash<BS>>::from_proto(DEGREE_BOUND, BLOWUP_LOG2, &proto);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_reject_long_value() {
-        let mut proto = honest_prover().query(QUERY_INDEX).to_proto();
+        let prover =
+            Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2);
+        let mut proto = prover.query(QUERY_INDEX).to_proto();
         proto.folds[1].left.as_mut().unwrap().leaf_values[0].resize(33, 0);
-        let result = load_query(&proto);
+        let result = Query::<BS, Sha2Hash<BS>>::from_proto(DEGREE_BOUND, BLOWUP_LOG2, &proto);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_reject_non_canonical_value() {
-        let mut proto = honest_prover().query(QUERY_INDEX).to_proto();
+        let prover =
+            Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2);
+        let mut proto = prover.query(QUERY_INDEX).to_proto();
         let modulus: primitive_types::U256 = BS::MODULUS.parse().unwrap();
         proto.folds[1].right.as_mut().unwrap().leaf_values[0] = modulus.to_little_endian().to_vec();
-        let result = load_query(&proto);
+        let result = Query::<BS, Sha2Hash<BS>>::from_proto(DEGREE_BOUND, BLOWUP_LOG2, &proto);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_reject_short_path_hash() {
-        let mut proto = honest_prover().query(QUERY_INDEX).to_proto();
+        let prover =
+            Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2);
+        let mut proto = prover.query(QUERY_INDEX).to_proto();
         proto.folds[0].left.as_mut().unwrap().merkle_path[1].pop();
-        let result = load_query(&proto);
+        let result = Query::<BS, Sha2Hash<BS>>::from_proto(DEGREE_BOUND, BLOWUP_LOG2, &proto);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_serialization() {
-        let prover = honest_prover();
+        let prover =
+            Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2);
         let commitment = prover.commit();
         let query = prover.query(QUERY_INDEX);
-        let decoded = load_query(&query.to_proto()).unwrap();
+        let decoded =
+            Query::<BS, Sha2Hash<BS>>::from_proto(DEGREE_BOUND, BLOWUP_LOG2, &query.to_proto())
+                .unwrap();
         assert_eq!(decoded.indices(), query.indices());
         assert_eq!(decoded.len(), query.len());
         assert_eq!(decoded.values(), query.values());
