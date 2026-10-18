@@ -10,13 +10,13 @@ use std::marker::PhantomData;
 utils::prost_name!(
     proto::Sha2HashBackend,
     "Sha2HashBackend",
-    "starkom.proto.pcs.v8"
+    "starkom.proto.pcs.v9"
 );
 
 utils::prost_name!(
     proto::KeccakHashBackend,
     "KeccakHashBackend",
-    "starkom.proto.pcs.v8"
+    "starkom.proto.pcs.v9"
 );
 
 /// Describes a hash backend for hashing internal Merkle tree nodes.
@@ -247,11 +247,11 @@ mod tests {
     fn test_hash_backend_type_urls() {
         assert_eq!(
             proto::Sha2HashBackend::type_url(),
-            "type.starkom.io/starkom.proto.pcs.v8.Sha2HashBackend"
+            "type.starkom.io/starkom.proto.pcs.v9.Sha2HashBackend"
         );
         assert_eq!(
             proto::KeccakHashBackend::type_url(),
-            "type.starkom.io/starkom.proto.pcs.v8.KeccakHashBackend"
+            "type.starkom.io/starkom.proto.pcs.v9.KeccakHashBackend"
         );
     }
 

@@ -12,13 +12,28 @@ use std::sync::LazyLock;
 /// Domain separator tag used when deriving the Fiat-Shamir challenge for FRI folding.
 static FOLD_DST: LazyLock<H256> = LazyLock::new(|| utils::make_dst(b"starkom/fri/fold"));
 
-/// A Merkle proof for a single FRI leaf.
+/// Reverses the order of the lowest `num_bits` bits of `index`.
+///
+/// REQUIRES: `index` must be less than `2^num_bits`.
+fn reverse_bits(index: usize, num_bits: usize) -> usize {
+    if num_bits > 0 {
+        index.reverse_bits() >> (usize::BITS as usize - num_bits)
+    } else {
+        0
+    }
+}
+
+/// A Merkle proof for a pair of partner FRI leaves.
+///
+/// The leaves of FRI trees are stored in bit-reversed order (see [`Tree`]), so partners are always
+/// siblings: the proof opens one of them explicitly and the other one is the first element of the
+/// Merkle path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LeafProof<F: Field256, H: Hasher<F>> {
     /// The opened evaluation.
     value: F,
     /// The Merkle path from the leaf up to, but excluding, the root. The first element is the
-    /// sibling leaf, that is another evaluation encoded with [`utils::encode_scalar`], and the
+    /// sibling leaf, that is the partner evaluation encoded with [`utils::encode_scalar`], and the
     /// following elements are the siblings of the ancestors of the leaf.
     path: Vec<H256>,
     _data: PhantomData<H>,
@@ -31,12 +46,34 @@ impl<F: Field256, H: Hasher<F>> LeafProof<F, H> {
         self.path.len()
     }
 
+    /// Returns the opened evaluation.
+    fn value(&self) -> F {
+        self.value
+    }
+
+    /// Returns the partner evaluation, that is the first element of the Merkle path.
+    fn partner(&self) -> F {
+        utils::decode_scalar(self.path[0]).unwrap()
+    }
+
+    /// Returns the two opened leaves.
+    ///
+    /// Equivalent to `(proof.value(), proof.partner())`.
+    fn leaves(&self) -> (F, F) {
+        (self.value, utils::decode_scalar(self.path[0]).unwrap())
+    }
+
     /// Verifies the proof against the given root hash.
+    ///
+    /// `index` is the index of the opened evaluation in the evaluation domain, not the position of
+    /// the leaf in the tree (see [`Tree`]).
+    ///
+    /// REQUIRES: `index` must be a valid index in the evaluation domain.
     fn verify(&self, index: usize, root_hash: H256) -> Result<()> {
         merkle::verify_path::<H>(
             utils::encode_scalar(self.value),
             self.path.as_slice(),
-            index,
+            reverse_bits(index, self.path.len()),
             root_hash,
         )
     }
@@ -94,6 +131,16 @@ impl<F: Field256, H: Hasher<F>> LeafProof<F, H> {
 }
 
 /// A Merkle tree whose leaves are the evaluations of a polynomial.
+///
+/// The evaluations are stored in bit-reversed order: the one at index `i` of the evaluation domain
+/// of size N goes to the leaf at position `reverse_bits(i, log2(N))`. The partner evaluations at
+/// `i` and `i + N/2` (that is at `X` and `-X`) only differ in the most significant bit of their
+/// index, so they end up in sibling leaves and a single Merkle path opens both. Furthermore, their
+/// parent node is at the same position as the leaf of the folded evaluation in the next round.
+///
+/// NOTE: bit reversal is completely abstracted away by `Tree`. The provided API exposes the
+/// original evaluation domain indices, but bit reversal allows opening two partner values with a
+/// single Merkle proof.
 #[derive(Debug, Clone)]
 struct Tree<F: Field256, H: Hasher<F>> {
     /// The whole tree, stored layer by layer as described in [`merkle::merklify`]. There are 2*N-1
@@ -108,8 +155,12 @@ impl<F: Field256, H: Hasher<F>> Tree<F, H> {
     fn new(values: &[F]) -> Self {
         let n = values.len();
         assert!(n.is_power_of_two());
+        let num_bits = n.trailing_zeros() as usize;
         let mut data = Vec::with_capacity(n * 2 - 1);
-        data.extend(values.iter().map(|&value| utils::encode_scalar(value)));
+        data.extend((0..n).map(|index| {
+            let reverse_index = reverse_bits(index, num_bits);
+            utils::encode_scalar(values[reverse_index])
+        }));
         data.resize(n * 2 - 1, H256::zero());
         merkle::merklify::<H>(data.as_mut_slice(), n);
         Self {
@@ -129,16 +180,24 @@ impl<F: Field256, H: Hasher<F>> Tree<F, H> {
         *self.data.last().unwrap()
     }
 
-    /// Returns the evaluation stored in the i-th leaf.
+    /// Returns the evaluation at the given index of the evaluation domain.
     fn leaf(&self, index: usize) -> F {
-        utils::decode_scalar(self.data[index]).unwrap()
+        let num_bits = self.num_leaves().trailing_zeros() as usize;
+        let reverse_index = reverse_bits(index, num_bits);
+        utils::decode_scalar(self.data[reverse_index]).unwrap()
     }
 
-    /// Returns a Merkle proof for the leaf at `index`.
+    /// Returns a Merkle proof for the evaluation at the given index of the evaluation domain and
+    /// its partner.
+    ///
+    /// NOTE: `index` is not bit-reversed, but thanks to the internal bit reversal the returned
+    /// [`LeafProof`] proves both the element at `index` and its partner at `index + N/2`.
     fn query(&self, index: usize) -> LeafProof<F, H> {
+        let n = self.num_leaves();
+        let reverse_index = reverse_bits(index, n.trailing_zeros() as usize);
         LeafProof {
             value: self.leaf(index),
-            path: merkle::merkle_path(self.data.as_slice(), self.num_leaves(), index),
+            path: merkle::merkle_path(self.data.as_slice(), n, reverse_index),
             _data: PhantomData,
         }
     }
@@ -196,9 +255,10 @@ pub struct Query<F: Field256, H: Hasher<F>> {
     blowup_log2: usize,
     /// The index of the element we're opening (the partner index is inferred automatically).
     index: usize,
-    /// Proves a pair of "partner" values at each folding round with one [`LeafProof`] pair for
-    /// every round. The pair at `folds[0]` proves the opened values.
-    folds: Vec<(LeafProof<F, H>, LeafProof<F, H>)>,
+    /// Proves a pair of "partner" values at each folding round with one [`LeafProof`] for every
+    /// round, opening the queried index explicitly and its partner as the sibling leaf. The proof
+    /// at `folds[0]` proves the opened values.
+    folds: Vec<LeafProof<F, H>>,
 }
 
 impl<F: Field256, H: Hasher<F>> Query<F, H> {
@@ -227,7 +287,7 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
     /// The first component of the returned tuple is the evaluation at the first index returned by
     /// [`Self::indices`], while the second component is the one at the second index.
     pub fn values(&self) -> (F, F) {
-        (self.folds[0].0.value, self.folds[0].1.value)
+        self.folds[0].leaves()
     }
 
     /// Returns the number of Merkle trees in the proof: one for the original polynomial evaluations
@@ -267,47 +327,38 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
         }
 
         let mut index = self.index;
-        let mut pos = self.folds[0].0.value;
+        let mut pos = self.folds[0].value();
         let mut step = Polynomial::<F>::domain_element2(1, n).invert_unwrap();
 
         for round in 0..num_folds {
             let root_hash = commitment.roots()[round];
 
-            let (left, right) = &self.folds[round];
-            if left.len() != k {
+            let proof = &self.folds[round];
+            if proof.len() != k {
                 return Err(anyhow!(
-                    "invalid left-hand side Merkle proof height (got {}, want {})",
-                    left.len(),
-                    k
-                ));
-            }
-            if right.len() != k {
-                return Err(anyhow!(
-                    "invalid right-hand side Merkle proof height (got {}, want {})",
-                    right.len(),
+                    "invalid Merkle proof height (got {}, want {})",
+                    proof.len(),
                     k
                 ));
             }
 
-            if left.value != pos {
+            if proof.value() != pos {
                 return Err(anyhow!("leaf value mismatch"));
             }
-            left.verify(index, root_hash)?;
-            right.verify((index + n / 2) % n, root_hash)?;
+            proof.verify(index, root_hash)?;
 
             let omega_inv = step.pow_small(index);
             n /= 2;
             k -= 1;
             index %= n;
 
-            let neg = right.value;
+            let neg = proof.partner();
             let alpha = H::challenge(*FOLD_DST, &[root_hash]);
             pos = (pos + neg + alpha * omega_inv * (pos - neg)) * F::BaseField::TWO_INV;
             step = step.square();
         }
 
-        let (left, right) = self.folds.last().unwrap();
-        if !left.is_constant() || !right.is_constant() {
+        if !self.folds.last().unwrap().is_constant() {
             return Err(anyhow!("the final folded polynomial is not constant"));
         }
 
@@ -318,14 +369,7 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
     pub fn to_proto(&self) -> proto::Query {
         proto::Query {
             index: self.index as u64,
-            folds: self
-                .folds
-                .iter()
-                .map(|(left, right)| proto::query::Fold {
-                    left: Some(left.to_proto()),
-                    right: Some(right.to_proto()),
-                })
-                .collect(),
+            folds: self.folds.iter().map(LeafProof::to_proto).collect(),
         }
     }
 
@@ -333,8 +377,6 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
     ///
     /// REQUIRES: `degree_bound` must be a power of 2, `blowup_log2` must be greater than 0, and the
     /// size of the extended domain must fit within the 2-adicity of `F::BaseField`.
-    ///
-    /// Every opened value must be a canonical field element, otherwise an error is returned.
     ///
     /// NOTE: this method does not validate the proof, it only deserializes it. The caller must
     /// invoke [`Self::verify`] separately.
@@ -356,12 +398,7 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
             folds: proto
                 .folds
                 .iter()
-                .map(|fold| match (&fold.left, &fold.right) {
-                    (Some(left), Some(right)) => {
-                        Ok((LeafProof::from_proto(left)?, LeafProof::from_proto(right)?))
-                    }
-                    _ => Err(anyhow!("missing FRI folds")),
-                })
+                .map(|fold| LeafProof::from_proto(fold))
                 .collect::<Result<_>>()?,
         })
     }
@@ -469,7 +506,7 @@ impl<F: Field256, H: Hasher<F>> Prover<F, H> {
 
     /// Builds a FRI [`Query`] for the value at the specified index of the evaluation domain.
     ///
-    /// NOTE: `index` is relative to the *inflated* evaluation domain, so for example if you
+    /// NOTE: `index` is relative to the *extended* evaluation domain, so for example if you
     /// committed to 4 evaluations with a blowup factor of 8 the range for `index` is [0, 32).
     pub fn query(&self, index: usize) -> Query<F, H> {
         let mut n = self.degree_bound << self.blowup_log2;
@@ -478,16 +515,12 @@ impl<F: Field256, H: Hasher<F>> Prover<F, H> {
         let mut i = index;
         let mut folds = vec![];
         for tree in &self.trees {
-            folds.push((tree.query(i), tree.query((i + n / 2) % n)));
+            folds.push(tree.query(i));
             n /= 2;
             i %= n;
         }
 
-        {
-            let (left, right) = folds.last().unwrap();
-            assert!(left.is_constant());
-            assert!(right.is_constant());
-        }
+        assert!(folds.last().unwrap().is_constant());
 
         Query {
             degree_bound: self.degree_bound,
@@ -531,6 +564,8 @@ mod tests {
 
     /// Reference implementation of a Keccak-256 FRI tree, returning all the nodes of the tree
     /// stored layer by layer as in [`merkle::merklify`].
+    ///
+    /// The leaves are the given values in the given order, so the caller must bit-reverse them.
     fn reference_keccak256_tree(values: &[BS]) -> Vec<H256> {
         let mut layer: Vec<H256> = values
             .iter()
@@ -545,6 +580,38 @@ mod tests {
             nodes.extend_from_slice(layer.as_slice());
         }
         nodes
+    }
+
+    fn test_reverse_bits_impl(index: usize, num_bits: usize, expected: usize) {
+        let result = reverse_bits(index, num_bits);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_reverse_no_bits() {
+        test_reverse_bits_impl(0, 0, 0);
+    }
+
+    #[test]
+    fn test_reverse_one_bit() {
+        test_reverse_bits_impl(0, 1, 0);
+        test_reverse_bits_impl(1, 1, 1);
+    }
+
+    #[test]
+    fn test_reverse_three_bits() {
+        test_reverse_bits_impl(0b000, 3, 0b000);
+        test_reverse_bits_impl(0b001, 3, 0b100);
+        test_reverse_bits_impl(0b011, 3, 0b110);
+        test_reverse_bits_impl(0b101, 3, 0b101);
+        test_reverse_bits_impl(0b110, 3, 0b011);
+    }
+
+    #[test]
+    fn test_reverse_many_bits() {
+        test_reverse_bits_impl(0b1, 62, 1 << 61);
+        test_reverse_bits_impl(0b1011, 62, 0b1101 << 58);
+        test_reverse_bits_impl(usize::MAX, usize::BITS as usize, usize::MAX);
     }
 
     #[test]
@@ -563,18 +630,18 @@ mod tests {
     }
 
     #[test]
-    fn test_tree_leaves_are_big_endian_values() {
+    fn test_tree_leaves_are_bit_reversed_big_endian_values() {
         let tree = Tree::<BS, Keccak256Hash<BS>>::new(sample_values().as_slice());
         assert_eq!(
             tree.data[0..8],
             [
                 H256::from_low_u64_be(7),
-                H256::from_low_u64_be(8),
-                H256::from_low_u64_be(11),
-                H256::from_low_u64_be(16),
                 H256::from_low_u64_be(23),
-                H256::from_low_u64_be(32),
+                H256::from_low_u64_be(11),
                 H256::from_low_u64_be(43),
+                H256::from_low_u64_be(8),
+                H256::from_low_u64_be(32),
+                H256::from_low_u64_be(16),
                 H256::from_low_u64_be(56),
             ]
         );
@@ -584,7 +651,13 @@ mod tests {
     fn test_tree_matches_reference_implementation() {
         let values = sample_values();
         let tree = Tree::<BS, Keccak256Hash<BS>>::new(values.as_slice());
-        assert_eq!(tree.data, reference_keccak256_tree(values.as_slice()));
+        assert_eq!(
+            tree.data,
+            reference_keccak256_tree(&[
+                values[0], values[4], values[2], values[6], values[1], values[5], values[3],
+                values[7],
+            ])
+        );
     }
 
     #[test]
@@ -614,38 +687,52 @@ mod tests {
     #[test]
     fn test_query_value() {
         let tree = Tree::<BS, Sha2Hash<BS>>::new(sample_values().as_slice());
-        let proof = tree.query(5);
-        assert_eq!(proof.value, BS::from_const(32));
+        let proof = tree.query(3);
+        assert_eq!(proof.value(), BS::from_const(16));
     }
 
     #[test]
     fn test_query_path() {
         let tree = Tree::<BS, Sha2Hash<BS>>::new(sample_values().as_slice());
-        let proof = tree.query(5);
+        let proof = tree.query(3);
         assert_eq!(proof.len(), 3);
-        assert_eq!(proof.path, [tree.data[4], tree.data[8 + 3], tree.data[12]]);
+        assert_eq!(proof.path, [tree.data[7], tree.data[8 + 2], tree.data[12]]);
     }
 
     #[test]
-    fn test_query_path_starts_with_sibling_leaf() {
+    fn test_query_path_starts_with_partner() {
         let tree = Tree::<BS, Sha2Hash<BS>>::new(sample_values().as_slice());
-        let proof = tree.query(5);
-        assert_eq!(proof.path[0], H256::from_low_u64_be(23));
+        let proof = tree.query(3);
+        assert_eq!(proof.path[0], H256::from_low_u64_be(56));
+    }
+
+    #[test]
+    fn test_query_partner() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(sample_values().as_slice());
+        let proof = tree.query(3);
+        assert_eq!(proof.partner(), BS::from_const(56));
+    }
+
+    #[test]
+    fn test_partner_of_partner() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(sample_values().as_slice());
+        let proof = tree.query(7);
+        assert_eq!(proof.partner(), BS::from_const(16));
     }
 
     #[test]
     fn test_single_leaf_tree_query() {
         let tree = Tree::<BS, Sha2Hash<BS>>::new(&[BS::from_const(42)]);
         let proof = tree.query(0);
-        assert_eq!(proof.value, BS::from_const(42));
+        assert_eq!(proof.value(), BS::from_const(42));
         assert_eq!(proof.path, []);
     }
 
     #[test]
     fn test_leaf_proof_verify() {
         let tree = Tree::<BS, Sha2Hash<BS>>::new(sample_values().as_slice());
-        let proof = tree.query(5);
-        let result = proof.verify(5, tree.root_hash());
+        let proof = tree.query(3);
+        let result = proof.verify(3, tree.root_hash());
         assert!(result.is_ok());
     }
 
@@ -661,24 +748,41 @@ mod tests {
     #[test]
     fn test_leaf_proof_verify_with_wrong_index() {
         let tree = Tree::<BS, Sha2Hash<BS>>::new(sample_values().as_slice());
-        let proof = tree.query(5);
-        let result = proof.verify(4, tree.root_hash());
+        let proof = tree.query(3);
+        let result = proof.verify(2, tree.root_hash());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_leaf_proof_verify_with_partner_index() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(sample_values().as_slice());
+        let proof = tree.query(3);
+        let result = proof.verify(7, tree.root_hash());
         assert!(result.is_err());
     }
 
     #[test]
     fn test_leaf_proof_verify_with_out_of_range_index() {
         let tree = Tree::<BS, Sha2Hash<BS>>::new(sample_values().as_slice());
-        let proof = tree.query(5);
-        let result = proof.verify(5 + 8, tree.root_hash());
+        let proof = tree.query(3);
+        let result = proof.verify(3 + 8, tree.root_hash());
         assert!(result.is_err());
     }
 
     #[test]
     fn test_leaf_proof_verify_with_wrong_root() {
         let tree = Tree::<BS, Sha2Hash<BS>>::new(sample_values().as_slice());
-        let proof = tree.query(5);
-        let result = proof.verify(5, tree.data[0]);
+        let proof = tree.query(3);
+        let result = proof.verify(3, tree.data[0]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_leaf_proof_verify_with_tampered_partner() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(sample_values().as_slice());
+        let mut proof = tree.query(3);
+        proof.path[0] = H256::from_low_u64_be(57);
+        let result = proof.verify(3, tree.root_hash());
         assert!(result.is_err());
     }
 
@@ -693,7 +797,7 @@ mod tests {
     #[test]
     fn test_leaf_proof_is_not_constant() {
         let tree = Tree::<BS, Sha2Hash<BS>>::new(sample_values().as_slice());
-        let proof = tree.query(5);
+        let proof = tree.query(3);
         assert!(!proof.is_constant());
     }
 
@@ -736,9 +840,9 @@ mod tests {
         assert_eq!(
             proto.merkle_path,
             [
-                tree.data[2].as_bytes().to_vec(),
-                tree.data[8].as_bytes().to_vec(),
-                tree.data[13].as_bytes().to_vec(),
+                tree.data[7].as_bytes().to_vec(),
+                tree.data[8 + 2].as_bytes().to_vec(),
+                tree.data[12].as_bytes().to_vec(),
             ]
         );
     }
@@ -778,10 +882,10 @@ mod tests {
         assert_eq!(
             commitment.roots(),
             [
-                parse("0xf243320c355c40b383d412c7e1964911d8b0158e9074dcb4c1d3f8b3d47fbe40"),
-                parse("0x6ec4f9a41a3d96df76e26c26acebf9b59832c42b5705595f8d9a32bea19e2592"),
-                parse("0xc0da902ce501419871c92091cf5a1dc3a18345334e3dc17c5a60ce4b3b45aaeb"),
-                parse("0x51f2f631f31206f27d63c68c70623c1e2bb93acd17d125b551dac8444b290eb7"),
+                parse("0x4dbf05b032faad3a0279e11536170c9dc6c2444b65bfda0917160a556b76ab5b"),
+                parse("0x3beefd65cfe8506f9b499e8397100d6d695d97af5742e70b60100f056d55307b"),
+                parse("0x7d5697dea024a95e3d383fdc569fb615fa391a96f710201c970bebe336476c9b"),
+                parse("0x14d99870760ebadb2f9f3b2689116c8348263851c7f2c5ff67845509618b582d"),
             ]
         );
     }
@@ -793,10 +897,10 @@ mod tests {
         assert_eq!(
             commitment.roots(),
             [
-                parse("0x9b4906d8f66d186d59009303c5caef59460de8a06b17c5bf09082778709f5201"),
-                parse("0xe4bc0886fb6edf122ba603607a60ac1c4feb73bf2ffebf306e229a490a55d796"),
-                parse("0x87b4a1f5b10087b68593b197901f40f857ad5777892fb6cc58fce34d8bc08e15"),
-                parse("0x7bb73139b685ac249fc83972820d410a8be43dab72764445e5679c9a182f39f4"),
+                parse("0xf62fdcf4604e703d26974310d70bca5ef93f22d316f2083167b3bc4fd4437f8f"),
+                parse("0x3e708444a31aed3a38ef8d8074873506efba437be058889e79b8499095e5eefd"),
+                parse("0xbb62bc0c84acc6aa08f2bac9f342426dc3e9c284630031807c3f848f35b15dcc"),
+                parse("0xcdfce461c1f186f69101a452d08021e6b6ed6613637327a5173234bafd9c3018"),
             ]
         );
     }
@@ -997,25 +1101,13 @@ mod tests {
     }
 
     #[test]
-    fn test_reject_wrong_left_proof_height() {
+    fn test_reject_wrong_proof_height() {
         let prover =
             Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2);
         let commitment = prover.commit();
         let mut query = prover.query(QUERY_INDEX);
         let mut donor = prover.query(QUERY_INDEX);
-        query.folds[0].0 = donor.folds.remove(1).0;
-        let result = query.verify(&commitment);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_reject_wrong_right_proof_height() {
-        let prover =
-            Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2);
-        let commitment = prover.commit();
-        let mut query = prover.query(QUERY_INDEX);
-        let mut donor = prover.query(QUERY_INDEX);
-        query.folds[0].1 = donor.folds.remove(1).1;
+        query.folds[0] = donor.folds.remove(1);
         let result = query.verify(&commitment);
         assert!(result.is_err());
     }
@@ -1026,8 +1118,22 @@ mod tests {
             Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2);
         let commitment = prover.commit();
         let mut query = prover.query(QUERY_INDEX);
-        let pair = &mut query.folds[0];
-        std::mem::swap(&mut pair.0, &mut pair.1);
+        let proof = &mut query.folds[0];
+        let partner = proof.partner();
+        proof.path[0] = utils::encode_scalar(proof.value);
+        proof.value = partner;
+        let result = query.verify(&commitment);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_tampered_partner() {
+        let prover =
+            Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2);
+        let commitment = prover.commit();
+        let mut query = prover.query(QUERY_INDEX);
+        let proof = &mut query.folds[1];
+        proof.path[0] = utils::encode_scalar(proof.partner() + BS::ONE);
         let result = query.verify(&commitment);
         assert!(result.is_err());
     }
@@ -1039,7 +1145,7 @@ mod tests {
         let commitment = prover.commit();
         let mut query = prover.query(QUERY_INDEX);
         let mut other = prover.query(QUERY_INDEX + 4);
-        query.folds[1].0 = other.folds.remove(1).0;
+        query.folds[1] = other.folds.remove(1);
         let result = query.verify(&commitment);
         assert!(result.is_err());
     }
@@ -1050,7 +1156,7 @@ mod tests {
             Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2);
         let commitment = prover.commit();
         let mut query = prover.query(QUERY_INDEX);
-        query.folds[0].0.path.push(H256::zero());
+        query.folds[0].path.push(H256::zero());
         let result = query.verify(&commitment);
         assert!(result.is_err());
     }
@@ -1067,21 +1173,22 @@ mod tests {
     }
 
     #[test]
-    fn test_reject_missing_partner_proof() {
+    fn test_reject_empty_merkle_path() {
         let prover =
             Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2);
         let mut proto = prover.query(QUERY_INDEX).to_proto();
-        proto.folds[0].right = None;
+        proto.folds[1].merkle_path.clear();
         let result = Query::<BS, Sha2Hash<BS>>::from_proto(DEGREE_BOUND, BLOWUP_LOG2, &proto);
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_reject_missing_proof() {
+    fn test_reject_non_canonical_partner() {
         let prover =
             Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2);
         let mut proto = prover.query(QUERY_INDEX).to_proto();
-        proto.folds[2].left = None;
+        let modulus: primitive_types::U256 = BS::MODULUS.parse().unwrap();
+        proto.folds[2].merkle_path[0] = modulus.to_big_endian().to_vec();
         let result = Query::<BS, Sha2Hash<BS>>::from_proto(DEGREE_BOUND, BLOWUP_LOG2, &proto);
         assert!(result.is_err());
     }
@@ -1091,7 +1198,7 @@ mod tests {
         let prover =
             Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2);
         let mut proto = prover.query(QUERY_INDEX).to_proto();
-        proto.folds[2].right.as_mut().unwrap().leaf_values.clear();
+        proto.folds[2].leaf_values.clear();
         let result = Query::<BS, Sha2Hash<BS>>::from_proto(DEGREE_BOUND, BLOWUP_LOG2, &proto);
         assert!(result.is_err());
     }
@@ -1101,7 +1208,7 @@ mod tests {
         let prover =
             Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2);
         let mut proto = prover.query(QUERY_INDEX).to_proto();
-        let leaf_values = &mut proto.folds[0].left.as_mut().unwrap().leaf_values;
+        let leaf_values = &mut proto.folds[0].leaf_values;
         leaf_values.push(leaf_values[0].clone());
         let result = Query::<BS, Sha2Hash<BS>>::from_proto(DEGREE_BOUND, BLOWUP_LOG2, &proto);
         assert!(result.is_err());
@@ -1112,7 +1219,7 @@ mod tests {
         let prover =
             Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2);
         let mut proto = prover.query(QUERY_INDEX).to_proto();
-        proto.folds[1].left.as_mut().unwrap().leaf_values[0].resize(33, 0);
+        proto.folds[1].leaf_values[0].resize(33, 0);
         let result = Query::<BS, Sha2Hash<BS>>::from_proto(DEGREE_BOUND, BLOWUP_LOG2, &proto);
         assert!(result.is_err());
     }
@@ -1123,7 +1230,7 @@ mod tests {
             Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2);
         let mut proto = prover.query(QUERY_INDEX).to_proto();
         let modulus: primitive_types::U256 = BS::MODULUS.parse().unwrap();
-        proto.folds[1].right.as_mut().unwrap().leaf_values[0] = modulus.to_little_endian().to_vec();
+        proto.folds[1].leaf_values[0] = modulus.to_little_endian().to_vec();
         let result = Query::<BS, Sha2Hash<BS>>::from_proto(DEGREE_BOUND, BLOWUP_LOG2, &proto);
         assert!(result.is_err());
     }
@@ -1133,7 +1240,7 @@ mod tests {
         let prover =
             Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2);
         let mut proto = prover.query(QUERY_INDEX).to_proto();
-        proto.folds[0].left.as_mut().unwrap().merkle_path[1].pop();
+        proto.folds[0].merkle_path[1].pop();
         let result = Query::<BS, Sha2Hash<BS>>::from_proto(DEGREE_BOUND, BLOWUP_LOG2, &proto);
         assert!(result.is_err());
     }

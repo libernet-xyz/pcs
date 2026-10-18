@@ -50,25 +50,48 @@ message Commitment {
 
 // A Merkle proof.
 //
-// The Merkle trees of the polynomial batches have vector leaves: each leaf is an array containing
-// the evaluations of one or more committed polynomials, and the Merkle tree is built on the hashes
-// of the leaves. The FRI trees are different, see `Query.Fold`.
+// Our Merkle proof behave slightly differently between the FRI layer and the DEEP layer.
+//
+// At the DEEP level batching is supported, so in general our DEEP Merkle trees have vector leaves
+// rather than scalar ones. If we're batching K polynomials each leaf is a vector of K evaluations
+// and the hashes of these vectors are used to build higher levels of the Merkle tree. In this case
+// `leaf_values` is the vector of K evaluations in the opened leaf and `merkle_path` is the Merkle
+// path to the root, with `merkle_path[0]` containing the hash of the sibling leaf. Evaluations are
+// field elements and are stored in canonical (non_Montgomery) integer form, in little-endian byte
+// order.
+//
+// At the FRI level we always work with a single polynomial (which is the DEEP quotient) and its
+// evaluations are stored in bit-reversed order so that a single Merkle proof opens both an element
+// at position `i` and its FRI partner at index `i+n/2`. In this case `leaf_values` must always have
+// one element, the opened element at index `i` stored in canonical (non-Montgomery) integer form in
+// little-endian byte order. `merkle_path[0]` is the sibling of the opened leaf, so in this case
+// it's the opened FRI partner stored in *big-endian* order! We use big-endian here because of the
+// extra serialization abstraction layer: `merkle_path` is an array of hashes, so we need to
+// serialize the partner element into a hash before serializing the array of hashes into this
+// protobuf. We use big-endian at the "extra" abstraction layer to facilitate calldata encoding and
+// verification on the EVM, which uses big-endian for `uint256`.
+//
+// In both cases `merkle_path` excludes the root hash of the tree because root hashes are send
+// separately in the `Commitment`.
 message MerkleProof {
-  // The evaluations of the batched polynomials at the domain location corresponding to this leaf.
+  // The opened values.
   //
-  // Each scalar is stored in canonical (non-Montgomery) integer form, in little-endian byte order.
+  // Each value is a field element stored in canonical (non-Montgomery) integer form, in
+  // little-endian byte order.
+  //
+  // In FRI queries this array must always have exactly one `bytes` element (FRI always works on a
+  // single polynomial, which is the DEEP quotient). In DEEP Merkle trees there may be more than one
+  // opened values.
   repeated bytes leaf_values = 1;
 
   // The leaf-to-root Merkle path, excluding the root hash.
   //
-  // The root hash is not stored here because all root hashes are stored separately in the
-  // `Commitment` message.
+  // Each hash is stored as a 32 byte sequence. The root hash is not stored here because all root
+  // hashes are sent separately in the `Commitment`.
   //
-  // The first element of the array is the hash of the evaluations of the sibling leaf, the second
-  // element is the hash of the sibling of the parent node, and so on until the sibling of the child
-  // of the root.
-  //
-  // Each hash is stored as a 32 byte sequence.
+  // In FRI queries the first element `merkle_path[0]` is the FRI partner value stored as a sequence
+  // of 32 bytes in big-endian order (in canonical form, not Montgomery). In DEEP openings the first
+  // element is the hash of the sibling of the opened leaf.
   repeated bytes merkle_path = 2;
 }
 
@@ -77,32 +100,16 @@ message MerkleProof {
 // NOTE: the proven degree bound and the blowup factor are not stored here because all queries in a
 // proof refer to `Proof.degree_bound` and `Proof.blowup_log2`.
 message Query {
-  // The index of the queried leaf.
+  // The queried index of the evaluation domain. Note that this is not the position of the queried
+  // leaf in the Merkle tree, because the leaves are stored in bit-reversed order (see below).
   uint64 index = 1;
 
-  // A pair of Merkle proofs resulting from a folding round: the queried position and its partner.
-  //
-  // The FRI layer works on a single polynomial, so the leaves of its Merkle trees are the
-  // evaluations themselves rather than hashes of them: each leaf is a canonical field element
-  // stored as a 32 byte big-endian integer, which a Solidity verifier can hash without any byte
-  // swapping.
-  //
-  // Therefore, in these `MerkleProof`s, `leaf_values` must contain exactly one element: the opened
-  // evaluation, stored in little-endian order like all other scalars in this file (note that this
-  // is the opposite of the byte order of the leaves in the Merkle tree). Similarly, the first
-  // element of `merkle_path` is the sibling leaf itself, that is another evaluation stored as a 32
-  // byte big-endian integer, rather than its hash.
-  message Fold {
-    MerkleProof left = 1;
-    MerkleProof right = 2;
-  }
-
-  // List of Merkle proofs resulting from the folding rounds.
+  // List of Merkle proofs for the query, each one proving the queried position and its partner.
   //
   // This list actually contains one entry for every Merkle tree in the folding argument, not one
   // for every fold, so there must be at least one element. The number of Merkle trees is equal to
   // the number of folds plus one.
-  repeated Fold folds = 2;
+  repeated MerkleProof folds = 2;
 }
 
 // A batched DEEP-FRI proof.

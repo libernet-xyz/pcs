@@ -1422,9 +1422,9 @@ mod tests {
         assert_eq!(
             commitment.inner.roots(),
             [
-                parse::<H256>("0x9fb0ac5a93ac455d0465cfeb436ccb026695d3db39f9d2cfeab3506ea20f5eb5"),
-                parse("0xb818fdd081734219bafef33b0a6f0bdff29f3d9e0f715b1e09504854b332e1b8"),
-                parse("0xd311651c5cee4e54bd7eb659ed640b801f4a644bf88876e0c25dca8f22f6e4ba"),
+                parse::<H256>("0x1cfc697bb66e15c8357f7a749010a210ae829f520944e21e4df00cfa7212ec8c"),
+                parse("0xc61b2df672d90a4aef984d6b7d485f673cec75f1868d39e6ba659a4ec3883f6f"),
+                parse("0xb3eb7eed49ad1119daa31ad838a2a4bb9905657869e618cc497611bbadbbd074"),
             ]
         );
     }
@@ -1474,7 +1474,7 @@ mod tests {
         let seed = commitment.query_seed();
         assert_eq!(
             seed,
-            parse("0xcf704cf27ca4f2cc280a736a11e363065e4cc22e3e8a8aa72f8e42798c3121df")
+            parse("0x085c3c13977971933e24213578667842fb22b1068841a1ce7edbccaaeb7ded6d")
         );
     }
 
@@ -1673,7 +1673,7 @@ mod tests {
         let committer = make_committer::<BS, Sha2Hash<BS>>(GROUND_OPTIONS, &SAMPLE_BATCHES);
         let (commitment, prover) = committer.commit(make_points(&SAMPLE_POINTS));
         let proof = prover.prove(&commitment);
-        assert_eq!(proof.nonce(), 331);
+        assert_eq!(proof.nonce(), 70);
     }
 
     #[test]
@@ -2102,7 +2102,7 @@ mod tests {
         assert_eq!(proto.degree_bound, 4);
         assert_eq!(proto.blowup_log2, 2);
         assert_eq!(proto.grinding_bits, 8);
-        assert_eq!(proto.nonce, 331);
+        assert_eq!(proto.nonce, 70);
         assert_eq!(proto.num_polys, 3);
         assert_eq!(
             proto.points,
