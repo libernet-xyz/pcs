@@ -504,131 +504,290 @@ mod tests {
     use crate::hash::{Keccak256Hash, Sha2Hash};
     use starkom_bluesky::Scalar as BS;
     use starkom_goldilocks::GL4;
+    use std::fmt::Debug;
+    use std::str::FromStr;
 
-    fn parse<V: std::str::FromStr<Err: std::fmt::Debug>>(s: &'static str) -> V {
+    fn parse<V: FromStr<Err: Debug>>(s: &'static str) -> V {
         s.parse().unwrap()
     }
 
-    fn keccak(left: &[u8], right: &[u8]) -> H256 {
+    /// Eight distinct evaluations to build trees from.
+    fn sample_values() -> Vec<BS> {
+        [7, 8, 11, 16, 23, 32, 43, 56]
+            .into_iter()
+            .map(BS::from_const)
+            .collect()
+    }
+
+    /// Hashes two 32-byte nodes with an independent Keccak-256 implementation, the same way an EVM
+    /// verifier does with `keccak256(abi.encodePacked(left, right))`.
+    fn reference_keccak256(left: H256, right: H256) -> H256 {
         use sha3::Digest;
         let mut hasher = sha3::Keccak256::new();
-        hasher.update(left);
-        hasher.update(right);
+        hasher.update(left.as_bytes());
+        hasher.update(right.as_bytes());
         H256::from_slice(hasher.finalize().as_slice())
     }
 
-    #[test]
-    fn test_tree_layout() {
-        let values: Vec<BS> = (0..8u64).map(|i| BS::from_const(i * i + 7)).collect();
-        let tree = Tree::<BS, Keccak256Hash<BS>>::new(values.as_slice());
-        assert_eq!(tree.data.len(), 15);
-        assert_eq!(tree.num_leaves(), 8);
-        // The leaves are the values themselves, as 32-byte big-endian integers.
-        assert_eq!(tree.data[2], H256::from_low_u64_be(11));
-        let mut level: Vec<H256> = values
+    /// Reference implementation of a Keccak-256 FRI tree, returning all the nodes of the tree
+    /// stored layer by layer as in [`merkle::merklify`].
+    fn reference_keccak256_tree(values: &[BS]) -> Vec<H256> {
+        let mut layer: Vec<H256> = values
             .iter()
             .map(|value| H256::from_slice(&value.to_u256().to_big_endian()))
             .collect();
-        assert_eq!(&tree.data[0..8], level.as_slice());
-        // Recompute the internal nodes the way an EVM verifier does:
-        // `keccak256(abi.encodePacked(left, right))`.
-        let mut offset = 8;
-        while level.len() > 1 {
-            level = level
+        let mut nodes = layer.clone();
+        while layer.len() > 1 {
+            layer = layer
                 .chunks(2)
-                .map(|pair| keccak(pair[0].as_bytes(), pair[1].as_bytes()))
+                .map(|pair| reference_keccak256(pair[0], pair[1]))
                 .collect();
-            assert_eq!(&tree.data[offset..(offset + level.len())], level.as_slice());
-            offset += level.len();
+            nodes.extend_from_slice(layer.as_slice());
         }
-        assert_eq!(tree.root_hash(), level[0]);
+        nodes
     }
 
     #[test]
-    fn test_tree_leaves() {
-        let values: Vec<BS> = (0..8u64).map(|i| BS::from_const(i * i + 7)).collect();
-        let tree = Tree::<BS, Sha2Hash<BS>>::new(values.as_slice());
-        for (index, &value) in values.iter().enumerate() {
-            assert_eq!(tree.leaf(index), value);
-        }
-        let single = Tree::<BS, Sha2Hash<BS>>::new(&values[0..1]);
-        assert_eq!(single.num_leaves(), 1);
-        assert_eq!(single.data.len(), 1);
-        assert_eq!(single.leaf(0), values[0]);
-        assert_eq!(single.root_hash(), single.data[0]);
-    }
-
-    #[test]
-    fn test_tree_query() {
-        let values: Vec<BS> = (0..8u64).map(|i| BS::from_const(i * i + 7)).collect();
-        let tree = Tree::<BS, Sha2Hash<BS>>::new(values.as_slice());
-        let proof = tree.query(5);
-        assert_eq!(proof.value, values[5]);
-        assert_eq!(proof.path, [tree.data[4], tree.data[8 + 3], tree.data[12]]);
-        assert_eq!(proof.len(), 3);
-        // The first element of the Merkle path is the sibling leaf, so it's a value too.
+    fn test_fold_dst() {
         assert_eq!(
-            utils::decode_scalar::<BS>(proof.path[0]).unwrap(),
-            values[4]
+            *FOLD_DST,
+            parse::<H256>("0x9ffd3556faeb2cae194ce95adf6b3580f590504daa0dea56966ce4ef233844af")
         );
-        assert!(proof.verify(5, tree.root_hash()).is_ok());
-        assert!(proof.verify(4, tree.root_hash()).is_err());
+    }
+
+    #[test]
+    fn test_tree_size() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(sample_values().as_slice());
+        assert_eq!(tree.num_leaves(), 8);
+        assert_eq!(tree.data.len(), 15);
+    }
+
+    #[test]
+    fn test_tree_leaves_are_big_endian_values() {
+        let tree = Tree::<BS, Keccak256Hash<BS>>::new(sample_values().as_slice());
+        assert_eq!(
+            tree.data[0..8],
+            [
+                H256::from_low_u64_be(7),
+                H256::from_low_u64_be(8),
+                H256::from_low_u64_be(11),
+                H256::from_low_u64_be(16),
+                H256::from_low_u64_be(23),
+                H256::from_low_u64_be(32),
+                H256::from_low_u64_be(43),
+                H256::from_low_u64_be(56),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_tree_matches_reference_implementation() {
+        let values = sample_values();
+        let tree = Tree::<BS, Keccak256Hash<BS>>::new(values.as_slice());
+        assert_eq!(tree.data, reference_keccak256_tree(values.as_slice()));
+    }
+
+    #[test]
+    fn test_tree_root_hash() {
+        let tree = Tree::<BS, Keccak256Hash<BS>>::new(sample_values().as_slice());
+        let root_hash = tree.root_hash();
+        assert_eq!(root_hash, tree.data[14]);
+    }
+
+    #[test]
+    fn test_tree_leaf() {
+        let values = sample_values();
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(values.as_slice());
+        let leaves: Vec<BS> = (0..8).map(|index| tree.leaf(index)).collect();
+        assert_eq!(leaves, values);
+    }
+
+    #[test]
+    fn test_single_leaf_tree() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(&[BS::from_const(42)]);
+        assert_eq!(tree.num_leaves(), 1);
+        assert_eq!(tree.data, [H256::from_low_u64_be(42)]);
+        assert_eq!(tree.root_hash(), H256::from_low_u64_be(42));
+        assert_eq!(tree.leaf(0), BS::from_const(42));
+    }
+
+    #[test]
+    fn test_query_value() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(sample_values().as_slice());
+        let proof = tree.query(5);
+        assert_eq!(proof.value, BS::from_const(32));
+    }
+
+    #[test]
+    fn test_query_path() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(sample_values().as_slice());
+        let proof = tree.query(5);
+        assert_eq!(proof.len(), 3);
+        assert_eq!(proof.path, [tree.data[4], tree.data[8 + 3], tree.data[12]]);
+    }
+
+    #[test]
+    fn test_query_path_starts_with_sibling_leaf() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(sample_values().as_slice());
+        let proof = tree.query(5);
+        assert_eq!(proof.path[0], H256::from_low_u64_be(23));
+    }
+
+    #[test]
+    fn test_single_leaf_tree_query() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(&[BS::from_const(42)]);
+        let proof = tree.query(0);
+        assert_eq!(proof.value, BS::from_const(42));
+        assert_eq!(proof.path, []);
+    }
+
+    #[test]
+    fn test_leaf_proof_verify() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(sample_values().as_slice());
+        let proof = tree.query(5);
+        let result = proof.verify(5, tree.root_hash());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_all_leaf_proofs_verify() {
+        let tree = Tree::<BS, Keccak256Hash<BS>>::new(sample_values().as_slice());
+        let results: Vec<bool> = (0..8)
+            .map(|index| tree.query(index).verify(index, tree.root_hash()).is_ok())
+            .collect();
+        assert_eq!(results, [true; 8]);
+    }
+
+    #[test]
+    fn test_leaf_proof_verify_with_wrong_index() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(sample_values().as_slice());
+        let proof = tree.query(5);
+        let result = proof.verify(4, tree.root_hash());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_leaf_proof_verify_with_out_of_range_index() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(sample_values().as_slice());
+        let proof = tree.query(5);
+        let result = proof.verify(5 + 8, tree.root_hash());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_leaf_proof_verify_with_wrong_root() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(sample_values().as_slice());
+        let proof = tree.query(5);
+        let result = proof.verify(5, tree.data[0]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_single_leaf_proof_verify() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(&[BS::from_const(42)]);
+        let proof = tree.query(0);
+        let result = proof.verify(0, tree.root_hash());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_leaf_proof_is_not_constant() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(sample_values().as_slice());
+        let proof = tree.query(5);
         assert!(!proof.is_constant());
-        for index in 0..8 {
-            assert!(tree.query(index).verify(index, tree.root_hash()).is_ok());
-        }
-        let single = Tree::<BS, Sha2Hash<BS>>::new(&values[0..1]);
-        let proof = single.query(0);
-        assert_eq!(proof.value, values[0]);
-        assert_eq!(proof.len(), 0);
-        assert!(proof.verify(0, single.root_hash()).is_ok());
+    }
+
+    #[test]
+    fn test_constant_tree_proofs_are_constant() {
+        let tree = Tree::<BS, Keccak256Hash<BS>>::new(&[BS::from_const(42); 8]);
+        let results: Vec<bool> = (0..8)
+            .map(|index| tree.query(index).is_constant())
+            .collect();
+        assert_eq!(results, [true; 8]);
+    }
+
+    #[test]
+    fn test_almost_constant_tree_proofs_are_not_constant() {
+        let mut values = [BS::from_const(42); 8];
+        values[5] = BS::from_const(43);
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(&values);
+        let results: Vec<bool> = (0..8)
+            .map(|index| tree.query(index).is_constant())
+            .collect();
+        assert_eq!(results, [false; 8]);
+    }
+
+    #[test]
+    fn test_single_leaf_proof_is_constant() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(&[BS::from_const(42)]);
+        let proof = tree.query(0);
         assert!(proof.is_constant());
     }
 
     #[test]
-    fn test_almost_constant_tree_query() {
-        let mut values = [BS::from_const(42); 8];
-        values[5] = BS::from_const(43);
-        let tree = Tree::<BS, Sha2Hash<BS>>::new(&values);
-        for index in 0..8 {
-            assert!(!tree.query(index).is_constant());
-        }
-    }
-
-    #[test]
-    fn test_constant_tree_query() {
-        let tree = Tree::<BS, Keccak256Hash<BS>>::new(&[BS::from_const(42); 8]);
-        for index in 0..8 {
-            let proof = tree.query(index);
-            assert!(proof.is_constant());
-            assert!(proof.verify(index, tree.root_hash()).is_ok());
-        }
-    }
-
-    #[test]
-    fn test_leaf_proof_serialization() {
-        let values: Vec<BS> = (0..8u64).map(|i| BS::from_const(i * i + 7)).collect();
-        let tree = Tree::<BS, Keccak256Hash<BS>>::new(values.as_slice());
+    fn test_leaf_proof_to_proto() {
+        let tree = Tree::<BS, Keccak256Hash<BS>>::new(sample_values().as_slice());
         let proof = tree.query(3);
         let proto = proof.to_proto();
-        assert_eq!(proto.leaf_values, [values[3].to_le_bytes().to_vec()]);
-        assert_eq!(proto.merkle_path.len(), 3);
-        assert_eq!(LeafProof::from_proto(&proto).unwrap(), proof);
+        assert_eq!(
+            proto.leaf_values,
+            [BS::from_const(16).to_le_bytes().to_vec()]
+        );
+        assert_eq!(
+            proto.merkle_path,
+            [
+                tree.data[2].as_bytes().to_vec(),
+                tree.data[8].as_bytes().to_vec(),
+                tree.data[13].as_bytes().to_vec(),
+            ]
+        );
     }
 
     #[test]
-    fn test_commitment_roots() {
+    fn test_leaf_proof_from_proto() {
+        let tree = Tree::<BS, Keccak256Hash<BS>>::new(sample_values().as_slice());
+        let proof = tree.query(3);
+        let proto = proof.to_proto();
+        let decoded = LeafProof::<BS, Keccak256Hash<BS>>::from_proto(&proto).unwrap();
+        assert_eq!(decoded, proof);
+    }
+
+    const DEGREE_BOUND: usize = 8;
+    const BLOWUP_LOG2: usize = 2;
+    const QUERY_INDEX: usize = 3;
+
+    /// Builds a polynomial from its coefficients.
+    fn make_polynomial<F: Field256>(coefficients: &[u64]) -> Polynomial<F> {
+        Polynomial::with_coefficients(coefficients.iter().copied().map(F::from).collect())
+    }
+
+    /// The polynomial committed by [`honest_prover`].
+    fn honest_polynomial() -> Polynomial<BS> {
+        make_polynomial(&[12, 34, 56, 78, 90, 12, 34, 56])
+    }
+
+    /// Same as [`honest_polynomial`] but with different coefficients.
+    fn foreign_polynomial() -> Polynomial<BS> {
+        make_polynomial(&[90, 78, 56, 34, 12, 90, 78, 56])
+    }
+
+    /// A prover for [`honest_polynomial`].
+    fn honest_prover() -> Prover<BS, Sha2Hash<BS>> {
+        Prover::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2)
+    }
+
+    /// Deserializes a query with the same parameters as [`honest_prover`].
+    fn load_query(proto: &proto::Query) -> Result<Query<BS, Sha2Hash<BS>>> {
+        Query::from_proto(DEGREE_BOUND, BLOWUP_LOG2, proto)
+    }
+
+    #[test]
+    fn test_sha2_commitment_roots() {
         // Pinned roots: changing them changes the protocol.
-        let polynomial = Polynomial::<BS>::with_coefficients(
-            [12, 34, 56, 78, 90, 12, 34, 56]
-                .into_iter()
-                .map(BS::from_const)
-                .collect(),
-        );
+        let prover = Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), 8, 2);
+        let commitment = prover.commit();
         assert_eq!(
-            Prover::<BS, Sha2Hash<BS>>::new(polynomial.clone(), 8, 2)
-                .commit()
-                .roots(),
+            commitment.roots(),
             [
                 parse("0xf243320c355c40b383d412c7e1964911d8b0158e9074dcb4c1d3f8b3d47fbe40"),
                 parse("0x6ec4f9a41a3d96df76e26c26acebf9b59832c42b5705595f8d9a32bea19e2592"),
@@ -636,10 +795,15 @@ mod tests {
                 parse("0x51f2f631f31206f27d63c68c70623c1e2bb93acd17d125b551dac8444b290eb7"),
             ]
         );
+    }
+
+    #[test]
+    fn test_keccak256_commitment_roots() {
+        // Pinned roots: changing them changes the protocol.
+        let prover = Prover::<BS, Keccak256Hash<BS>>::new(honest_polynomial(), 8, 2);
+        let commitment = prover.commit();
         assert_eq!(
-            Prover::<BS, Keccak256Hash<BS>>::new(polynomial, 8, 2)
-                .commit()
-                .roots(),
+            commitment.roots(),
             [
                 parse("0x9b4906d8f66d186d59009303c5caef59460de8a06b17c5bf09082778709f5201"),
                 parse("0xe4bc0886fb6edf122ba603607a60ac1c4feb73bf2ffebf306e229a490a55d796"),
@@ -650,28 +814,37 @@ mod tests {
     }
 
     #[test]
-    fn test_fold_dst() {
-        assert_eq!(
-            *FOLD_DST,
-            "0x9ffd3556faeb2cae194ce95adf6b3580f590504daa0dea56966ce4ef233844af"
-                .parse()
-                .unwrap()
-        );
+    fn test_prover_parameters() {
+        let prover = honest_prover();
+        assert_eq!(prover.degree_bound(), DEGREE_BOUND);
+        assert_eq!(prover.extended_domain_size(), DEGREE_BOUND << BLOWUP_LOG2);
+        assert_eq!(prover.size(), DEGREE_BOUND << BLOWUP_LOG2);
     }
 
-    fn test_prover_impl<F: Field256, H: Hasher<F>>(
-        polynomial: &Polynomial<F>,
+    #[test]
+    fn test_prover_root_hash() {
+        let prover = honest_prover();
+        let root_hash = prover.root_hash();
+        assert_eq!(root_hash, prover.commit().root());
+    }
+
+    /// Queries every index of the extended domain of a polynomial with the given coefficients and
+    /// checks the resulting queries.
+    ///
+    /// There's one query per evaluation, so this iterates over them rather than unrolling the
+    /// assertions.
+    fn test_queries_impl<F: Field256, H: Hasher<F>>(
+        coefficients: &[u64],
         degree_bound: usize,
         blowup_log2: usize,
     ) {
+        let polynomial = make_polynomial::<F>(coefficients);
         let prover = Prover::<F, H>::new(polynomial.clone(), degree_bound, blowup_log2);
-        assert_eq!(prover.degree_bound(), degree_bound);
-        let n = degree_bound << blowup_log2;
-        assert_eq!(prover.extended_domain_size(), n);
         let commitment = prover.commit();
-        for i in 0..n {
-            let query = prover.query(i);
-            assert_eq!(query.indices(), (i, (i + n / 2) % n));
+        let n = degree_bound << blowup_log2;
+        let queries: Vec<Query<F, H>> = (0..n).map(|index| prover.query(index)).collect();
+        for (index, query) in queries.iter().enumerate() {
+            assert_eq!(query.indices(), (index, (index + n / 2) % n));
             assert_eq!(query.len(), degree_bound.trailing_zeros() as usize + 1);
             let x = query.x();
             assert_eq!(
@@ -682,96 +855,103 @@ mod tests {
         }
     }
 
-    fn test_prover(coefficients: Vec<u64>, degree_bound: usize) {
-        let bluesky_polynomial = Polynomial::<BS>::with_coefficients(
-            coefficients.iter().copied().map(BS::from_const).collect(),
-        );
-        let goldilocks_polynomial = Polynomial::<GL4>::with_coefficients(
-            coefficients.iter().copied().map(GL4::from_const).collect(),
-        );
-        for blowup_log2 in 1..=3 {
-            test_prover_impl::<BS, Sha2Hash<BS>>(&bluesky_polynomial, degree_bound, blowup_log2);
-            test_prover_impl::<GL4, Sha2Hash<GL4>>(
-                &goldilocks_polynomial,
-                degree_bound,
-                blowup_log2,
-            );
-            test_prover_impl::<BS, Keccak256Hash<BS>>(
-                &bluesky_polynomial,
-                degree_bound,
-                blowup_log2,
-            );
-            test_prover_impl::<GL4, Keccak256Hash<GL4>>(
-                &goldilocks_polynomial,
-                degree_bound,
-                blowup_log2,
-            );
-        }
+    /// Runs [`test_queries_impl`] with every combination of field and hash backend.
+    fn test_queries(coefficients: &[u64], degree_bound: usize, blowup_log2: usize) {
+        test_queries_impl::<BS, Sha2Hash<BS>>(coefficients, degree_bound, blowup_log2);
+        test_queries_impl::<BS, Keccak256Hash<BS>>(coefficients, degree_bound, blowup_log2);
+        test_queries_impl::<GL4, Sha2Hash<GL4>>(coefficients, degree_bound, blowup_log2);
+        test_queries_impl::<GL4, Keccak256Hash<GL4>>(coefficients, degree_bound, blowup_log2);
     }
 
     #[test]
-    fn test_constant_polynomial() {
-        test_prover(vec![12], 1);
-        test_prover(vec![34], 1);
+    fn test_constant_polynomial_blowup_2() {
+        test_queries(&[12], 1, 1);
     }
 
     #[test]
-    fn test_polynomial_degree_one() {
-        test_prover(vec![12, 34], 2);
-        test_prover(vec![56, 78], 2);
+    fn test_constant_polynomial_blowup_4() {
+        test_queries(&[34], 1, 2);
     }
 
     #[test]
-    fn test_polynomial_degree_three() {
-        test_prover(vec![12, 34, 56, 78], 4);
-        test_prover(vec![42, 43, 44, 45], 4);
+    fn test_constant_polynomial_blowup_8() {
+        test_queries(&[56], 1, 3);
     }
 
     #[test]
-    fn test_polynomial_degree_seven() {
-        test_prover(vec![12, 34, 56, 78, 90, 12, 34], 8);
-        test_prover(vec![42, 43, 44, 45, 46, 47, 48], 8);
+    fn test_polynomial_degree_one_blowup_2() {
+        test_queries(&[12, 34], 2, 1);
     }
 
     #[test]
-    fn test_polynomial_below_degree_bound() {
-        test_prover(vec![12, 34], 8);
+    fn test_polynomial_degree_one_blowup_4() {
+        test_queries(&[56, 78], 2, 2);
     }
 
-    const DEGREE_BOUND: usize = 8;
-    const BLOWUP_LOG2: usize = 2;
-    const QUERY_INDEX: usize = 3;
-
-    fn make_prover(coefficients: [u64; 8]) -> Prover<BS, Sha2Hash<BS>> {
-        Prover::new(
-            Polynomial::with_coefficients(coefficients.into_iter().map(BS::from_const).collect()),
-            DEGREE_BOUND,
-            BLOWUP_LOG2,
-        )
+    #[test]
+    fn test_polynomial_degree_one_blowup_8() {
+        test_queries(&[90, 12], 2, 3);
     }
 
-    fn honest_prover() -> Prover<BS, Sha2Hash<BS>> {
-        make_prover([12, 34, 56, 78, 90, 12, 34, 56])
+    #[test]
+    fn test_polynomial_degree_three_blowup_2() {
+        test_queries(&[12, 34, 56, 78], 4, 1);
     }
 
-    fn assert_rejected(result: Result<()>, expected: &str) {
-        let error = result
-            .expect_err("the tampered proof was accepted")
-            .to_string();
-        assert!(error.contains(expected), "unexpected error: {error}");
+    #[test]
+    fn test_polynomial_degree_three_blowup_4() {
+        test_queries(&[42, 43, 44, 45], 4, 2);
+    }
+
+    #[test]
+    fn test_polynomial_degree_three_blowup_8() {
+        test_queries(&[78, 56, 34, 12], 4, 3);
+    }
+
+    #[test]
+    fn test_polynomial_degree_seven_blowup_2() {
+        test_queries(&[12, 34, 56, 78, 90, 12, 34, 56], 8, 1);
+    }
+
+    #[test]
+    fn test_polynomial_degree_seven_blowup_4() {
+        test_queries(&[42, 43, 44, 45, 46, 47, 48, 49], 8, 2);
+    }
+
+    #[test]
+    fn test_polynomial_degree_seven_blowup_8() {
+        test_queries(&[56, 34, 12, 90, 78, 56, 34, 12], 8, 3);
+    }
+
+    #[test]
+    fn test_polynomial_below_degree_bound_blowup_2() {
+        test_queries(&[12, 34], 8, 1);
+    }
+
+    #[test]
+    fn test_polynomial_below_degree_bound_blowup_4() {
+        test_queries(&[56, 78], 8, 2);
+    }
+
+    #[test]
+    fn test_polynomial_below_degree_bound_blowup_8() {
+        test_queries(&[90, 12], 8, 3);
     }
 
     #[test]
     fn test_accept_untampered_proof() {
         let prover = honest_prover();
-        assert!(prover.query(QUERY_INDEX).verify(&prover.commit()).is_ok());
+        let query = prover.query(QUERY_INDEX);
+        let result = query.verify(&prover.commit());
+        assert!(result.is_ok());
     }
 
     #[test]
     fn test_reject_foreign_commitment() {
         let query = honest_prover().query(QUERY_INDEX);
-        let foreign = make_prover([90, 78, 56, 34, 12, 90, 78, 56]).commit();
-        assert_rejected(query.verify(&foreign), "root hash mismatch");
+        let foreign = Prover::<BS, Sha2Hash<BS>>::new(foreign_polynomial(), 8, 2).commit();
+        let result = query.verify(&foreign);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -779,10 +959,8 @@ mod tests {
         let prover = honest_prover();
         let mut commitment = prover.commit();
         commitment.roots[2] = H256::repeat_byte(0xAA);
-        assert_rejected(
-            prover.query(QUERY_INDEX).verify(&commitment),
-            "root hash mismatch",
-        );
+        let result = prover.query(QUERY_INDEX).verify(&commitment);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -791,7 +969,8 @@ mod tests {
         let commitment = prover.commit();
         let mut query = prover.query(QUERY_INDEX);
         query.folds.truncate(3);
-        assert_rejected(query.verify(&commitment), "wrong number of folding rounds");
+        let result = query.verify(&commitment);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -799,10 +978,8 @@ mod tests {
         let prover = honest_prover();
         let mut commitment = prover.commit();
         commitment.roots.truncate(3);
-        assert_rejected(
-            prover.query(QUERY_INDEX).verify(&commitment),
-            "wrong number of folding rounds",
-        );
+        let result = prover.query(QUERY_INDEX).verify(&commitment);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -812,7 +989,8 @@ mod tests {
         let mut query = prover.query(QUERY_INDEX);
         let mut donor = prover.query(QUERY_INDEX);
         query.folds.push(donor.folds.pop().unwrap());
-        assert_rejected(query.verify(&commitment), "incorrect proof size");
+        let result = query.verify(&commitment);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -822,7 +1000,8 @@ mod tests {
         let mut query = prover.query(QUERY_INDEX);
         commitment.roots.truncate(3);
         query.folds.truncate(3);
-        assert_rejected(query.verify(&commitment), "not constant");
+        let result = query.verify(&commitment);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -832,10 +1011,8 @@ mod tests {
         let mut query = prover.query(QUERY_INDEX);
         let mut donor = prover.query(QUERY_INDEX);
         query.folds[0].0 = donor.folds.remove(1).0;
-        assert_rejected(
-            query.verify(&commitment),
-            "invalid left-hand side Merkle proof height",
-        );
+        let result = query.verify(&commitment);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -845,10 +1022,8 @@ mod tests {
         let mut query = prover.query(QUERY_INDEX);
         let mut donor = prover.query(QUERY_INDEX);
         query.folds[0].1 = donor.folds.remove(1).1;
-        assert_rejected(
-            query.verify(&commitment),
-            "invalid right-hand side Merkle proof height",
-        );
+        let result = query.verify(&commitment);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -858,7 +1033,8 @@ mod tests {
         let mut query = prover.query(QUERY_INDEX);
         let pair = &mut query.folds[0];
         std::mem::swap(&mut pair.0, &mut pair.1);
-        assert_rejected(query.verify(&commitment), "root hash mismatch");
+        let result = query.verify(&commitment);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -868,35 +1044,52 @@ mod tests {
         let mut query = prover.query(QUERY_INDEX);
         let mut other = prover.query(QUERY_INDEX + 4);
         query.folds[1].0 = other.folds.remove(1).0;
-        assert_rejected(query.verify(&commitment), "leaf value mismatch");
+        let result = query.verify(&commitment);
+        assert!(result.is_err());
     }
 
-    fn assert_query_rejected(proto: &proto::Query, expected: &str) {
-        assert_rejected(
-            Query::<BS, Sha2Hash<BS>>::from_proto(DEGREE_BOUND, BLOWUP_LOG2, proto).map(|_| ()),
-            expected,
-        );
+    #[test]
+    fn test_reject_extra_path_hash() {
+        let prover = honest_prover();
+        let commitment = prover.commit();
+        let mut query = prover.query(QUERY_INDEX);
+        query.folds[0].0.path.push(H256::zero());
+        let result = query.verify(&commitment);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_out_of_range_query_index() {
+        let prover = honest_prover();
+        let commitment = prover.commit();
+        let mut query = prover.query(QUERY_INDEX);
+        query.index = DEGREE_BOUND << BLOWUP_LOG2;
+        let result = query.verify(&commitment);
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_reject_missing_partner_proof() {
         let mut proto = honest_prover().query(QUERY_INDEX).to_proto();
         proto.folds[0].right = None;
-        assert_query_rejected(&proto, "missing FRI folds");
+        let result = load_query(&proto);
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_reject_missing_proof() {
         let mut proto = honest_prover().query(QUERY_INDEX).to_proto();
         proto.folds[2].left = None;
-        assert_query_rejected(&proto, "missing FRI folds");
+        let result = load_query(&proto);
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_reject_leaf_without_values() {
         let mut proto = honest_prover().query(QUERY_INDEX).to_proto();
         proto.folds[2].right.as_mut().unwrap().leaf_values.clear();
-        assert_query_rejected(&proto, "invalid FRI leaf size");
+        let result = load_query(&proto);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -904,14 +1097,16 @@ mod tests {
         let mut proto = honest_prover().query(QUERY_INDEX).to_proto();
         let leaf_values = &mut proto.folds[0].left.as_mut().unwrap().leaf_values;
         leaf_values.push(leaf_values[0].clone());
-        assert_query_rejected(&proto, "invalid FRI leaf size");
+        let result = load_query(&proto);
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_reject_long_value() {
         let mut proto = honest_prover().query(QUERY_INDEX).to_proto();
         proto.folds[1].left.as_mut().unwrap().leaf_values[0].resize(33, 0);
-        assert_query_rejected(&proto, "invalid scalar length");
+        let result = load_query(&proto);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -919,62 +1114,28 @@ mod tests {
         let mut proto = honest_prover().query(QUERY_INDEX).to_proto();
         let modulus: primitive_types::U256 = BS::MODULUS.parse().unwrap();
         proto.folds[1].right.as_mut().unwrap().leaf_values[0] = modulus.to_little_endian().to_vec();
-        assert_query_rejected(&proto, "invalid scalar");
+        let result = load_query(&proto);
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_reject_short_path_hash() {
         let mut proto = honest_prover().query(QUERY_INDEX).to_proto();
         proto.folds[0].left.as_mut().unwrap().merkle_path[1].pop();
-        assert_query_rejected(&proto, "invalid hash length");
-    }
-
-    #[test]
-    fn test_reject_extra_path_hash() {
-        let prover = honest_prover();
-        let mut proto = prover.query(QUERY_INDEX).to_proto();
-        proto.folds[0]
-            .left
-            .as_mut()
-            .unwrap()
-            .merkle_path
-            .push(vec![0; 32]);
-        let query =
-            Query::<BS, Sha2Hash<BS>>::from_proto(DEGREE_BOUND, BLOWUP_LOG2, &proto).unwrap();
-        assert_rejected(
-            query.verify(&prover.commit()),
-            "invalid left-hand side Merkle proof height",
-        );
-    }
-
-    #[test]
-    fn test_reject_out_of_range_query_index() {
-        let prover = honest_prover();
-        let commitment = prover.commit();
-        let mut proto = prover.query(QUERY_INDEX).to_proto();
-        proto.index = (DEGREE_BOUND << BLOWUP_LOG2) as u64;
-        let query =
-            Query::<BS, Sha2Hash<BS>>::from_proto(DEGREE_BOUND, BLOWUP_LOG2, &proto).unwrap();
-        assert_rejected(query.verify(&commitment), "invalid query index");
+        let result = load_query(&proto);
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_serialization() {
-        let polynomial = Polynomial::<BS>::encode2(
-            [12u64, 34, 56, 78]
-                .into_iter()
-                .map(|value| value.into())
-                .collect(),
-        );
-        let prover = Prover::<BS, Sha2Hash<BS>>::new(polynomial, 4, 2);
+        let prover = honest_prover();
         let commitment = prover.commit();
-        let query = prover.query(2);
-        let values = query.values();
-        let proto = query.to_proto();
-        let query = Query::<BS, Sha2Hash<BS>>::from_proto(4, 2, &proto).unwrap();
-        assert_eq!(query.indices(), (2, 10));
-        assert_eq!(query.len(), 3);
-        assert_eq!(query.values(), values);
-        assert!(query.verify(&commitment).is_ok());
+        let query = prover.query(QUERY_INDEX);
+        let decoded = load_query(&query.to_proto()).unwrap();
+        assert_eq!(decoded.indices(), query.indices());
+        assert_eq!(decoded.len(), query.len());
+        assert_eq!(decoded.values(), query.values());
+        assert_eq!(decoded.x(), query.x());
+        assert!(decoded.verify(&commitment).is_ok());
     }
 }

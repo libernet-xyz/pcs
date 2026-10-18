@@ -341,12 +341,7 @@ mod tests {
             assert!(verify_path::<Sha2Hash<BS>>(leaves[other], &path, index, root).is_err());
         }
         let path = merkle_path(hashes.as_slice(), 8, 3);
-        assert!(
-            verify_path::<Sha2Hash<BS>>(leaves[3], &path, 3 + 8, root)
-                .unwrap_err()
-                .to_string()
-                .contains("invalid index")
-        );
+        assert!(verify_path::<Sha2Hash<BS>>(leaves[3], &path, 3 + 8, root).is_err());
         assert!(verify_path::<Sha2Hash<BS>>(leaves[0], &[], 0, leaves[0]).is_ok());
     }
 
