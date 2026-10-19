@@ -48,68 +48,73 @@ message Commitment {
   repeated bytes fri_roots = 3;
 }
 
-// A Merkle proof.
+// A Merkle proof for a leaf of the Merkle tree of a polynomial batch (see `Commitment.Batch`).
 //
-// Our Merkle proof behave slightly differently between the FRI layer and the DEEP layer.
-//
-// At the DEEP level batching is supported, so in general our DEEP Merkle trees have vector leaves
-// rather than scalar ones. If we're batching K polynomials each leaf is a vector of K evaluations
-// and the hashes of these vectors are used to build higher levels of the Merkle tree. In this case
-// `leaf_values` is the vector of K evaluations in the opened leaf and `merkle_path` is the Merkle
-// path to the root, with `merkle_path[0]` containing the hash of the sibling leaf. Evaluations are
-// field elements and are stored in canonical (non_Montgomery) integer form, in little-endian byte
-// order.
-//
-// At the FRI level we always work with a single polynomial (which is the DEEP quotient) and its
-// evaluations are stored in bit-reversed order so that a single Merkle proof opens both an element
-// at position `i` and its FRI partner at index `i+n/2`. In this case `leaf_values` must always have
-// one element, the opened element at index `i` stored in canonical (non-Montgomery) integer form in
-// little-endian byte order. `merkle_path[0]` is the sibling of the opened leaf, so in this case
-// it's the opened FRI partner stored in *big-endian* order! We use big-endian here because of the
-// extra serialization abstraction layer: `merkle_path` is an array of hashes, so we need to
-// serialize the partner element into a hash before serializing the array of hashes into this
-// protobuf. We use big-endian at the "extra" abstraction layer to facilitate calldata encoding and
-// verification on the EVM, which uses big-endian for `uint256`.
-//
-// In both cases `merkle_path` excludes the root hash of the tree because root hashes are send
-// separately in the `Commitment`.
+// Batching is supported at the DEEP level, so these Merkle trees have vector leaves rather than
+// scalar ones: if we're batching K polynomials each leaf is the vector of their K evaluations at a
+// point of the extended domain, and the hashes of these vectors are used to build the higher levels
+// of the Merkle tree.
 message MerkleProof {
-  // The opened values.
+  // The K evaluations in the opened leaf.
   //
   // Each value is a field element stored in canonical (non-Montgomery) integer form, in
   // little-endian byte order.
-  //
-  // In FRI queries this array must always have exactly one `bytes` element (FRI always works on a
-  // single polynomial, which is the DEEP quotient). In DEEP Merkle trees there may be more than one
-  // opened values.
   repeated bytes leaf_values = 1;
 
   // The leaf-to-root Merkle path, excluding the root hash.
   //
-  // Each hash is stored as a 32 byte sequence. The root hash is not stored here because all root
-  // hashes are sent separately in the `Commitment`.
-  //
-  // In FRI queries the first element `merkle_path[0]` is the FRI partner value stored as a sequence
-  // of 32 bytes in big-endian order (in canonical form, not Montgomery). In DEEP openings the first
-  // element is the hash of the sibling of the opened leaf.
+  // The first element is the hash of the sibling leaf, the second element is the sibling of the
+  // parent node, and so on until the sibling of the child of the root. Each hash is stored as a 32
+  // byte sequence. The root hash is not stored here because all root hashes are sent separately in
+  // the `Commitment`.
   repeated bytes merkle_path = 2;
 }
 
 // A FRI query.
 //
-// NOTE: the proven degree bound and the blowup factor are not stored here because all queries in a
-// proof refer to `Proof.degree_bound` and `Proof.blowup_log2`.
+// NOTE: the proven degree bound, the blowup factor, and the fold rate are not stored here because
+// all queries in a proof refer to `Proof.degree_bound`, `Proof.blowup_log2`, and `Proof.fold_rate`.
 message Query {
+  // A Merkle proof for a coset of evaluations in a Merkle tree of the folding argument.
+  //
+  // At the FRI level we always work with a single polynomial (which is the DEEP quotient), so the
+  // leaves of the Merkle trees are the evaluations themselves rather than hashes of them.
+  //
+  // The evaluations are stored in bit-reversed order: the evaluation at index `i` of a domain of
+  // size `n` is stored in the leaf at position `reverse_bits(i, log2(n))`. As a result, the `2^r`
+  // evaluations folded together by an `r`-fold round (at indices `i + j * n / 2^r`) are the leaves
+  // of a subtree of height `r`, so a single Merkle proof opens all of them. Those evaluations are
+  // at the points of a coset of the subgroup of order `2^r`. For example, with `r = 1` the coset is
+  // an element at index `i` and its FRI partner at index `i + n / 2`, which are siblings.
+  message LeafProof {
+    // The `2^r` evaluations of the coset, in leaf order (that is, in the order of the leaves of the
+    // coset subtree). One of them is the evaluation at the queried index.
+    //
+    // Each value is a field element stored in canonical (non-Montgomery) integer form, in
+    // little-endian byte order.
+    repeated bytes coset_values = 1;
+
+    // The Merkle path from the root of the coset subtree up to, but excluding, the root of the
+    // tree. There are as many hashes as the height of the tree minus `r`. The verifier recomputes
+    // the subtree root from the coset values.
+    //
+    // Each hash is stored as a 32 byte sequence. The root hash is not stored here because all root
+    // hashes are sent separately in the `Commitment`.
+    repeated bytes merkle_path = 2;
+  }
+
   // The queried index of the evaluation domain. Note that this is not the position of the queried
-  // leaf in the Merkle tree, because the leaves are stored in bit-reversed order (see below).
+  // leaf in the Merkle tree, because the leaves are stored in bit-reversed order (see
+  // `LeafProof`).
   uint64 index = 1;
 
-  // List of Merkle proofs for the query, each one proving the queried position and its partner.
+  // List of Merkle proofs for the query, each one proving the coset of the queried position that is
+  // folded by the corresponding round.
   //
   // This list actually contains one entry for every Merkle tree in the folding argument, not one
-  // for every fold, so there must be at least one element. The number of Merkle trees is equal to
-  // the number of folds plus one.
-  repeated MerkleProof folds = 2;
+  // for every round, so there must be at least one element. The number of Merkle trees is equal to
+  // the number of rounds plus one.
+  repeated LeafProof folds = 2;
 }
 
 // A batched DEEP-FRI proof.
@@ -133,18 +138,26 @@ message Proof {
   // The base-2 logarithm of the blowup factor.
   uint32 blowup_log2 = 3;
 
+  // Number of FRI folds per round.
+  //
+  // This is the base-2 logarithm of the folding arity: every round folds the polynomial this many
+  // times (except for the last round, which performs at most the remaining folds), and every query
+  // opens a coset of `2^fold_rate` evaluations in the corresponding Merkle tree. Must be greater
+  // than 0.
+  uint32 fold_rate = 4;
+
   // Number of grinding bits.
   //
   // A nonce is valid if the proof-of-work hash, interpreted as a big-endian integer, has at least
   // this many leading zero bits. This also determines the number of queries, because grinding
   // provides part of the target security level.
-  uint32 grinding_bits = 4;
+  uint32 grinding_bits = 5;
 
   // The proof-of-work nonce found by the prover.
-  uint64 nonce = 5;
+  uint64 nonce = 6;
 
   // Number of committed polynomials.
-  uint64 num_polys = 6;
+  uint64 num_polys = 7;
 
   // A point opened by the proof.
   message Point {
@@ -160,7 +173,7 @@ message Proof {
   }
 
   // The points opened by the proof.
-  repeated Point points = 7;
+  repeated Point points = 8;
 
   message Opening {
     repeated MerkleProof proofs = 1;
@@ -168,9 +181,9 @@ message Proof {
 
   // Merkle proofs for the points at the query positions, relative to the raw Merkle trees (not the
   // FRI folds). There's one entry for every FRI query (`openings.len() == queries.len()`).
-  repeated Opening openings = 8;
+  repeated Opening openings = 9;
 
   // FRI queries on the combined DEEP quotient, that is the random linear combination of the DEEP
   // quotients of all opened points. Every FRI leaf therefore holds exactly one value.
-  repeated Query queries = 9;
+  repeated Query queries = 10;
 }
