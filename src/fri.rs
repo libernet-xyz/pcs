@@ -43,14 +43,6 @@ fn coset_size_log2(schedule: &[usize], tree: usize, num_trees: usize) -> usize {
     }
 }
 
-/// Returns the position of the evaluation at `index` within its coset of size `2^coset_size_log2`,
-/// in a Merkle tree of the given height (see [`Tree`]).
-///
-/// REQUIRES: `index` must be less than `2^height`.
-fn coset_offset(index: usize, height: usize, coset_size_log2: usize) -> usize {
-    reverse_bits(index, height) & ((1 << coset_size_log2) - 1)
-}
-
 /// Reverses the order of the lowest `num_bits` bits of `index`.
 ///
 /// REQUIRES: `index` must be less than `2^num_bits`.
@@ -69,8 +61,8 @@ fn reverse_bits(index: usize, num_bits: usize) -> usize {
 /// subtree of height `r`. The proof contains all of them and (allowing the verifier to recompute
 /// the subtree root), along with the Merkle path from the subtree root up to the root of the tree.
 ///
-/// Note that the proof authenticates the coset as a whole: it's valid for any index of the coset,
-/// and it's up to the caller to pick the evaluation at the queried index (see [`coset_offset`]).
+/// The proof authenticates the coset as a whole. In a tree of height `h`, the evaluation at index
+/// `i` is at position `reverse_bits(i, h) mod 2^r` within the coset.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LeafProof<F: Field256, H: Hasher<F>> {
     /// The evaluations of the coset in bit-reversed order. Their number is always a power of 2.
@@ -325,7 +317,9 @@ pub struct Query<F: Field256, H: Hasher<F>> {
     fold_rate: usize,
     /// The index of the element we're opening (the partner index is inferred automatically).
     ///
-    /// Always less than the size of the extended domain.
+    /// This is always less than the size of the extended domain.
+    ///
+    /// NOTE: this is the natural index, not the bit-reversed one.
     index: usize,
     /// Proves the coset of the queried index folded by each round with one [`LeafProof`] for every
     /// Merkle tree. The proof at `folds[0]` proves the opened values.
@@ -360,9 +354,10 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
     pub fn values(&self) -> (F, F) {
         let proof = &self.folds[0];
         let height = (self.degree_bound << self.blowup_log2).trailing_zeros() as usize;
-        let offset = coset_offset(self.index, height, proof.coset_size_log2());
+        let coset_mask = (1 << proof.coset_size_log2()) - 1;
+        let index = reverse_bits(self.index, height) & coset_mask;
         let coset = proof.coset();
-        (coset[offset], coset[offset ^ 1])
+        (coset[index], coset[index ^ 1])
     }
 
     /// Returns the number of Merkle trees in the proof: one for the original polynomial evaluations
@@ -408,9 +403,9 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
 
     /// Verifies this proof against the given commitment.
     ///
-    /// NOTE: for low-degree testing you also need to check that [`Self::len`] returns the number of
-    /// Merkle trees expected for the degree bound. This function only verifies the opened values
-    /// across the folding structure.
+    /// If verification succeeds, the committed polynomial has degree less than `2^k`, where `k` is
+    /// the number of folds performed by the proof, and therefore less than
+    /// [`degree_bound`](`Self::degree_bound`).
     pub fn verify(&self, commitment: &Commitment) -> Result<()> {
         let mut n = self.degree_bound << self.blowup_log2;
         assert!(n.is_power_of_two());
@@ -450,7 +445,7 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
                 ));
             }
 
-            let offset = coset_offset(index, k, num_folds);
+            let offset = reverse_bits(index, k) & ((1 << num_folds) - 1);
             if expected.is_some_and(|expected| proof.coset()[offset] != expected) {
                 return Err(anyhow!("leaf value mismatch"));
             }
@@ -815,20 +810,6 @@ mod tests {
     #[should_panic]
     fn test_fold_schedule_with_rate_0() {
         fold_schedule(3, 0);
-    }
-
-    fn test_coset_offset_impl(index: usize, coset_size_log2: usize, expected: usize) {
-        let offset = coset_offset(index, 3, coset_size_log2);
-        assert_eq!(offset, expected);
-    }
-
-    #[test]
-    fn test_coset_offset() {
-        test_coset_offset_impl(3, 1, 0);
-        test_coset_offset_impl(7, 1, 1);
-        test_coset_offset_impl(3, 2, 2);
-        test_coset_offset_impl(5, 2, 1);
-        test_coset_offset_impl(3, 3, 6);
     }
 
     fn test_coset_size_log2_impl(tree: usize, expected: usize) {
