@@ -36,42 +36,11 @@ pub(crate) fn fold_schedule(num_folds: usize, fold_rate: usize) -> Vec<usize> {
 /// the last tree, which only needs to witness that the final polynomial is constant, opens a pair
 /// of partners.
 fn coset_size_log2(schedule: &[usize], tree: usize, num_trees: usize) -> usize {
-    if tree + 1 < num_trees {
+    if tree < num_trees - 1 {
         schedule[tree]
     } else {
         1
     }
-}
-
-/// Folds a coset of evaluations into a single evaluation of the folded polynomial.
-///
-/// `values` contains the `2^r` evaluations of a coset of the evaluation domain of size `n`, in leaf
-/// order (see [`Tree`]): the evaluation at index `base_index + j * n / 2^r` is in position
-/// `reverse_bits(j, r)`, with `base_index < n / 2^r`. The coset is folded `r` times with the
-/// challenges `alpha`, `alpha^2`, `alpha^4`, and so on, which is equivalent to folding it once with
-/// arity `2^r` and challenge `alpha`. The result is the evaluation of the folded polynomial at
-/// index `base_index` of the evaluation domain of size `n / 2^r`.
-fn fold_coset<F: Field256>(mut values: Vec<F>, base_index: usize, mut n: usize, mut alpha: F) -> F {
-    while values.len() > 1 {
-        // Leaves `2*i` and `2*i+1` contain the evaluations at `X` and `-X`. The former is the one
-        // at the lower index, `base_index + reverse_bits(i, log2(half)) * stride`.
-        let half = values.len() / 2;
-        let num_bits = half.trailing_zeros() as usize;
-        let stride = n / 2 / half;
-        let omega_inv = Polynomial::<F>::domain_element2(1, n).invert_unwrap();
-        values = (0..half)
-            .map(|i| {
-                let pos = values[i * 2];
-                let neg = values[i * 2 + 1];
-                let index = base_index + reverse_bits(i, num_bits) * stride;
-                (pos + neg + alpha * omega_inv.pow_small(index) * (pos - neg))
-                    * F::BaseField::TWO_INV
-            })
-            .collect();
-        n /= 2;
-        alpha = alpha * alpha;
-    }
-    values[0]
 }
 
 /// Returns the position of the evaluation at `index` within its coset of size `2^coset_size_log2`,
@@ -97,14 +66,14 @@ fn reverse_bits(index: usize, num_bits: usize) -> usize {
 ///
 /// The leaves of FRI trees are stored in bit-reversed order (see [`Tree`]), so the `2^r`
 /// evaluations folded together by a round with fold rate `r` are adjacent: they're the leaves of a
-/// subtree of height `r`. The proof contains all of them, from which the verifier recomputes the
-/// subtree root, and the Merkle path from the subtree root up to the root of the tree.
+/// subtree of height `r`. The proof contains all of them and (allowing the verifier to recompute
+/// the subtree root), along with the Merkle path from the subtree root up to the root of the tree.
 ///
 /// Note that the proof authenticates the coset as a whole: it's valid for any index of the coset,
 /// and it's up to the caller to pick the evaluation at the queried index (see [`coset_offset`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LeafProof<F: Field256, H: Hasher<F>> {
-    /// The evaluations of the coset in leaf order. Their number is always a power of 2.
+    /// The evaluations of the coset in bit-reversed order. Their number is always a power of 2.
     coset: Vec<F>,
     /// The Merkle path from the root of the coset subtree up to, but excluding, the root of the
     /// tree.
@@ -113,17 +82,17 @@ struct LeafProof<F: Field256, H: Hasher<F>> {
 }
 
 impl<F: Field256, H: Hasher<F>> LeafProof<F, H> {
-    /// Returns the log2 of the size of the coset.
+    /// Returns the log2 of the coset size, which is the height of the opened subtree.
     fn coset_size_log2(&self) -> usize {
         self.coset.len().trailing_zeros() as usize
     }
 
-    /// Returns the height of the tree, that is the log2 of its number of leaves.
+    /// Returns the height of the full tree, that is the log2 of its number of leaves.
     fn height(&self) -> usize {
         self.coset_size_log2() + self.path.len()
     }
 
-    /// Returns the evaluations of the coset in leaf order.
+    /// Returns the evaluations of the coset in bit-reversed order.
     fn coset(&self) -> &[F] {
         self.coset.as_slice()
     }
@@ -135,17 +104,15 @@ impl<F: Field256, H: Hasher<F>> LeafProof<F, H> {
     ///
     /// REQUIRES: `index` must be less than `2^self.height()`.
     fn verify(&self, index: usize, root_hash: H256) -> Result<()> {
-        let size = self.coset.len();
-        let mut subtree = Vec::with_capacity(size * 2 - 1);
-        subtree.extend(self.coset.iter().map(|&value| utils::encode_scalar(value)));
-        subtree.resize(size * 2 - 1, H256::zero());
-        merkle::merklify::<H>(subtree.as_mut_slice(), size);
-        merkle::verify_path::<H>(
-            *subtree.last().unwrap(),
-            self.path.as_slice(),
-            reverse_bits(index, self.height()) >> self.coset_size_log2(),
-            root_hash,
-        )
+        let subtree_root = merkle::merkle_root::<H>(
+            self.coset
+                .iter()
+                .map(|&value| utils::encode_scalar(value))
+                .collect::<Vec<H256>>()
+                .as_slice(),
+        );
+        let index = reverse_bits(index, self.height()) >> self.coset_size_log2();
+        merkle::verify_path::<H>(subtree_root, self.path.as_slice(), index, root_hash)
     }
 
     /// Returns true iff the proof witnesses a tree whose leaves are all equal, i.e. the evaluations
@@ -187,18 +154,17 @@ impl<F: Field256, H: Hasher<F>> LeafProof<F, H> {
         }
     }
 
-    /// Deserializes a proof for a coset of size `2^coset_size_log2` from a
+    /// Deserializes a proof for a coset of size `2^num_folds` from a
     /// [`LeafProof`](`proto::query::LeafProof`) protobuf.
     ///
-    /// Returns an error if the number of coset values is not `2^coset_size_log2`, if any value is
-    /// not a canonical field element, or if any hash is invalid.
-    fn from_proto(proto: &proto::query::LeafProof, coset_size_log2: usize) -> Result<Self> {
-        let size = 1 << coset_size_log2;
-        if proto.coset_values.len() != size {
+    /// Returns an error if the number of coset values is not `2^num_folds`, if any value is not a
+    /// canonical field element, or if any hash is invalid.
+    fn from_proto(proto: &proto::query::LeafProof, num_folds: usize) -> Result<Self> {
+        if proto.coset_values.len() != 1 << num_folds {
             return Err(anyhow!(
                 "invalid FRI coset size (got {}, want {})",
                 proto.coset_values.len(),
-                size
+                1 << num_folds
             ));
         }
         Ok(Self {
@@ -226,16 +192,19 @@ impl<F: Field256, H: Hasher<F>> LeafProof<F, H> {
 ///
 /// The evaluations are stored in bit-reversed order: the one at index `i` of the evaluation domain
 /// of size N goes to the leaf at position `reverse_bits(i, log2(N))`. The partner evaluations at
-/// `i` and `i + N/2` (that is at `X` and `-X`) only differ in the most significant bit of their
-/// index, so they end up in sibling leaves and a single Merkle path opens both. More generally, the
-/// `2^r` evaluations of a coset folded by a round with fold rate `r`, at the indices `i + j*N/2^r`,
-/// only differ in their `r` most significant bits, so they're the leaves of a subtree of height
-/// `r`. Furthermore, the root of that subtree is at the same position as the leaf of the folded
-/// evaluation in the next round.
+/// `i` and `i + j * N / 2^r` (for all `j` in `[0..2^r)`) only differ in the `r` most significant
+/// bits of their index, with `r` being the fold rate. So all partner values form a coset and end up
+/// in adjacent leaves, and a single [`LeafProof`] opens all of them.
+///
+/// When `r = 1` this reduces to binary FRI with only two partner values at each round, located at
+/// indices `i` and `i + n/2`. In that case a [`LeafProof`] has the shape of a regular Merkle proof.
+///
+/// In addition to the above, the root of that subtree is at the same position as the leaf of the
+/// folded evaluation in the next round.
 ///
 /// NOTE: bit reversal is completely abstracted away by `Tree`. The provided API exposes the
 /// original evaluation domain indices, but bit reversal allows opening a whole coset with a single
-/// Merkle proof.
+/// Merkle proof (see [`LeafProof`]).
 #[derive(Debug, Clone)]
 struct Tree<F: Field256, H: Hasher<F>> {
     /// The whole tree, stored layer by layer as described in [`merkle::merklify`]. There are 2*N-1
@@ -323,8 +292,8 @@ impl Commitment {
     /// Returns the number of stored roots, equivalent to the number of Merkle trees known to the
     /// prover. These would in turn include the base Merkle tree of the committed evaluations (over
     /// the extended domain) and one subsequent tree for every folding round. The number of folding
-    /// rounds is the log2 of the degree bound of the original polynomial divided by the fold rate,
-    /// rounded up. For example, if the user commits a degree<8 polynomial encoding 8 values,
+    /// rounds is the log2 of the degree bound of the original polynomial divided by the folding
+    /// rate, rounded up. For example, if the user commits a degree<8 polynomial encoding 8 values,
     /// `len()` will return log2(8)+1 = 3+1 = 4 with a fold rate of 1, or 2 with a fold rate of 3,
     /// regardless of the blowup factor.
     pub fn len(&self) -> usize {
@@ -406,6 +375,37 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
         self.folds.len()
     }
 
+    /// Folds a coset of evaluations into a single evaluation of the folded polynomial.
+    ///
+    /// `values` contains the `2^r` evaluations of a coset of the evaluation domain of size `n`,
+    /// in bit-reversed order (see [`Tree`]): the evaluation at index `base_index + j * n / 2^r` is
+    /// in position `reverse_bits(j, r)`, with `base_index < n / 2^r`. The coset is folded `r` times
+    /// with the challenges `alpha`, `alpha^2`, `alpha^4`, and so on, which is equivalent to folding
+    /// it once with arity `2^r` and challenge `alpha`. The result is the evaluation of the folded
+    /// polynomial at index `base_index` of the evaluation domain of size `n / 2^r`.
+    fn fold_coset(mut values: Vec<F>, base_index: usize, mut n: usize, mut alpha: F) -> F {
+        while values.len() > 1 {
+            // Leaves `2*i` and `2*i+1` contain the evaluations at `X` and `-X`. The former is the
+            // one at the lower index, `base_index + reverse_bits(i, log2(half)) * stride`.
+            let half = values.len() / 2;
+            let num_bits = half.trailing_zeros() as usize;
+            let stride = n / 2 / half;
+            let omega_inv = Polynomial::<F>::domain_element2(1, n).invert_unwrap();
+            values = (0..half)
+                .map(|i| {
+                    let pos = values[i * 2];
+                    let neg = values[i * 2 + 1];
+                    let index = base_index + reverse_bits(i, num_bits) * stride;
+                    (pos + neg + alpha * omega_inv.pow_small(index) * (pos - neg))
+                        * F::BaseField::TWO_INV
+                })
+                .collect();
+            n /= 2;
+            alpha = alpha.square();
+        }
+        values[0]
+    }
+
     /// Verifies this proof against the given commitment.
     ///
     /// NOTE: for low-degree testing you also need to check that [`Self::len`] returns the number of
@@ -434,12 +434,12 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
             let root_hash = commitment.roots()[round];
 
             let proof = &self.folds[round];
-            let coset_size_log2 = coset_size_log2(schedule.as_slice(), round, num_trees);
-            if proof.coset_size_log2() != coset_size_log2 {
+            let num_folds = coset_size_log2(schedule.as_slice(), round, num_trees);
+            if proof.coset_size_log2() != num_folds {
                 return Err(anyhow!(
                     "invalid FRI coset size 2^{} (want 2^{})",
                     proof.coset_size_log2(),
-                    coset_size_log2
+                    num_folds
                 ));
             }
             if proof.height() != k {
@@ -450,7 +450,7 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
                 ));
             }
 
-            let offset = coset_offset(index, k, coset_size_log2);
+            let offset = coset_offset(index, k, num_folds);
             if expected.is_some_and(|expected| proof.coset()[offset] != expected) {
                 return Err(anyhow!("leaf value mismatch"));
             }
@@ -458,15 +458,15 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
 
             if round + 1 < num_trees {
                 let alpha = H::challenge(*FOLD_DST, &[root_hash]);
-                let folded_n = n >> coset_size_log2;
-                expected = Some(fold_coset(
+                let folded_n = n >> num_folds;
+                expected = Some(Self::fold_coset(
                     proof.coset().to_vec(),
                     index % folded_n,
                     n,
                     alpha,
                 ));
                 n = folded_n;
-                k -= coset_size_log2;
+                k -= num_folds;
                 index %= n;
             }
         }
@@ -854,7 +854,8 @@ mod tests {
         }
         let base_index = index % folded.len();
         let proof = Tree::<BS, Sha2Hash<BS>>::new(values.as_slice()).query(index, coset_size_log2);
-        let result = fold_coset(proof.coset().to_vec(), base_index, 8, alpha);
+        let result =
+            Query::<BS, Sha2Hash<BS>>::fold_coset(proof.coset().to_vec(), base_index, 8, alpha);
         assert_eq!(result, folded[base_index]);
     }
 

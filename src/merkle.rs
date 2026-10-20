@@ -82,6 +82,26 @@ pub(crate) fn merklify<H: MerkleHasher>(mut hashes: &mut [H256], mut n: usize) {
     }
 }
 
+/// Computes the Merkle root of a set of values on the fly, without allocating space for the
+/// intermediate nodes.
+///
+/// The computed root is compatible with the one resulting from a call to [`merklify`] for the same
+/// values.
+///
+/// REQUIRES: `values.len()` must be a power of two.
+pub(crate) fn merkle_root<H: MerkleHasher>(values: &[H256]) -> H256 {
+    assert!(values.len().is_power_of_two());
+    match values.len() {
+        1 => values[0],
+        n => {
+            let m = n >> 1;
+            let left = merkle_root::<H>(&values[0..m]);
+            let right = merkle_root::<H>(&values[m..]);
+            H::hash_binary(left, right)
+        }
+    }
+}
+
 /// Returns the Merkle path of the leaf at `index`, that is the sibling hashes from the leaf up to,
 /// but excluding, the root.
 ///
@@ -495,6 +515,85 @@ mod tests {
                 "0xbd82b7f4f83de57b73e00aa0924a5fc4dfaf959bd252aa3fda8abdaf87713dc0",
             ],
         );
+    }
+
+    fn test_merkle_root_impl<H: MerkleHasher>(leaves: &[&'static str], expected: &'static str) {
+        let leaves: Vec<H256> = leaves.iter().map(|&leaf| parse(leaf)).collect();
+        let root = merkle_root::<H>(leaves.as_slice());
+        assert_eq!(root, parse::<H256>(expected));
+    }
+
+    #[test]
+    fn test_merkle_root_one_leaf() {
+        test_merkle_root_impl::<Sha2Hash<BS>>(
+            &["0x1fe9e33b7ff790473e13eb6384d61d6abb32d2e50b30a382c9767b5347f5846b"],
+            "0x1fe9e33b7ff790473e13eb6384d61d6abb32d2e50b30a382c9767b5347f5846b",
+        );
+        test_merkle_root_impl::<Keccak256Hash<BS>>(
+            &["0x1fe9e33b7ff790473e13eb6384d61d6abb32d2e50b30a382c9767b5347f5846b"],
+            "0x1fe9e33b7ff790473e13eb6384d61d6abb32d2e50b30a382c9767b5347f5846b",
+        );
+    }
+
+    #[test]
+    fn test_merkle_root_two_leaves() {
+        test_merkle_root_impl::<Sha2Hash<BS>>(
+            &[
+                "0x0cbb1061e55efef40fae3c8e34d301c9940889146f816edd475052fc45caf060",
+                "0x2d8257d72c4b6e6bfa3a21a22c053d02d1d52b4b5e6097acfd0ed45f827d6ba4",
+            ],
+            "0x3af448b6612ac9931b7413ecca5d209187cd808ae2d3647099aa99fada16c955",
+        );
+        test_merkle_root_impl::<Keccak256Hash<BS>>(
+            &[
+                "0x0cbb1061e55efef40fae3c8e34d301c9940889146f816edd475052fc45caf060",
+                "0x2d8257d72c4b6e6bfa3a21a22c053d02d1d52b4b5e6097acfd0ed45f827d6ba4",
+            ],
+            "0x6e70b19bd160e181bb367ab730eababc6e3673977f7fdce38934ee197bbcb568",
+        );
+    }
+
+    #[test]
+    fn test_merkle_root_four_leaves() {
+        test_merkle_root_impl::<Sha2Hash<BS>>(
+            &[
+                "0x034acf2cced8e9744784ec9c3c626fa83f6f8ddd83faed9d5caa5ad72c91eb1c",
+                "0x39dce95a2271a57f999981eef6917f3df8ad25d116c98d809a3b7da5d54805a3",
+                "0x435246f701f1483adcb7037fa64b3fa027c41e13a52d1e6c502e9b71dea3ca81",
+                "0x7952ed41c4062f594b53b8c548874b41a7a7f05593d7a5a313ed82c2fe1c62d7",
+            ],
+            "0xed171c6bd6876b93f4fc8914e0b2a8db53d7204048ad9fdff6e7127c077ca072",
+        );
+        test_merkle_root_impl::<Keccak256Hash<BS>>(
+            &[
+                "0x034acf2cced8e9744784ec9c3c626fa83f6f8ddd83faed9d5caa5ad72c91eb1c",
+                "0x39dce95a2271a57f999981eef6917f3df8ad25d116c98d809a3b7da5d54805a3",
+                "0x435246f701f1483adcb7037fa64b3fa027c41e13a52d1e6c502e9b71dea3ca81",
+                "0x7952ed41c4062f594b53b8c548874b41a7a7f05593d7a5a313ed82c2fe1c62d7",
+            ],
+            "0xbd82b7f4f83de57b73e00aa0924a5fc4dfaf959bd252aa3fda8abdaf87713dc0",
+        );
+    }
+
+    #[test]
+    fn test_merkle_root_matches_merklify() {
+        let leaves = sample_leaves();
+        let hashes = make_hashes(leaves.as_slice());
+        let root = merkle_root::<Sha2Hash<BS>>(leaves.as_slice());
+        assert_eq!(root, *hashes.last().unwrap());
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_merkle_root_of_no_leaves() {
+        merkle_root::<Sha2Hash<BS>>(&[]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_merkle_root_of_three_leaves() {
+        let leaves = sample_leaves();
+        merkle_root::<Sha2Hash<BS>>(&leaves[0..3]);
     }
 
     #[test]

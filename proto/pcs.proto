@@ -87,8 +87,8 @@ message Query {
   // at the points of a coset of the subgroup of order `2^r`. For example, with `r = 1` the coset is
   // an element at index `i` and its FRI partner at index `i + n / 2`, which are siblings.
   message LeafProof {
-    // The `2^r` evaluations of the coset, in leaf order (that is, in the order of the leaves of the
-    // coset subtree). One of them is the evaluation at the queried index.
+    // The `2^r` evaluations of the coset, in bit-reversed order (that is, in the order of the
+    // leaves of the coset subtree). One of them is the evaluation at the queried index.
     //
     // Each value is a field element stored in canonical (non-Montgomery) integer form, in
     // little-endian byte order.
