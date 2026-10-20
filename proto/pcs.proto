@@ -35,17 +35,26 @@ message Commitment {
   // The polynomial batches, in commitment order. There must be at least one batch.
   repeated Batch batches = 2;
 
-  // Merkle roots of the FRI folding argument.
+  // Merkle roots of the FRI folding argument, one for every folding round.
   //
-  // The first element is the root of the main Merkle tree, the second one is the root of the Merkle
-  // tree from the first folding round, and so on until the last element which is the Merkle root of
-  // the last folding round.
-  //
-  // This list cannot be empty because there needs to be at least the initial (unfolded) Merkle
-  // tree.
+  // The first element is the root of the Merkle tree of the DEEP quotient, the second one is the
+  // root of the Merkle tree of the polynomial folded by the first round, and so on. The number of
+  // rounds is determined by `Proof.degree_bound`, `Proof.fold_rate`, and `Proof.max_rounds`, and
+  // this list is empty if there are zero rounds.
   //
   // Each root hash is stored as a 32 byte sequence.
   repeated bytes fri_roots = 3;
+
+  // The coefficients of the DEEP quotient folded by all the FRI rounds, which is sent in the clear
+  // rather than being folded further. With zero rounds this is the whole (unfolded) DEEP quotient.
+  //
+  // There are at most `Proof.degree_bound / 2^(rounds * Proof.fold_rate)` coefficients, in
+  // ascending degree order. They're the coefficients of the domain-shifted polynomial, so they must
+  // be evaluated at the roots of unity of the folded domain, not at the shifted domain points.
+  //
+  // Each coefficient is a field element stored in canonical (non-Montgomery) integer form, in
+  // little-endian byte order.
+  repeated bytes folded_quotient = 4;
 }
 
 // A Merkle proof for a leaf of the Merkle tree of a polynomial batch (see `Commitment.Batch`).
@@ -72,8 +81,9 @@ message MerkleProof {
 
 // A FRI query.
 //
-// NOTE: the proven degree bound, the blowup factor, and the fold rate are not stored here because
-// all queries in a proof refer to `Proof.degree_bound`, `Proof.blowup_log2`, and `Proof.fold_rate`.
+// NOTE: the proven degree bound, the blowup factor, the fold rate, and the maximum number of rounds
+// are not stored here because all queries in a proof refer to `Proof.degree_bound`,
+// `Proof.blowup_log2`, `Proof.fold_rate`, and `Proof.max_rounds`.
 message Query {
   // A Merkle proof for a coset of evaluations in a Merkle tree of the folding argument.
   //
@@ -111,9 +121,10 @@ message Query {
   // List of Merkle proofs for the query, each one proving the coset of the queried position that is
   // folded by the corresponding round.
   //
-  // This list actually contains one entry for every Merkle tree in the folding argument, not one
-  // for every round, so there must be at least one element. The number of Merkle trees is equal to
-  // the number of rounds plus one.
+  // There's exactly one entry for every folding round (see `Proof.max_rounds`), each opening a
+  // coset of `2^r` evaluations with `r` being `Proof.fold_rate`, so this list is empty if there are
+  // zero rounds. The value resulting from the last round is checked against the folded quotient
+  // stored in the `Commitment`.
   repeated LeafProof folds = 2;
 }
 
@@ -140,24 +151,34 @@ message Proof {
 
   // Number of FRI folds per round.
   //
-  // This is the base-2 logarithm of the folding arity: every round folds the polynomial this many
-  // times (except for the last round, which performs at most the remaining folds), and every query
-  // opens a coset of `2^fold_rate` evaluations in the corresponding Merkle tree. Must be greater
-  // than 0.
+  // This is the base-2 logarithm of the folding arity: every round folds the polynomial exactly
+  // this many times, and every query opens a coset of `2^fold_rate` evaluations in the
+  // corresponding Merkle tree.
+  //
+  // `fold_rate` must be greater than 0.
   uint32 fold_rate = 4;
+
+  // Maximum number of FRI folding rounds.
+  //
+  // The actual number of rounds is the minimum between this value and
+  // `log2(degree_bound) / fold_rate`, rounded down. Rather than being folded further, the
+  // polynomial resulting from the last round is sent in the clear (see
+  // `Commitment.folded_quotient`). With 0 there's no folding at all and the whole DEEP quotient is
+  // sent in the clear.
+  uint64 max_rounds = 5;
 
   // Number of grinding bits.
   //
   // A nonce is valid if the proof-of-work hash, interpreted as a big-endian integer, has at least
   // this many leading zero bits. This also determines the number of queries, because grinding
   // provides part of the target security level.
-  uint32 grinding_bits = 5;
+  uint32 grinding_bits = 6;
 
   // The proof-of-work nonce found by the prover.
-  uint64 nonce = 6;
+  uint64 nonce = 7;
 
   // Number of committed polynomials.
-  uint64 num_polys = 7;
+  uint64 num_polys = 8;
 
   // A point opened by the proof.
   message Point {
@@ -173,7 +194,7 @@ message Proof {
   }
 
   // The points opened by the proof.
-  repeated Point points = 8;
+  repeated Point points = 9;
 
   message Opening {
     repeated MerkleProof proofs = 1;
@@ -181,9 +202,9 @@ message Proof {
 
   // Merkle proofs for the points at the query positions, relative to the raw Merkle trees (not the
   // FRI folds). There's one entry for every FRI query (`openings.len() == queries.len()`).
-  repeated Opening openings = 9;
+  repeated Opening openings = 10;
 
   // FRI queries on the combined DEEP quotient, that is the random linear combination of the DEEP
   // quotients of all opened points. Every FRI leaf therefore holds exactly one value.
-  repeated Query queries = 10;
+  repeated Query queries = 11;
 }
