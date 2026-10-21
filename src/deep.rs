@@ -163,8 +163,8 @@ impl Options {
 
 /// Computes the proof-of-work hash of a nonce.
 ///
-/// `seed` is the hash of the full commitment transcript returned by [`Commitment::query_seed`], so
-/// that changing any commitment requires redoing the proof of work.
+/// `seed` is the hash of the full proof transcript returned by [`query_seed`], so that changing
+/// anything sent before the queries requires redoing the proof of work.
 fn proof_of_work<F: Field256, H: Hasher<F>>(seed: H256, nonce: u64) -> H256 {
     H::hash_transcript(*POW_DST, &[seed, utils::encode_u64(nonce)])
 }
@@ -223,6 +223,24 @@ fn rlc<F: Field>(values: impl IntoIterator<Item = F>, alpha: F) -> F {
     rlc
 }
 
+/// Encodes the transcript of the DEEP layer, that is all Merkle roots of the committed polynomials,
+/// all opened points, and their claimed evaluations.
+fn deep_transcript<F: Field256>(
+    tree_roots: &[H256],
+    num_polys: usize,
+    points: &BTreeMap<F, Vec<F>>,
+) -> impl Iterator<Item = H256> {
+    std::iter::once(utils::encode_usize(tree_roots.len()))
+        .chain(tree_roots.iter().copied())
+        .chain(std::iter::once(utils::encode_usize(num_polys)))
+        .chain(std::iter::once(utils::encode_usize(points.len())))
+        .chain(points.iter().flat_map(|(z, values)| {
+            std::iter::once(z)
+                .chain(values.iter())
+                .map(|value| H256::from_slice(&value.to_be_bytes()))
+        }))
+}
+
 /// Derives the two Fiat-Shamir challenges of the DEEP layer.
 ///
 /// The first challenge uses [`RLC_DST`] and is used by the caller to combine all committed
@@ -236,19 +254,40 @@ fn deep_challenges<F: Field256, H: Hasher<F>>(
     num_polys: usize,
     points: &BTreeMap<F, Vec<F>>,
 ) -> (F, F) {
-    let transcript: Vec<H256> = std::iter::once(utils::encode_usize(tree_roots.len()))
-        .chain(tree_roots.iter().copied())
-        .chain(std::iter::once(utils::encode_usize(num_polys)))
-        .chain(std::iter::once(utils::encode_usize(points.len())))
-        .chain(points.iter().flat_map(|(z, values)| {
-            std::iter::once(z)
-                .chain(values.iter())
-                .map(|value| H256::from_slice(&value.to_be_bytes()))
-        }))
-        .collect();
+    let transcript: Vec<H256> = deep_transcript(tree_roots, num_polys, points).collect();
     (
         H::challenge(*RLC_DST, transcript.as_slice()),
         H::challenge(*QUOTIENT_DST, transcript.as_slice()),
+    )
+}
+
+/// Hashes the full transcript of a proof up to the queries: all Merkle roots of the committed
+/// polynomials, all opened points and their claimed evaluations, all FRI roots, and the
+/// coefficients of the folded quotient.
+///
+/// The returned seed is the input of the proof of work, which in turn determines the FRI query
+/// indices (see [`get_query_indices`]).
+fn query_seed<F: Field256, H: Hasher<F>>(
+    tree_roots: &[H256],
+    num_polys: usize,
+    points: &BTreeMap<F, Vec<F>>,
+    fri_commitment: &fri::Commitment<F>,
+) -> H256 {
+    let folded_quotient = fri_commitment.folded_quotient();
+    H::hash_transcript(
+        *QUERY_DST0,
+        deep_transcript(tree_roots, num_polys, points)
+            .chain(std::iter::once(utils::encode_usize(fri_commitment.len())))
+            .chain(fri_commitment.roots().iter().copied())
+            .chain(std::iter::once(utils::encode_usize(folded_quotient.len())))
+            .chain(
+                folded_quotient
+                    .coefficients()
+                    .iter()
+                    .map(|coefficient| H256::from_slice(&coefficient.to_be_bytes())),
+            )
+            .collect::<Vec<H256>>()
+            .as_slice(),
     )
 }
 
@@ -272,6 +311,9 @@ fn check_hash_backend<T: prost::Name + Default>(
 }
 
 /// A batched DEEP-FRI polynomial commitment (see [`Committer`] for details).
+///
+/// The commitment only depends on the committed polynomials, not on the points opened by a
+/// [`Proof`], so the points can be chosen after committing (see [`Prover::prove`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Commitment<F: Field256, H: Hasher<F>> {
     /// The root hashes of the Merkle trees where the evaluations of all batched polynomials are
@@ -280,8 +322,6 @@ pub struct Commitment<F: Field256, H: Hasher<F>> {
     /// The number of polynomials in each batch, which is also the number of evaluations stored in
     /// each leaf of the corresponding Merkle tree. There is one entry per polynomial batch.
     batch_sizes: Vec<usize>,
-    /// The underlying FRI commitment.
-    inner: fri::Commitment<F>,
     _data: PhantomData<(F, H)>,
 }
 
@@ -321,31 +361,6 @@ impl<F: Field256, H: Hasher<F>> Commitment<F, H> {
         )
     }
 
-    /// Hashes the full commitment transcript (all polynomial and FRI Merkle root hashes and the
-    /// coefficients of the folded quotient).
-    ///
-    /// The returned seed is the input of the proof of work, which in turn determines the FRI query
-    /// indices (see [`get_query_indices`]).
-    fn query_seed(&self) -> H256 {
-        let folded_quotient = self.inner.folded_quotient();
-        H::hash_transcript(
-            *QUERY_DST0,
-            std::iter::once(utils::encode_usize(self.tree_roots.len()))
-                .chain(self.tree_roots.iter().copied())
-                .chain(std::iter::once(utils::encode_usize(self.inner.len())))
-                .chain(self.inner.roots().iter().copied())
-                .chain(std::iter::once(utils::encode_usize(folded_quotient.len())))
-                .chain(
-                    folded_quotient
-                        .coefficients()
-                        .iter()
-                        .map(|coefficient| H256::from_slice(&coefficient.to_be_bytes())),
-                )
-                .collect::<Vec<H256>>()
-                .as_slice(),
-        )
-    }
-
     /// Serializes this commitment to a [`Commitment`](`proto::Commitment`) protobuf.
     pub fn to_proto(&self) -> proto::Commitment {
         proto::Commitment {
@@ -359,28 +374,10 @@ impl<F: Field256, H: Hasher<F>> Commitment<F, H> {
                     num_polys: num_polys as u64,
                 })
                 .collect(),
-            fri_roots: self
-                .inner
-                .roots()
-                .iter()
-                .map(|&hash| hash.as_bytes().to_vec())
-                .collect(),
-            folded_quotient: self
-                .inner
-                .folded_quotient()
-                .coefficients()
-                .iter()
-                .map(|coefficient| coefficient.to_le_bytes().to_vec())
-                .collect(),
         }
     }
 
     /// Deserializes a commitment from a [`Commitment`](`proto::Commitment`) protobuf.
-    ///
-    /// Returns an error if there are no polynomial batches, if any hash is invalid, or if any
-    /// coefficient of the FRI folded quotient is not a canonical field element. Note that the
-    /// number of FRI roots and the size of the folded quotient can only be checked against the
-    /// [`Options`] of a proof (see [`Proof::verify`]).
     pub fn from_proto(proto: &proto::Commitment) -> Result<Self> {
         check_hash_backend::<H::ProtoTag>(&proto.hash_backend)?;
 
@@ -399,20 +396,6 @@ impl<F: Field256, H: Hasher<F>> Commitment<F, H> {
                 .iter()
                 .map(|batch| Ok(usize::try_from(batch.num_polys)?))
                 .collect::<Result<_>>()?,
-            inner: fri::Commitment::new(
-                proto
-                    .fri_roots
-                    .iter()
-                    .map(|bytes| H::load_hash(bytes.as_slice()))
-                    .collect::<Result<_>>()?,
-                Polynomial::with_coefficients(
-                    proto
-                        .folded_quotient
-                        .iter()
-                        .map(|coefficient| utils::load_scalar(coefficient.as_slice()))
-                        .collect::<Result<_>>()?,
-                ),
-            ),
             _data: PhantomData,
         })
     }
@@ -425,8 +408,9 @@ impl<F: Field256, H: Hasher<F>> Commitment<F, H> {
 /// method).
 ///
 /// This two-stage Committer-Prover architecture allows getting Merkle roots for the proven
-/// polynomials before running the FRI folding argument and even before batching all polynomials, so
-/// that Fiat-Shamir challenges can be derived before any quotients are built.
+/// polynomials before batching all of them, so that Fiat-Shamir challenges can be derived between
+/// batches (see [`Self::transcript_hash`]). The opened points don't need to be known at commitment
+/// time either: the [`Prover`] receives them later (see [`Prover::prove`]).
 #[derive(Debug, Clone)]
 pub struct Committer<F: Field256, H: Hasher<F>> {
     /// The protocol parameters. The degree of all batched polynomials must be less than the degree
@@ -527,79 +511,22 @@ impl<F: Field256, H: Hasher<F>> Committer<F, H> {
         index
     }
 
-    /// Consumes the [`Committer`], calculates all DEEP quotients, and returns a polynomial
-    /// [`Commitment`] and a DEEP-FRI [`Prover`].
+    /// Consumes the [`Committer`] and returns a polynomial [`Commitment`] and a DEEP-FRI [`Prover`]
+    /// for the committed polynomials.
     ///
-    /// `points` is the set of points to open in the [`Prover`]. The contained scalars are
-    /// (off-domain) X-coordinates; the corresponding Y-coordinates will be computed automatically
-    /// for every batched polynomial.
-    ///
-    /// The DEEP quotients of all opened points are combined into a single polynomial with a random
-    /// linear combination, so the FRI folding argument always works on one polynomial regardless
-    /// of the number of points.
-    pub fn commit(self, points: BTreeSet<F>) -> (Commitment<F, H>, Prover<F, H>) {
-        check_points_off_domain(points.iter().copied(), self.options.extended_domain_size())
-            .unwrap();
-
-        let points: BTreeMap<F, Vec<F>> = points
-            .iter()
-            .map(|&z| {
-                (
-                    z,
-                    self.polynomials
-                        .iter()
-                        .map(|polynomial| polynomial.evaluate(z))
-                        .collect(),
-                )
-            })
-            .collect();
-
-        let tree_roots: Vec<H256> = self.trees.iter().map(Tree::root_hash).collect();
-        let (alpha, beta) =
-            deep_challenges::<F, H>(tree_roots.as_slice(), self.polynomials.len(), &points);
-
-        let combined = {
-            let mut combined = Polynomial::default();
-            let mut pow = F::ONE;
-            for polynomial in &self.polynomials {
-                combined += polynomial.clone() * pow;
-                pow *= alpha;
-            }
-            combined
-        };
-
-        let quotient = {
-            let mut quotient = Polynomial::default();
-            let mut pow = F::ONE;
-            for (&z, values) in &points {
-                let value = rlc(values.iter().copied(), alpha);
-                let (point_quotient, remainder) = (combined.clone() - value).horner(z);
-                assert_eq!(remainder, F::ZERO);
-                quotient += point_quotient * pow;
-                pow *= beta;
-            }
-            quotient
-        };
-
-        let inner_prover = fri::Prover::<F, H>::new(
-            quotient,
-            self.options.degree_bound,
-            self.options.blowup_log2,
-            self.options.fold_rate,
-            self.options.max_rounds,
-        );
-
+    /// The commitment only depends on the committed polynomials, so the points to open can be
+    /// chosen afterwards, for example by deriving them from the commitment via Fiat-Shamir or by
+    /// letting an interactive verifier request them (see [`Prover::prove`]).
+    pub fn commit(self) -> (Commitment<F, H>, Prover<F, H>) {
         let commitment = Commitment {
-            tree_roots,
+            tree_roots: self.trees.iter().map(Tree::root_hash).collect(),
             batch_sizes: self.trees.iter().map(Tree::num_polys).collect(),
-            inner: inner_prover.commit(),
-            _data: Default::default(),
+            _data: PhantomData,
         };
         let prover = Prover {
             options: self.options,
+            polynomials: self.polynomials,
             trees: self.trees,
-            points,
-            inner_prover,
         };
         (commitment, prover)
     }
@@ -617,12 +544,15 @@ pub struct Proof<F: Field256, H: Hasher<F>> {
     /// The opened points. Keys are (off-domain) X-coordinates, values are the corresponding
     /// evaluations (one for every committed polynomial).
     points: BTreeMap<F, Vec<F>>,
+    /// The FRI commitment to the combined DEEP quotient of all opened points (see
+    /// [`Prover::prove`]), that is the Merkle roots of the folding rounds and the folded quotient.
+    fri_commitment: fri::Commitment<F>,
     /// Merkle proofs for the points at the query positions, relative to the raw Merkle trees (not
     /// the FRI folds). The outer array has one entry for every FRI query
     /// (`openings.len() == queries.len()`), and the inner arrays contain one proof for every Merkle
     /// tree.
     openings: Vec<Vec<LeafProof<F, H>>>,
-    /// FRI queries on the combined DEEP quotient (see [`Committer::commit`]). The number of queries
+    /// FRI queries on the combined DEEP quotient (see [`Prover::prove`]). The number of queries
     /// is calculated by [`num_queries`] above and is tuned to achieve 128-bit security together
     /// with grinding.
     queries: Vec<fri::Query<F, H>>,
@@ -671,19 +601,22 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
     /// equals one of lower degree plus a multiple of `X^degree_bound - 1`, which vanishes on `H`.
     /// Protocols whose soundness depends on the exact degree bound, such as univariate sumcheck,
     /// must take the slack into account.
+    ///
+    /// NOTE: the proof proves the evaluations at whatever points it contains, so callers must check
+    /// that the [opened points](`Self::points`) are the ones they expect.
     pub fn verify(&self, commitment: &Commitment<F, H>) -> Result<()> {
         check_points_off_domain(
             self.points.keys().copied(),
             self.options.extended_domain_size(),
         )?;
 
-        if commitment.inner.len() != self.options.num_rounds() {
+        if self.fri_commitment.len() != self.options.num_rounds() {
             return Err(anyhow!(
                 "the options (degree bound {}, fold rate {}, max rounds {}) don't match the {} FRI roots",
                 self.options.degree_bound,
                 self.options.fold_rate,
                 self.options.max_rounds,
-                commitment.inner.len()
+                self.fri_commitment.len()
             ));
         }
 
@@ -708,7 +641,13 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
             }
         }
 
-        let pow = proof_of_work::<F, H>(commitment.query_seed(), self.nonce);
+        let seed = query_seed::<F, H>(
+            commitment.tree_roots(),
+            self.num_polys,
+            &self.points,
+            &self.fri_commitment,
+        );
+        let pow = proof_of_work::<F, H>(seed, self.nonce);
         if !check_proof_of_work(pow, self.options.grinding_bits) {
             return Err(anyhow!("insufficient proof of work"));
         }
@@ -770,7 +709,7 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
             if query.len() != self.options.num_rounds() {
                 return Err(anyhow!("invalid low-degree proof for index {index}"));
             }
-            query.verify(&commitment.inner)?;
+            query.verify(&self.fri_commitment)?;
 
             let combined = rlc(
                 openings
@@ -779,7 +718,7 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
                 alpha,
             );
 
-            let quotient = query.value(&commitment.inner);
+            let quotient = query.value(&self.fri_commitment);
 
             let x = query.x();
             let expected = rlc(
@@ -818,6 +757,19 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
                         .map(|value| value.to_le_bytes().to_vec())
                         .collect(),
                 })
+                .collect(),
+            fri_roots: self
+                .fri_commitment
+                .roots()
+                .iter()
+                .map(|&hash| hash.as_bytes().to_vec())
+                .collect(),
+            folded_quotient: self
+                .fri_commitment
+                .folded_quotient()
+                .coefficients()
+                .iter()
+                .map(|coefficient| coefficient.to_le_bytes().to_vec())
                 .collect(),
             openings: self
                 .openings
@@ -864,6 +816,20 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
                     ))
                 })
                 .collect::<Result<_>>()?,
+            fri_commitment: fri::Commitment::new(
+                proto
+                    .fri_roots
+                    .iter()
+                    .map(|bytes| H::load_hash(bytes.as_slice()))
+                    .collect::<Result<_>>()?,
+                Polynomial::with_coefficients(
+                    proto
+                        .folded_quotient
+                        .iter()
+                        .map(|coefficient| utils::load_scalar(coefficient.as_slice()))
+                        .collect::<Result<_>>()?,
+                ),
+            ),
             openings: proto
                 .openings
                 .iter()
@@ -899,15 +865,10 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
 pub struct Prover<F: Field256, H: Hasher<F>> {
     /// The protocol parameters.
     options: Options,
+    /// The committed polynomials.
+    polynomials: Vec<Polynomial<F>>,
     /// Raw Merkle trees for the committed polynomials, one for each batch.
     trees: Vec<Tree<F, H>>,
-    /// The opened points.
-    ///
-    /// The keys of the map are the (off-domain) X-coordinates of the points, while values are lists
-    /// of polynomial evaluations at that point (one for every committed polynomial).
-    points: BTreeMap<F, Vec<F>>,
-    /// The underlying FRI prover for the DEEP quotient.
-    inner_prover: fri::Prover<F, H>,
 }
 
 impl<F: Field256, H: Hasher<F>> Prover<F, H> {
@@ -934,12 +895,6 @@ impl<F: Field256, H: Hasher<F>> Prover<F, H> {
         self.trees[index].root_hash()
     }
 
-    /// Returns a reference to the opened points. Keys are (off-domain) X-coordinates, values are
-    /// the corresponding evaluations (one for every committed polynomial).
-    pub fn points(&self) -> &BTreeMap<F, Vec<F>> {
-        &self.points
-    }
-
     /// Carries out an exhaustive search for a valid nonce, stopping when one is found.
     ///
     /// This is our proof-of-work algorithm.
@@ -953,13 +908,78 @@ impl<F: Field256, H: Hasher<F>> Prover<F, H> {
         panic!("no valid proof-of-work nonce found");
     }
 
-    /// Makes a DEEP-FRI proof opening the committed polynomials at the points specified at
-    /// commitment time (see [`Committer::commit()`]).
+    /// Makes a DEEP-FRI proof opening the committed polynomials at the given points.
+    ///
+    /// `points` contains (off-domain) X-coordinates; the corresponding Y-coordinates are computed
+    /// automatically for every committed polynomial. The DEEP quotients of all opened points are
+    /// combined into a single polynomial with a random linear combination, so the FRI folding
+    /// argument always works on one polynomial regardless of the number of points.
+    ///
+    /// This method can be called several times, so that the same [`Commitment`] can be opened at
+    /// different points by different proofs. However, every proof reveals more information about
+    /// the committed polynomials (the opened evaluations as well as the evaluations at the queried
+    /// positions of the extended domain), so a commitment that must be zero-knowledge must be
+    /// opened only once.
     ///
     /// This includes grinding a proof-of-work nonce, which takes
     /// 2^[`grinding_bits`](`Options::grinding_bits`) hash evaluations on average.
-    pub fn prove(&self, commitment: &Commitment<F, H>) -> Proof<F, H> {
-        let (nonce, pow) = self.grind_nonce(commitment.query_seed());
+    ///
+    /// Panics if any of the points lies inside the evaluation domain.
+    pub fn prove(&self, points: BTreeSet<F>) -> Proof<F, H> {
+        check_points_off_domain(points.iter().copied(), self.options.extended_domain_size())
+            .unwrap();
+
+        let points: BTreeMap<F, Vec<F>> = points
+            .into_iter()
+            .map(|z| {
+                (
+                    z,
+                    self.polynomials
+                        .iter()
+                        .map(|polynomial| polynomial.evaluate(z))
+                        .collect(),
+                )
+            })
+            .collect();
+
+        let tree_roots: Vec<H256> = self.trees.iter().map(Tree::root_hash).collect();
+        let num_polys = self.polynomials.len();
+        let (alpha, beta) = deep_challenges::<F, H>(tree_roots.as_slice(), num_polys, &points);
+
+        let combined = {
+            let mut combined = Polynomial::default();
+            let mut pow = F::ONE;
+            for polynomial in &self.polynomials {
+                combined += polynomial.clone() * pow;
+                pow *= alpha;
+            }
+            combined
+        };
+
+        let quotient = {
+            let mut quotient = Polynomial::default();
+            let mut pow = F::ONE;
+            for (&z, values) in &points {
+                let value = rlc(values.iter().copied(), alpha);
+                let (point_quotient, remainder) = (combined.clone() - value).horner(z);
+                assert_eq!(remainder, F::ZERO);
+                quotient += point_quotient * pow;
+                pow *= beta;
+            }
+            quotient
+        };
+
+        let fri_prover = fri::Prover::<F, H>::new(
+            quotient,
+            self.options.degree_bound,
+            self.options.blowup_log2,
+            self.options.fold_rate,
+            self.options.max_rounds,
+        );
+        let fri_commitment = fri_prover.commit();
+
+        let seed = query_seed::<F, H>(tree_roots.as_slice(), num_polys, &points, &fri_commitment);
+        let (nonce, pow) = self.grind_nonce(seed);
         let indices = get_query_indices::<F, H>(pow, &self.options);
         let openings = indices
             .iter()
@@ -967,13 +987,14 @@ impl<F: Field256, H: Hasher<F>> Prover<F, H> {
             .collect();
         let queries = indices
             .iter()
-            .map(|&index| self.inner_prover.query(index))
+            .map(|&index| fri_prover.query(index))
             .collect();
         Proof {
             options: self.options,
             nonce,
-            num_polys: self.num_polys(),
-            points: self.points.clone(),
+            num_polys,
+            points,
+            fri_commitment,
             openings,
             queries,
         }
@@ -1052,8 +1073,8 @@ mod tests {
     /// [`SAMPLE_POINTS`].
     fn sample_proof(options: Options) -> (Commitment<BS, Sha2Hash<BS>>, Proof<BS, Sha2Hash<BS>>) {
         let committer = make_committer(options, &SAMPLE_BATCHES);
-        let (commitment, prover) = committer.commit(make_points(&SAMPLE_POINTS));
-        let proof = prover.prove(&commitment);
+        let (commitment, prover) = committer.commit();
+        let proof = prover.prove(make_points(&SAMPLE_POINTS));
         (commitment, proof)
     }
 
@@ -1064,8 +1085,13 @@ mod tests {
         proof: &Proof<BS, Sha2Hash<BS>>,
         valid: bool,
     ) -> u64 {
-        let seed = commitment.query_seed();
-        (proof.nonce + 1..)
+        let seed = query_seed::<BS, Sha2Hash<BS>>(
+            commitment.tree_roots(),
+            proof.num_polys,
+            &proof.points,
+            &proof.fri_commitment,
+        );
+        ((proof.nonce + 1)..)
             .find(|&nonce| {
                 let hash = proof_of_work::<BS, Sha2Hash<BS>>(seed, nonce);
                 check_proof_of_work(hash, proof.options.grinding_bits) == valid
@@ -1402,10 +1428,15 @@ mod tests {
         assert_eq!(result, BS::ZERO);
     }
 
-    #[test]
-    fn test_deep_challenges() {
-        let tree_roots = [H256::repeat_byte(0x56), H256::repeat_byte(0x78)];
-        let points = BTreeMap::from([
+    /// The Merkle roots of the committed polynomials used to test the Fiat-Shamir transcript.
+    fn transcript_tree_roots() -> [H256; 2] {
+        [H256::repeat_byte(0x56), H256::repeat_byte(0x78)]
+    }
+
+    /// The opened points and evaluations (of three polynomials) used to test the Fiat-Shamir
+    /// transcript.
+    fn transcript_points() -> BTreeMap<BS, Vec<BS>> {
+        BTreeMap::from([
             (
                 BS::from_const(123),
                 vec![BS::from_const(1), BS::from_const(2), BS::from_const(3)],
@@ -1414,8 +1445,22 @@ mod tests {
                 BS::from_const(456),
                 vec![BS::from_const(4), BS::from_const(5), BS::from_const(6)],
             ),
-        ]);
-        let (alpha, beta) = deep_challenges::<BS, Sha2Hash<BS>>(&tree_roots, 3, &points);
+        ])
+    }
+
+    /// A FRI commitment with two roots and a folded quotient of two coefficients, used to test the
+    /// Fiat-Shamir transcript.
+    fn transcript_fri_commitment() -> fri::Commitment<BS> {
+        fri::Commitment::new(
+            vec![H256::repeat_byte(0x9a), H256::repeat_byte(0xbc)],
+            Polynomial::with_coefficients(vec![BS::from_const(7), BS::from_const(8)]),
+        )
+    }
+
+    #[test]
+    fn test_deep_challenges() {
+        let (alpha, beta) =
+            deep_challenges::<BS, Sha2Hash<BS>>(&transcript_tree_roots(), 3, &transcript_points());
         assert_eq!(
             alpha,
             parse("0x097f51584f3018cfb58caa2989196f63076af96bff20325da17bf923ef269335")
@@ -1424,6 +1469,47 @@ mod tests {
             beta,
             parse("0x152a37a010a775d0c161debac79b64a26f915125a5e1fff14b875fc51d9301f7")
         );
+    }
+
+    #[test]
+    fn test_query_seed() {
+        let seed = query_seed::<BS, Sha2Hash<BS>>(
+            &transcript_tree_roots(),
+            3,
+            &transcript_points(),
+            &transcript_fri_commitment(),
+        );
+        assert_eq!(
+            seed,
+            parse("0xc3749a4732349eda6ce66d199ac4fa709842b54fa6e99c88ed80fb2d75f411c5")
+        );
+    }
+
+    #[test]
+    fn test_query_seed_binds_points() {
+        let tree_roots = transcript_tree_roots();
+        let points = transcript_points();
+        let mut other_points = points.clone();
+        let values = other_points.remove(&BS::from_const(456)).unwrap();
+        other_points.insert(BS::from_const(789), values);
+        let fri_commitment = transcript_fri_commitment();
+        let seed = query_seed::<BS, Sha2Hash<BS>>(&tree_roots, 3, &points, &fri_commitment);
+        let other_seed =
+            query_seed::<BS, Sha2Hash<BS>>(&tree_roots, 3, &other_points, &fri_commitment);
+        assert_ne!(seed, other_seed);
+    }
+
+    #[test]
+    fn test_query_seed_binds_evaluations() {
+        let tree_roots = transcript_tree_roots();
+        let points = transcript_points();
+        let mut other_points = points.clone();
+        other_points.get_mut(&BS::from_const(456)).unwrap()[2] += BS::ONE;
+        let fri_commitment = transcript_fri_commitment();
+        let seed = query_seed::<BS, Sha2Hash<BS>>(&tree_roots, 3, &points, &fri_commitment);
+        let other_seed =
+            query_seed::<BS, Sha2Hash<BS>>(&tree_roots, 3, &other_points, &fri_commitment);
+        assert_ne!(seed, other_seed);
     }
 
     #[test]
@@ -1515,17 +1601,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
-    fn test_commit_point_on_domain() {
-        let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
-        let z = Polynomial::<BS>::coset_element2(3, OPTIONS.extended_domain_size());
-        committer.commit(BTreeSet::from([z]));
-    }
-
-    #[test]
     fn test_commitment_tree_roots() {
         let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
-        let (commitment, _) = committer.commit(make_points(&SAMPLE_POINTS));
+        let (commitment, _) = committer.commit();
         assert_eq!(
             commitment.tree_roots(),
             [
@@ -1538,39 +1616,14 @@ mod tests {
     #[test]
     fn test_commitment_batch_sizes() {
         let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
-        let (commitment, _) = committer.commit(make_points(&SAMPLE_POINTS));
+        let (commitment, _) = committer.commit();
         assert_eq!(commitment.batch_sizes(), [2, 1]);
-    }
-
-    #[test]
-    fn test_commitment_fri_roots() {
-        let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
-        let (commitment, _) = committer.commit(make_points(&SAMPLE_POINTS));
-        assert_eq!(
-            commitment.inner.roots(),
-            [
-                parse::<H256>("0x1cfc697bb66e15c8357f7a749010a210ae829f520944e21e4df00cfa7212ec8c"),
-                parse("0xc61b2df672d90a4aef984d6b7d485f673cec75f1868d39e6ba659a4ec3883f6f"),
-            ]
-        );
-    }
-
-    #[test]
-    fn test_commitment_folded_quotient() {
-        let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
-        let (commitment, _) = committer.commit(make_points(&SAMPLE_POINTS));
-        assert_eq!(
-            commitment.inner.folded_quotient().coefficients(),
-            [parse::<BS>(
-                "0x0e9f1ad4b8e8061af017e701db60283baf50808a86959003141baed02ddbf544"
-            )]
-        );
     }
 
     #[test]
     fn test_commitment_transcript_hash_of_first_batch() {
         let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
-        let (commitment, _) = committer.commit(make_points(&SAMPLE_POINTS));
+        let (commitment, _) = committer.commit();
         let hash = commitment.transcript_hash(1);
         assert_eq!(
             hash,
@@ -1581,7 +1634,7 @@ mod tests {
     #[test]
     fn test_commitment_transcript_hash_of_all_batches() {
         let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
-        let (commitment, _) = committer.commit(make_points(&SAMPLE_POINTS));
+        let (commitment, _) = committer.commit();
         let hash = commitment.transcript_hash(2);
         assert_eq!(
             hash,
@@ -1593,7 +1646,7 @@ mod tests {
     #[should_panic]
     fn test_commitment_transcript_hash_of_no_batches() {
         let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
-        let (commitment, _) = committer.commit(make_points(&SAMPLE_POINTS));
+        let (commitment, _) = committer.commit();
         commitment.transcript_hash(0);
     }
 
@@ -1601,25 +1654,14 @@ mod tests {
     #[should_panic]
     fn test_commitment_transcript_hash_of_too_many_batches() {
         let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
-        let (commitment, _) = committer.commit(make_points(&SAMPLE_POINTS));
+        let (commitment, _) = committer.commit();
         commitment.transcript_hash(3);
-    }
-
-    #[test]
-    fn test_commitment_query_seed() {
-        let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
-        let (commitment, _) = committer.commit(make_points(&SAMPLE_POINTS));
-        let seed = commitment.query_seed();
-        assert_eq!(
-            seed,
-            parse("0xbc410e551e15e172a66eaf9db719cf382e198be287cd079271c04714a491b2ac")
-        );
     }
 
     #[test]
     fn test_commitment_to_proto() {
         let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
-        let (commitment, _) = committer.commit(make_points(&SAMPLE_POINTS));
+        let (commitment, _) = committer.commit();
         let proto = commitment.to_proto();
         assert_eq!(
             proto.batches,
@@ -1634,25 +1676,12 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(
-            proto.fri_roots,
-            [
-                commitment.inner.roots()[0].as_bytes().to_vec(),
-                commitment.inner.roots()[1].as_bytes().to_vec(),
-            ]
-        );
-        assert_eq!(
-            proto.folded_quotient,
-            [commitment.inner.folded_quotient().coefficients()[0]
-                .to_le_bytes()
-                .to_vec()]
-        );
     }
 
     #[test]
     fn test_commitment_from_proto() {
         let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
-        let (commitment, _) = committer.commit(make_points(&SAMPLE_POINTS));
+        let (commitment, _) = committer.commit();
         let proto = commitment.to_proto();
         let decoded = Commitment::<BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
         assert_eq!(decoded, commitment);
@@ -1661,7 +1690,7 @@ mod tests {
     #[test]
     fn test_reject_commitment_without_batches() {
         let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
-        let (commitment, _) = committer.commit(make_points(&SAMPLE_POINTS));
+        let (commitment, _) = committer.commit();
         let mut proto = commitment.to_proto();
         proto.batches.clear();
         let result = Commitment::<BS, Sha2Hash<BS>>::from_proto(&proto);
@@ -1669,31 +1698,9 @@ mod tests {
     }
 
     #[test]
-    fn test_reject_commitment_without_fri_roots() {
-        // The number of FRI roots can only be checked against the options of a proof.
-        let (commitment, proof) = sample_proof(OPTIONS);
-        let mut proto = commitment.to_proto();
-        proto.fri_roots.clear();
-        let commitment = Commitment::<BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
-        let result = proof.verify(&commitment);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_reject_commitment_with_non_canonical_final_coefficient() {
-        let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
-        let (commitment, _) = committer.commit(make_points(&SAMPLE_POINTS));
-        let mut proto = commitment.to_proto();
-        let modulus: U256 = BS::MODULUS.parse().unwrap();
-        proto.folded_quotient[0] = modulus.to_little_endian().to_vec();
-        let result = Commitment::<BS, Sha2Hash<BS>>::from_proto(&proto);
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn test_reject_commitment_with_short_root() {
         let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
-        let (commitment, _) = committer.commit(make_points(&SAMPLE_POINTS));
+        let (commitment, _) = committer.commit();
         let mut proto = commitment.to_proto();
         proto.batches[1].root.pop();
         let result = Commitment::<BS, Sha2Hash<BS>>::from_proto(&proto);
@@ -1701,19 +1708,9 @@ mod tests {
     }
 
     #[test]
-    fn test_reject_commitment_with_short_fri_root() {
-        let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
-        let (commitment, _) = committer.commit(make_points(&SAMPLE_POINTS));
-        let mut proto = commitment.to_proto();
-        proto.fri_roots[1].pop();
-        let result = Commitment::<BS, Sha2Hash<BS>>::from_proto(&proto);
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn test_reject_commitment_without_hash_backend() {
         let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
-        let (commitment, _) = committer.commit(make_points(&SAMPLE_POINTS));
+        let (commitment, _) = committer.commit();
         let mut proto = commitment.to_proto();
         proto.hash_backend = None;
         let result = Commitment::<BS, Sha2Hash<BS>>::from_proto(&proto);
@@ -1723,7 +1720,7 @@ mod tests {
     #[test]
     fn test_reject_commitment_with_wrong_hash_backend() {
         let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
-        let (commitment, _) = committer.commit(make_points(&SAMPLE_POINTS));
+        let (commitment, _) = committer.commit();
         let proto = commitment.to_proto();
         let result = Commitment::<BS, Keccak256Hash<BS>>::from_proto(&proto);
         assert!(result.is_err());
@@ -1732,28 +1729,28 @@ mod tests {
     #[test]
     fn test_prover_options() {
         let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
-        let (_, prover) = committer.commit(make_points(&SAMPLE_POINTS));
+        let (_, prover) = committer.commit();
         assert_eq!(*prover.options(), OPTIONS);
     }
 
     #[test]
     fn test_prover_num_polys() {
         let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
-        let (_, prover) = committer.commit(make_points(&SAMPLE_POINTS));
+        let (_, prover) = committer.commit();
         assert_eq!(prover.num_polys(), 3);
     }
 
     #[test]
     fn test_prover_num_trees() {
         let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
-        let (_, prover) = committer.commit(make_points(&SAMPLE_POINTS));
+        let (_, prover) = committer.commit();
         assert_eq!(prover.num_trees(), 2);
     }
 
     #[test]
     fn test_prover_root_hashes() {
         let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
-        let (_, prover) = committer.commit(make_points(&SAMPLE_POINTS));
+        let (_, prover) = committer.commit();
         assert_eq!(
             prover.root_hash(0),
             parse("0x8a560267cca9607a73ad5186d575443499a19685f460be07ff3928387dcb5a48")
@@ -1765,11 +1762,21 @@ mod tests {
     }
 
     #[test]
-    fn test_prover_points() {
+    #[should_panic]
+    fn test_prove_point_on_domain() {
         let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
-        let (_, prover) = committer.commit(make_points(&SAMPLE_POINTS));
+        let (_, prover) = committer.commit();
+        let z = Polynomial::<BS>::coset_element2(3, OPTIONS.extended_domain_size());
+        prover.prove(BTreeSet::from([z]));
+    }
+
+    #[test]
+    fn test_proof_points() {
+        let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
+        let (_, prover) = committer.commit();
+        let proof = prover.prove(make_points(&SAMPLE_POINTS));
         assert_eq!(
-            *prover.points(),
+            *proof.points(),
             BTreeMap::from([
                 (
                     BS::from_const(123),
@@ -1794,48 +1801,67 @@ mod tests {
     #[test]
     fn test_proof_options() {
         let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
-        let (commitment, prover) = committer.commit(make_points(&SAMPLE_POINTS));
-        let proof = prover.prove(&commitment);
+        let (_, prover) = committer.commit();
+        let proof = prover.prove(make_points(&SAMPLE_POINTS));
         assert_eq!(*proof.options(), OPTIONS);
     }
 
     #[test]
     fn test_proof_num_polys() {
         let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
-        let (commitment, prover) = committer.commit(make_points(&SAMPLE_POINTS));
-        let proof = prover.prove(&commitment);
+        let (_, prover) = committer.commit();
+        let proof = prover.prove(make_points(&SAMPLE_POINTS));
         assert_eq!(proof.num_polys(), 3);
     }
 
     #[test]
-    fn test_proof_points() {
+    fn test_proof_fri_roots() {
         let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
-        let (commitment, prover) = committer.commit(make_points(&SAMPLE_POINTS));
-        let proof = prover.prove(&commitment);
-        assert_eq!(proof.points(), prover.points());
+        let (_, prover) = committer.commit();
+        let proof = prover.prove(make_points(&SAMPLE_POINTS));
+        assert_eq!(
+            proof.fri_commitment.roots(),
+            [
+                parse::<H256>("0x1cfc697bb66e15c8357f7a749010a210ae829f520944e21e4df00cfa7212ec8c"),
+                parse("0xc61b2df672d90a4aef984d6b7d485f673cec75f1868d39e6ba659a4ec3883f6f"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_proof_folded_quotient() {
+        let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
+        let (_, prover) = committer.commit();
+        let proof = prover.prove(make_points(&SAMPLE_POINTS));
+        assert_eq!(
+            proof.fri_commitment.folded_quotient().coefficients(),
+            [parse::<BS>(
+                "0x0e9f1ad4b8e8061af017e701db60283baf50808a86959003141baed02ddbf544"
+            )]
+        );
     }
 
     #[test]
     fn test_proof_nonce_without_grinding() {
         let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
-        let (commitment, prover) = committer.commit(make_points(&SAMPLE_POINTS));
-        let proof = prover.prove(&commitment);
+        let (_, prover) = committer.commit();
+        let proof = prover.prove(make_points(&SAMPLE_POINTS));
         assert_eq!(proof.nonce(), 0);
     }
 
     #[test]
     fn test_proof_nonce_with_grinding() {
         let committer = make_committer::<BS, Sha2Hash<BS>>(GROUND_OPTIONS, &SAMPLE_BATCHES);
-        let (commitment, prover) = committer.commit(make_points(&SAMPLE_POINTS));
-        let proof = prover.prove(&commitment);
-        assert_eq!(proof.nonce(), 252);
+        let (_, prover) = committer.commit();
+        let proof = prover.prove(make_points(&SAMPLE_POINTS));
+        assert_eq!(proof.nonce(), 204);
     }
 
     #[test]
     fn test_proof_size_without_grinding() {
         let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
-        let (commitment, prover) = committer.commit(make_points(&SAMPLE_POINTS));
-        let proof = prover.prove(&commitment);
+        let (_, prover) = committer.commit();
+        let proof = prover.prove(make_points(&SAMPLE_POINTS));
         assert_eq!(proof.openings.len(), 64);
         assert_eq!(proof.queries.len(), 64);
     }
@@ -1843,8 +1869,8 @@ mod tests {
     #[test]
     fn test_proof_size_with_grinding() {
         let committer = make_committer::<BS, Sha2Hash<BS>>(GROUND_OPTIONS, &SAMPLE_BATCHES);
-        let (commitment, prover) = committer.commit(make_points(&SAMPLE_POINTS));
-        let proof = prover.prove(&commitment);
+        let (_, prover) = committer.commit();
+        let proof = prover.prove(make_points(&SAMPLE_POINTS));
         assert_eq!(proof.openings.len(), 60);
         assert_eq!(proof.queries.len(), 60);
     }
@@ -1855,8 +1881,8 @@ mod tests {
         options: Options,
     ) {
         let committer = make_committer::<F, H>(options, batches);
-        let (commitment, prover) = committer.commit(make_points(points));
-        let proof = prover.prove(&commitment);
+        let (commitment, prover) = committer.commit();
+        let proof = prover.prove(make_points(points));
         let result = proof.verify(&commitment);
         assert!(result.is_ok());
     }
@@ -2056,6 +2082,16 @@ mod tests {
     }
 
     #[test]
+    fn test_several_proofs_for_the_same_commitment() {
+        let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
+        let (commitment, prover) = committer.commit();
+        let proof1 = prover.prove(make_points(&SAMPLE_POINTS));
+        let proof2 = prover.prove(make_points(&[789]));
+        assert!(proof1.verify(&commitment).is_ok());
+        assert!(proof2.verify(&commitment).is_ok());
+    }
+
+    #[test]
     fn test_accept_untampered_proof() {
         let (commitment, proof) = sample_proof(OPTIONS);
         let result = proof.verify(&commitment);
@@ -2171,14 +2207,29 @@ mod tests {
 
     #[test]
     fn test_reject_tampered_folded_quotient_without_rounds() {
-        let (mut commitment, proof) = sample_proof(Options {
+        let (commitment, mut proof) = sample_proof(Options {
             max_rounds: 0,
             ..OPTIONS
         });
-        let mut coefficients = commitment.inner.folded_quotient().coefficients().to_vec();
+        let mut coefficients = proof
+            .fri_commitment
+            .folded_quotient()
+            .coefficients()
+            .to_vec();
         coefficients[1] += BS::ONE;
-        commitment.inner =
+        proof.fri_commitment =
             fri::Commitment::new(vec![], Polynomial::with_coefficients(coefficients));
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_tampered_fri_root() {
+        let (commitment, mut proof) = sample_proof(OPTIONS);
+        let mut roots = proof.fri_commitment.roots().to_vec();
+        roots[1] = H256::repeat_byte(0x42);
+        proof.fri_commitment =
+            fri::Commitment::new(roots, proof.fri_commitment.folded_quotient().clone());
         let result = proof.verify(&commitment);
         assert!(result.is_err());
     }
@@ -2274,7 +2325,7 @@ mod tests {
                 &[&[91, 90, 89, 88]],
             ],
         );
-        let (foreign, _) = committer.commit(make_points(&SAMPLE_POINTS));
+        let (foreign, _) = committer.commit();
         let result = proof.verify(&foreign);
         assert!(result.is_err());
     }
@@ -2337,8 +2388,8 @@ mod tests {
             },
             &[&[&[11, 22, 33, 44]]],
         );
-        let (other_commitment, other_prover) = committer.commit(make_points(&[123]));
-        let mut other_proof = other_prover.prove(&other_commitment);
+        let (_, other_prover) = committer.commit();
+        let mut other_proof = other_prover.prove(make_points(&[123]));
         proof.openings[0][0] = other_proof.openings[0].remove(0);
         let result = proof.verify(&commitment);
         assert!(result.is_err());
@@ -2385,7 +2436,7 @@ mod tests {
         assert_eq!(proto.fold_rate, 1);
         assert_eq!(proto.max_rounds, u64::MAX);
         assert_eq!(proto.grinding_bits, 8);
-        assert_eq!(proto.nonce, 252);
+        assert_eq!(proto.nonce, 204);
         assert_eq!(proto.num_polys, 3);
         assert_eq!(
             proto.points,
@@ -2407,6 +2458,19 @@ mod tests {
                     ],
                 },
             ]
+        );
+        assert_eq!(
+            proto.fri_roots,
+            [
+                proof.fri_commitment.roots()[0].as_bytes().to_vec(),
+                proof.fri_commitment.roots()[1].as_bytes().to_vec(),
+            ]
+        );
+        assert_eq!(
+            proto.folded_quotient,
+            [proof.fri_commitment.folded_quotient().coefficients()[0]
+                .to_le_bytes()
+                .to_vec()]
         );
         assert_eq!(proto.openings.len(), 60);
         assert_eq!(proto.queries.len(), 60);
@@ -2506,6 +2570,36 @@ mod tests {
         let mut proto = proof.to_proto();
         let modulus: U256 = BS::MODULUS.parse().unwrap();
         proto.points[1].v[2] = modulus.to_little_endian().to_vec();
+        let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_proof_without_fri_roots() {
+        // The number of FRI roots is only checked by `verify`.
+        let (commitment, proof) = sample_proof(OPTIONS);
+        let mut proto = proof.to_proto();
+        proto.fri_roots.clear();
+        let proof = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_short_fri_root() {
+        let (_, proof) = sample_proof(OPTIONS);
+        let mut proto = proof.to_proto();
+        proto.fri_roots[1].pop();
+        let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_non_canonical_folded_quotient() {
+        let (_, proof) = sample_proof(OPTIONS);
+        let mut proto = proof.to_proto();
+        let modulus: U256 = BS::MODULUS.parse().unwrap();
+        proto.folded_quotient[0] = modulus.to_little_endian().to_vec();
         let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto);
         assert!(result.is_err());
     }

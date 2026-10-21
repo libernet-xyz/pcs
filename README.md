@@ -22,6 +22,9 @@ implementation that works with any field with sufficient 2-adicity.
 > 2. commit one extra uniformly random polynomial to mask the FRI query siblings in the folding
 >    argument.
 >
+> Both measures only account for a single proof: every proof reveals more evaluations of the
+> committed polynomials, so a zero-knowledge commitment must be opened only once.
+>
 > The [`starkom-plonk`][starkom-plonk] crate does both when its
 > [blinding system][plonk-options-blind] is enabled.
 

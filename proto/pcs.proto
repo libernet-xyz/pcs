@@ -11,6 +11,9 @@ message Sha2HashBackend {}
 message KeccakHashBackend {}
 
 // A batched DEEP-FRI polynomial commitment.
+//
+// The commitment only depends on the committed polynomials, not on the points opened by a `Proof`,
+// so the points can be chosen after committing.
 message Commitment {
   // Hash backend used for this commitment.
   //
@@ -34,27 +37,6 @@ message Commitment {
 
   // The polynomial batches, in commitment order. There must be at least one batch.
   repeated Batch batches = 2;
-
-  // Merkle roots of the FRI folding argument, one for every folding round.
-  //
-  // The first element is the root of the Merkle tree of the DEEP quotient, the second one is the
-  // root of the Merkle tree of the polynomial folded by the first round, and so on. The number of
-  // rounds is determined by `Proof.degree_bound`, `Proof.fold_rate`, and `Proof.max_rounds`, and
-  // this list is empty if there are zero rounds.
-  //
-  // Each root hash is stored as a 32 byte sequence.
-  repeated bytes fri_roots = 3;
-
-  // The coefficients of the DEEP quotient folded by all the FRI rounds, which is sent in the clear
-  // rather than being folded further. With zero rounds this is the whole (unfolded) DEEP quotient.
-  //
-  // There are at most `Proof.degree_bound / 2^(rounds * Proof.fold_rate)` coefficients, in
-  // ascending degree order. They're the coefficients of the domain-shifted polynomial, so they must
-  // be evaluated at the roots of unity of the folded domain, not at the shifted domain points.
-  //
-  // Each coefficient is a field element stored in canonical (non-Montgomery) integer form, in
-  // little-endian byte order.
-  repeated bytes folded_quotient = 4;
 }
 
 // A Merkle proof for a leaf of the Merkle tree of a polynomial batch (see `Commitment.Batch`).
@@ -74,8 +56,8 @@ message MerkleProof {
   //
   // The first element is the hash of the sibling leaf, the second element is the sibling of the
   // parent node, and so on until the sibling of the child of the root. Each hash is stored as a 32
-  // byte sequence. The root hash is not stored here because all root hashes are sent separately in
-  // the `Commitment`.
+  // byte sequence. The root hash is not stored here because the root hashes of all polynomial
+  // batches are sent separately in the `Commitment`.
   repeated bytes merkle_path = 2;
 }
 
@@ -108,8 +90,8 @@ message Query {
     // tree. There are as many hashes as the height of the tree minus `r`. The verifier recomputes
     // the subtree root from the coset values.
     //
-    // Each hash is stored as a 32 byte sequence. The root hash is not stored here because all root
-    // hashes are sent separately in the `Commitment`.
+    // Each hash is stored as a 32 byte sequence. The root hash is not stored here because all FRI
+    // root hashes are sent separately in `Proof.fri_roots`.
     repeated bytes merkle_path = 2;
   }
 
@@ -123,8 +105,8 @@ message Query {
   //
   // There's exactly one entry for every folding round (see `Proof.max_rounds`), each opening a
   // coset of `2^r` evaluations with `r` being `Proof.fold_rate`, so this list is empty if there are
-  // zero rounds. The value resulting from the last round is checked against the folded quotient
-  // stored in the `Commitment`.
+  // zero rounds. The value resulting from the last round is checked against
+  // `Proof.folded_quotient`.
   repeated LeafProof folds = 2;
 }
 
@@ -162,9 +144,8 @@ message Proof {
   //
   // The actual number of rounds is the minimum between this value and
   // `log2(degree_bound) / fold_rate`, rounded down. Rather than being folded further, the
-  // polynomial resulting from the last round is sent in the clear (see
-  // `Commitment.folded_quotient`). With 0 there's no folding at all and the whole DEEP quotient is
-  // sent in the clear.
+  // polynomial resulting from the last round is sent in the clear (see `folded_quotient`). With 0
+  // there's no folding at all and the whole DEEP quotient is sent in the clear.
   uint64 max_rounds = 5;
 
   // Number of grinding bits.
@@ -196,15 +177,36 @@ message Proof {
   // The points opened by the proof.
   repeated Point points = 9;
 
+  // Merkle roots of the FRI folding argument, one for every folding round.
+  //
+  // The first element is the root of the Merkle tree of the DEEP quotient, the second one is the
+  // root of the Merkle tree of the polynomial folded by the first round, and so on. The number of
+  // rounds is determined by `degree_bound`, `fold_rate`, and `max_rounds`, and this list is empty
+  // if there are zero rounds.
+  //
+  // Each root hash is stored as a 32 byte sequence.
+  repeated bytes fri_roots = 10;
+
+  // The coefficients of the DEEP quotient folded by all the FRI rounds, which is sent in the clear
+  // rather than being folded further. With zero rounds this is the whole (unfolded) DEEP quotient.
+  //
+  // There are at most `degree_bound / 2^(rounds * fold_rate)` coefficients, in ascending degree
+  // order. They're the coefficients of the domain-shifted polynomial, so they must be evaluated at
+  // the roots of unity of the folded domain, not at the shifted domain points.
+  //
+  // Each coefficient is a field element stored in canonical (non-Montgomery) integer form, in
+  // little-endian byte order.
+  repeated bytes folded_quotient = 11;
+
   message Opening {
     repeated MerkleProof proofs = 1;
   }
 
   // Merkle proofs for the points at the query positions, relative to the raw Merkle trees (not the
   // FRI folds). There's one entry for every FRI query (`openings.len() == queries.len()`).
-  repeated Opening openings = 10;
+  repeated Opening openings = 12;
 
   // FRI queries on the combined DEEP quotient, that is the random linear combination of the DEEP
   // quotients of all opened points. Every FRI leaf therefore holds exactly one value.
-  repeated Query queries = 11;
+  repeated Query queries = 13;
 }
