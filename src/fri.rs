@@ -313,28 +313,6 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
         Polynomial::<F>::coset_element2(self.index, self.degree_bound << self.blowup_log2).into()
     }
 
-    /// Returns the evaluation of the committed polynomial at the opened domain element
-    /// [`Self::x`].
-    ///
-    /// If there's at least one folding round the evaluation is part of the coset opened in the
-    /// first Merkle tree, otherwise it's computed from the folded quotient of the `commitment`.
-    ///
-    /// REQUIRES: the query must have been [verified](`Self::verify`) against `commitment`.
-    pub fn value(&self, commitment: &Commitment<F>) -> F {
-        let n = self.degree_bound << self.blowup_log2;
-        match self.folds.first() {
-            Some(proof) => {
-                let height = n.trailing_zeros() as usize;
-                let coset_mask = (1 << self.fold_rate) - 1;
-                let index = reverse_bits(self.index, height) & coset_mask;
-                proof.coset()[index]
-            }
-            None => commitment
-                .folded_quotient()
-                .evaluate_on_two_adic_domain(self.index, n),
-        }
-    }
-
     /// Returns the number of Merkle proofs in the query, which is the number of folding rounds
     /// (see [`num_rounds`]).
     pub fn len(&self) -> usize {
@@ -372,18 +350,24 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
         values[0]
     }
 
-    /// Verifies this proof against the given commitment.
+    /// Verifies this proof against the given commitment, with `value` being the expected evaluation
+    /// of the committed polynomial at the opened domain element [`Self::x`].
+    ///
+    /// The caller derives `value` on its own (DEEP-FRI computes it from the openings of the
+    /// committed polynomials), and every round derives the expected evaluation of the next one by
+    /// folding its coset.
     ///
     /// The number of folding rounds and the maximum number of coefficients of the folded quotient
     /// are determined by the degree bound, the fold rate, and the maximum number of rounds (see
-    /// [`num_rounds`]). Every round checks the opened coset against the Merkle root of the round
-    /// and folds it, and the result of the last round must match the evaluation of the final
-    /// polynomial.
+    /// [`num_rounds`]). Every round checks that the opened coset contains the expected evaluation,
+    /// checks the coset against the Merkle root of the round, and folds it. The result of the last
+    /// round, or `value` itself if there are zero rounds, must match the evaluation of the folded
+    /// quotient.
     ///
     /// If verification succeeds, the committed polynomial has degree less than `2^(rounds * r)`
     /// times the number of coefficients of the folded quotient, with `r` being the fold rate, and
     /// therefore less than the degree bound.
-    pub fn verify(&self, commitment: &Commitment<F>) -> Result<()> {
+    pub fn verify(&self, commitment: &Commitment<F>, mut value: F) -> Result<()> {
         let mut n = self.degree_bound << self.blowup_log2;
         assert!(n.is_power_of_two());
 
@@ -406,8 +390,6 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
         }
 
         let mut index = self.index;
-        // The evaluation at the queried index expected from the previous round.
-        let mut expected: Option<F> = None;
 
         for (proof, &root_hash) in self.folds.iter().zip(commitment.roots()) {
             if proof.fold_rate() != self.fold_rate {
@@ -426,29 +408,23 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
             }
 
             let offset = reverse_bits(index, k) & ((1 << self.fold_rate) - 1);
-            if expected.is_some_and(|expected| proof.coset()[offset] != expected) {
+            if proof.coset()[offset] != value {
                 return Err(anyhow!("leaf value mismatch"));
             }
             proof.verify(index, root_hash)?;
 
             let alpha = H::challenge(*FOLD_DST, &[root_hash]);
             let folded_n = n >> self.fold_rate;
-            expected = Some(Self::fold_coset(
-                proof.coset().to_vec(),
-                index % folded_n,
-                n,
-                alpha,
-            ));
+            value = Self::fold_coset(proof.coset().to_vec(), index % folded_n, n, alpha);
             n = folded_n;
             k -= self.fold_rate;
             index %= n;
         }
 
-        if let Some(expected) = expected
-            && commitment
-                .folded_quotient()
-                .evaluate_on_two_adic_domain(index, n)
-                != expected
+        if commitment
+            .folded_quotient()
+            .evaluate_on_two_adic_domain(index, n)
+            != value
         {
             return Err(anyhow!("folded quotient mismatch"));
         }
@@ -1228,6 +1204,13 @@ mod tests {
         make_polynomial(&[12, 34, 56, 78, 90, 12, 34, 56])
     }
 
+    /// The evaluation of [`honest_polynomial`] at the element of the extended domain at index
+    /// [`QUERY_INDEX`].
+    fn honest_value() -> BS {
+        let x = Polynomial::<BS>::coset_element2(QUERY_INDEX, DEGREE_BOUND << BLOWUP_LOG2);
+        honest_polynomial().evaluate(x)
+    }
+
     /// Same as [`honest_polynomial`] but with different coefficients.
     fn foreign_polynomial() -> Polynomial<BS> {
         make_polynomial(&[90, 78, 56, 34, 12, 90, 78, 56])
@@ -1388,8 +1371,11 @@ mod tests {
         for (index, query) in queries.iter().enumerate() {
             assert_eq!(query.index(), index);
             assert_eq!(query.len(), num_rounds);
-            assert_eq!(query.value(&commitment), polynomial.evaluate(query.x()));
-            assert!(query.verify(&commitment).is_ok());
+            assert!(
+                query
+                    .verify(&commitment, polynomial.evaluate(query.x()))
+                    .is_ok()
+            );
         }
     }
 
@@ -1632,7 +1618,7 @@ mod tests {
             MAX_ROUNDS,
         );
         let query = prover.query(QUERY_INDEX);
-        let result = query.verify(&prover.commit());
+        let result = query.verify(&prover.commit(), honest_value());
         assert!(result.is_ok());
     }
 
@@ -1648,7 +1634,7 @@ mod tests {
         let query = prover.query(QUERY_INDEX);
         let foreign =
             Prover::<BS, Sha2Hash<BS>>::new(foreign_polynomial(), 8, 2, 1, MAX_ROUNDS).commit();
-        let result = query.verify(&foreign);
+        let result = query.verify(&foreign, honest_value());
         assert!(result.is_err());
     }
 
@@ -1663,7 +1649,9 @@ mod tests {
         );
         let mut commitment = prover.commit();
         commitment.roots[2] = H256::repeat_byte(0xAA);
-        let result = prover.query(QUERY_INDEX).verify(&commitment);
+        let result = prover
+            .query(QUERY_INDEX)
+            .verify(&commitment, honest_value());
         assert!(result.is_err());
     }
 
@@ -1679,7 +1667,7 @@ mod tests {
         let commitment = prover.commit();
         let mut query = prover.query(QUERY_INDEX);
         query.folds.truncate(2);
-        let result = query.verify(&commitment);
+        let result = query.verify(&commitment, honest_value());
         assert!(result.is_err());
     }
 
@@ -1694,7 +1682,9 @@ mod tests {
         );
         let mut commitment = prover.commit();
         commitment.roots.truncate(2);
-        let result = prover.query(QUERY_INDEX).verify(&commitment);
+        let result = prover
+            .query(QUERY_INDEX)
+            .verify(&commitment, honest_value());
         assert!(result.is_err());
     }
 
@@ -1711,7 +1701,7 @@ mod tests {
         let mut query = prover.query(QUERY_INDEX);
         let mut donor = prover.query(QUERY_INDEX);
         query.folds.push(donor.folds.pop().unwrap());
-        let result = query.verify(&commitment);
+        let result = query.verify(&commitment, honest_value());
         assert!(result.is_err());
     }
 
@@ -1728,7 +1718,7 @@ mod tests {
         let mut query = prover.query(QUERY_INDEX);
         commitment.roots.truncate(2);
         query.folds.truncate(2);
-        let result = query.verify(&commitment);
+        let result = query.verify(&commitment, honest_value());
         assert!(result.is_err());
     }
 
@@ -1745,7 +1735,9 @@ mod tests {
         let mut coefficients = commitment.folded_quotient.take();
         coefficients[0] += BS::ONE;
         commitment.folded_quotient = Polynomial::with_coefficients(coefficients);
-        let result = prover.query(QUERY_INDEX).verify(&commitment);
+        let result = prover
+            .query(QUERY_INDEX)
+            .verify(&commitment, honest_value());
         assert!(result.is_err());
     }
 
@@ -1762,7 +1754,9 @@ mod tests {
         let mut coefficients = commitment.folded_quotient.take();
         coefficients.push(BS::ZERO);
         commitment.folded_quotient = Polynomial::with_coefficients(coefficients);
-        let result = prover.query(QUERY_INDEX).verify(&commitment);
+        let result = prover
+            .query(QUERY_INDEX)
+            .verify(&commitment, honest_value());
         assert!(result.is_err());
     }
 
@@ -1774,7 +1768,9 @@ mod tests {
         let mut coefficients = commitment.folded_quotient.take();
         coefficients.push(BS::ZERO);
         commitment.folded_quotient = Polynomial::with_coefficients(coefficients);
-        let result = prover.query(QUERY_INDEX).verify(&commitment);
+        let result = prover
+            .query(QUERY_INDEX)
+            .verify(&commitment, honest_value());
         assert!(result.is_err());
     }
 
@@ -1783,16 +1779,13 @@ mod tests {
         // The polynomial has degree less than 2, so after one round its folded quotient has 4
         // coefficients of which only the first is non-zero. A shorter folded quotient proves a
         // stronger degree bound.
-        let prover = Prover::<BS, Sha2Hash<BS>>::new(
-            make_polynomial(&[12, 34]),
-            DEGREE_BOUND,
-            BLOWUP_LOG2,
-            1,
-            1,
-        );
+        let polynomial = make_polynomial(&[12, 34]);
+        let prover =
+            Prover::<BS, Sha2Hash<BS>>::new(polynomial.clone(), DEGREE_BOUND, BLOWUP_LOG2, 1, 1);
         let mut commitment = prover.commit();
         commitment.folded_quotient = commitment.folded_quotient.clone().trim();
-        let result = prover.query(QUERY_INDEX).verify(&commitment);
+        let query = prover.query(QUERY_INDEX);
+        let result = query.verify(&commitment, polynomial.evaluate(query.x()));
         assert!(result.is_ok());
     }
 
@@ -1821,7 +1814,32 @@ mod tests {
         let mut query = prover.query(QUERY_INDEX);
         let mut donor = prover.query(QUERY_INDEX);
         query.folds[0] = donor.folds.remove(1);
-        let result = query.verify(&commitment);
+        let result = query.verify(&commitment, honest_value());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_wrong_value() {
+        let prover = Prover::<BS, Sha2Hash<BS>>::new(
+            honest_polynomial(),
+            DEGREE_BOUND,
+            BLOWUP_LOG2,
+            FOLD_RATE,
+            MAX_ROUNDS,
+        );
+        let commitment = prover.commit();
+        let query = prover.query(QUERY_INDEX);
+        let result = query.verify(&commitment, honest_value() + BS::ONE);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_wrong_value_without_rounds() {
+        let prover =
+            Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2, 1, 0);
+        let commitment = prover.commit();
+        let query = prover.query(QUERY_INDEX);
+        let result = query.verify(&commitment, honest_value() + BS::ONE);
         assert!(result.is_err());
     }
 
@@ -1837,7 +1855,7 @@ mod tests {
         let commitment = prover.commit();
         let mut query = prover.query(QUERY_INDEX);
         query.folds[0].coset.swap(0, 1);
-        let result = query.verify(&commitment);
+        let result = query.verify(&commitment, honest_value());
         assert!(result.is_err());
     }
 
@@ -1853,7 +1871,7 @@ mod tests {
         let commitment = prover.commit();
         let mut query = prover.query(QUERY_INDEX);
         query.folds[1].coset[1] += BS::ONE;
-        let result = query.verify(&commitment);
+        let result = query.verify(&commitment, honest_value());
         assert!(result.is_err());
     }
 
@@ -1870,7 +1888,7 @@ mod tests {
         let mut query = prover.query(QUERY_INDEX);
         let mut other = prover.query(QUERY_INDEX + 4);
         query.folds[1] = other.folds.remove(1);
-        let result = query.verify(&commitment);
+        let result = query.verify(&commitment, honest_value());
         assert!(result.is_err());
     }
 
@@ -1886,7 +1904,7 @@ mod tests {
         let commitment = prover.commit();
         let mut query = prover.query(QUERY_INDEX);
         query.folds[0].path.push(H256::zero());
-        let result = query.verify(&commitment);
+        let result = query.verify(&commitment, honest_value());
         assert!(result.is_err());
     }
 
@@ -1944,7 +1962,7 @@ mod tests {
         let commitment = prover.commit();
         let mut query = prover.query(QUERY_INDEX);
         query.folds[1].path.pop();
-        let result = query.verify(&commitment);
+        let result = query.verify(&commitment, honest_value());
         assert!(result.is_err());
     }
 
@@ -2090,7 +2108,7 @@ mod tests {
         let mut query = prover.query(QUERY_INDEX);
         let proof = &mut query.folds[0];
         proof.coset[4] += BS::ONE;
-        let result = query.verify(&commitment);
+        let result = query.verify(&commitment, honest_value());
         assert!(result.is_err());
     }
 
@@ -2106,7 +2124,7 @@ mod tests {
         let commitment = prover.commit();
         let mut query = prover.query(QUERY_INDEX);
         query.folds[0].coset.swap(1, 2);
-        let result = query.verify(&commitment);
+        let result = query.verify(&commitment, honest_value());
         assert!(result.is_err());
     }
 
@@ -2122,7 +2140,7 @@ mod tests {
         let commitment = prover.commit();
         let mut query = prover.query(QUERY_INDEX);
         query.fold_rate = 2;
-        let result = query.verify(&commitment);
+        let result = query.verify(&commitment, honest_value());
         assert!(result.is_err());
     }
 
@@ -2198,8 +2216,7 @@ mod tests {
         .unwrap();
         assert_eq!(decoded.index(), query.index());
         assert_eq!(decoded.len(), query.len());
-        assert_eq!(decoded.value(&commitment), query.value(&commitment));
         assert_eq!(decoded.x(), query.x());
-        assert!(decoded.verify(&commitment).is_ok());
+        assert!(decoded.verify(&commitment, honest_value()).is_ok());
     }
 }

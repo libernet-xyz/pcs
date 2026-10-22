@@ -709,7 +709,6 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
             if query.len() != self.options.num_rounds() {
                 return Err(anyhow!("invalid low-degree proof for index {index}"));
             }
-            query.verify(&self.fri_commitment)?;
 
             let combined = rlc(
                 openings
@@ -718,19 +717,15 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
                 alpha,
             );
 
-            let quotient = query.value(&self.fri_commitment);
-
             let x = query.x();
-            let expected = rlc(
+            let quotient = rlc(
                 self.points.iter().map(|(&z, values)| {
                     let v = rlc(values.iter().copied(), alpha);
                     (combined - v) * (x - z).invert_vartime().unwrap()
                 }),
                 beta,
             );
-            if quotient != expected {
-                return Err(anyhow!("algebraic check failed at query index {index}"));
-            }
+            query.verify(&self.fri_commitment, quotient)?;
         }
 
         Ok(())

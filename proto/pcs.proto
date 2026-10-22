@@ -105,8 +105,8 @@ message Query {
   //
   // There's exactly one entry for every folding round (see `Proof.max_rounds`), each opening a
   // coset of `2^r` evaluations with `r` being `Proof.fold_rate`, so this list is empty if there are
-  // zero rounds. The value resulting from the last round is checked against
-  // `Proof.folded_quotient`.
+  // zero rounds. The value resulting from the last round, or the DEEP quotient computed from
+  // `Proof.openings` if there are zero rounds, is checked against `Proof.folded_quotient`.
   repeated LeafProof folds = 2;
 }
 
