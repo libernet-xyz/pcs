@@ -5,9 +5,13 @@ import "google/protobuf/any.proto";
 package starkom.proto.pcs.v9;
 
 // Identifier for the Starkom-provided SHA2-256 hash backend.
+//
+// The type URL of this message is `type.starkom.io/starkom.proto.pcs.v9.Sha2HashBackend`.
 message Sha2HashBackend {}
 
 // Identifier for the Starkom-provided Keccak-256 hash backend.
+//
+// The type URL of this message is `type.starkom.io/starkom.proto.pcs.v9.KeccakHashBackend`.
 message KeccakHashBackend {}
 
 // A batched DEEP-FRI polynomial commitment.
@@ -17,7 +21,7 @@ message KeccakHashBackend {}
 message Commitment {
   // Hash backend used for this commitment.
   //
-  // It can be `Sha2HashBackend`, `KeccakHashBackend`, or any other user-defined tag with a
+  // It can be a `Sha2HashBackend`, `KeccakHashBackend`, or any other user-defined tag with a
   // corresponding backend implementation.
   //
   // NOTE: in order to warrant 128-bit security in a quantum setting, all backends are required to
