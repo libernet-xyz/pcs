@@ -17,8 +17,8 @@ implementation that works with any field with sufficient 2-adicity.
 >
 > To make it fully zero-knowledge you need to:
 >
-> 1. add at least [`num_queries`][num_queries] + 1 uniformly random elements to every polynomial to
->    compensate for the information leak,
+> 1. add at least [`num_queries`][num_queries] + num_opened_points + 1 uniformly random elements to
+>    every polynomial to compensate for the information leak,
 > 2. commit one extra uniformly random polynomial to mask the FRI query siblings in the folding
 >    argument.
 >
