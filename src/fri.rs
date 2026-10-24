@@ -327,7 +327,8 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
     /// Our algorithm doesn't perform any memory (re)allocations, it just keeps reusing the `values`
     /// vector. Every fold halves the number of evaluations, which are kept in the first `m`
     /// positions. The i-th folded evaluation overwrites position `i` after reading positions `2*i`
-    /// and `2*i+1`, which is safe because position `i` was already read by fold `i / 2`.
+    /// and `2*i+1`. That's safe because, for `i > 0`, position `i` was already read when computing
+    /// the folded evaluation at position `i / 2`.
     fn fold_coset(mut values: Vec<F>, base_index: usize, mut n: usize, mut alpha: F) -> F {
         let mut m = values.len();
         assert!(m.is_power_of_two());
