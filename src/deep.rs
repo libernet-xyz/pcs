@@ -273,7 +273,7 @@ fn query_seed<F: Field256, H: Hasher<F>>(
     points: &BTreeMap<F, Vec<F>>,
     fri_commitment: &fri::Commitment<F>,
 ) -> H256 {
-    let folded_quotient = fri_commitment.folded_quotient();
+    let folded_quotient = fri_commitment.folded_polynomial();
     H::hash_transcript(
         *QUERY_DST0,
         deep_transcript(tree_roots, num_polys, points)
@@ -761,7 +761,7 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
                 .collect(),
             folded_quotient: self
                 .fri_commitment
-                .folded_quotient()
+                .folded_polynomial()
                 .coefficients()
                 .iter()
                 .map(|coefficient| coefficient.to_le_bytes().to_vec())
@@ -1829,7 +1829,7 @@ mod tests {
         let (_, prover) = committer.commit();
         let proof = prover.prove(make_points(&SAMPLE_POINTS));
         assert_eq!(
-            proof.fri_commitment.folded_quotient().coefficients(),
+            proof.fri_commitment.folded_polynomial().coefficients(),
             [parse::<BS>(
                 "0x0e9f1ad4b8e8061af017e701db60283baf50808a86959003141baed02ddbf544"
             )]
@@ -2208,7 +2208,7 @@ mod tests {
         });
         let mut coefficients = proof
             .fri_commitment
-            .folded_quotient()
+            .folded_polynomial()
             .coefficients()
             .to_vec();
         coefficients[1] += BS::ONE;
@@ -2224,7 +2224,7 @@ mod tests {
         let mut roots = proof.fri_commitment.roots().to_vec();
         roots[1] = H256::repeat_byte(0x42);
         proof.fri_commitment =
-            fri::Commitment::new(roots, proof.fri_commitment.folded_quotient().clone());
+            fri::Commitment::new(roots, proof.fri_commitment.folded_polynomial().clone());
         let result = proof.verify(&commitment);
         assert!(result.is_err());
     }
@@ -2463,7 +2463,7 @@ mod tests {
         );
         assert_eq!(
             proto.folded_quotient,
-            [proof.fri_commitment.folded_quotient().coefficients()[0]
+            [proof.fri_commitment.folded_polynomial().coefficients()[0]
                 .to_le_bytes()
                 .to_vec()]
         );

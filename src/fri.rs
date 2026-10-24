@@ -17,8 +17,8 @@ static FOLD_DST: LazyLock<H256> = LazyLock::new(|| utils::make_dst(b"starkom/fri
 /// Every round performs exactly `fold_rate` folds, so there can be at most
 /// `log2(degree_bound) / fold_rate` rounds (rounded down), and their number is further capped by
 /// `max_rounds`. Rather than being folded further, the polynomial resulting from the last round is
-/// sent in the clear as the [folded quotient](`Commitment::folded_quotient`), which has degree less
-/// than `degree_bound / 2^(rounds * fold_rate)`.
+/// sent in the clear as the [folded polynomial](`Commitment::folded_polynomial`), which has degree
+/// less than `degree_bound / 2^(rounds * fold_rate)`.
 ///
 /// REQUIRES: `degree_bound` must be a power of 2 and `fold_rate` must be greater than 0.
 pub fn num_rounds(degree_bound: usize, fold_rate: usize, max_rounds: usize) -> usize {
@@ -79,10 +79,8 @@ impl<F: Field256, H: Hasher<F>> LeafProof<F, H> {
 
     /// Verifies the proof against the given root hash.
     ///
-    /// `index` is the index of any evaluation of the coset in the evaluation domain, not the
-    /// position of its leaf in the tree (see [`Tree`]).
-    ///
-    /// REQUIRES: `index` must be less than `2^self.height()`.
+    /// `index` is a natural index within the evaluation domain (not bit-reversed), and can refer to
+    /// any element in the coset.
     fn verify(&self, index: usize, root_hash: H256) -> Result<()> {
         let subtree_root = merkle::merkle_root::<H>(
             self.coset
@@ -113,9 +111,6 @@ impl<F: Field256, H: Hasher<F>> LeafProof<F, H> {
 
     /// Deserializes a proof for a coset of size `2^num_folds` from a
     /// [`LeafProof`](`proto::query::LeafProof`) protobuf.
-    ///
-    /// Returns an error if the number of coset values is not `2^num_folds`, if any value is not a
-    /// canonical field element, or if any hash is invalid.
     fn from_proto(proto: &proto::query::LeafProof, num_folds: usize) -> Result<Self> {
         if proto.coset_values.len() != 1 << num_folds {
             return Err(anyhow!(
@@ -142,26 +137,26 @@ impl<F: Field256, H: Hasher<F>> LeafProof<F, H> {
 
 /// A Merkle tree whose leaves are the evaluations of a polynomial.
 ///
-/// The leaves are the evaluations themselves rather than hashes of them: each leaf is an evaluation
-/// encoded with [`utils::encode_scalar`]. The internal nodes are computed as described in
-/// [`merkle::merklify`], hashing pairs of children with
-/// [`MerkleHasher::hash_binary`](`crate::hash::MerkleHasher::hash_binary`).
+/// Unlike [`merkle::Tree`] this struct is optimized to manage a single polynomial. The leaves are
+/// the evaluations themselves rather than hashes of them: each leaf is an evaluation encoded with
+/// [`utils::encode_scalar`]. The internal nodes are computed as described in [`merkle::merklify`],
+/// hashing pairs of children with [`H::hash_binary`](`crate::hash::MerkleHasher::hash_binary`).
 ///
 /// The evaluations are stored in bit-reversed order: the one at index `i` of the evaluation domain
 /// of size N goes to the leaf at position `reverse_bits(i, log2(N))`. The partner evaluations at
 /// `i` and `i + j * N / 2^r` (for all `j` in `[0..2^r)`) only differ in the `r` most significant
-/// bits of their index, with `r` being the fold rate. So all partner values form a coset and end up
-/// in adjacent leaves, and a single [`LeafProof`] opens all of them.
+/// bits of their natural index, with `r` being the fold rate. So all partner values form a coset
+/// and end up in adjacent leaves, and a single [`LeafProof`] opens all of them.
 ///
 /// When `r = 1` this reduces to binary FRI with only two partner values at each round, located at
 /// indices `i` and `i + n/2`. In that case a [`LeafProof`] has the shape of a regular Merkle proof.
 ///
-/// In addition to the above, the root of that subtree is at the same position as the leaf of the
-/// folded evaluation in the next round.
+/// In addition to the above, the root of the coset subtree is at the same position as the leaf of
+/// the folded evaluation in the next round.
 ///
-/// NOTE: bit reversal is completely abstracted away by `Tree`. The provided API exposes the
-/// original evaluation domain indices, but bit reversal allows opening a whole coset with a single
-/// Merkle proof (see [`LeafProof`]).
+/// NOTE: bit reversal is abstracted away by `Tree`. The provided API exposes the original
+/// evaluation domain indices, but bit reversal allows opening a whole coset with a single Merkle
+/// proof (see [`LeafProof`]).
 #[derive(Debug, Clone)]
 struct Tree<F: Field256, H: Hasher<F>> {
     /// The whole tree, stored layer by layer as described in [`merkle::merklify`]. There are 2*N-1
@@ -213,10 +208,10 @@ impl<F: Field256, H: Hasher<F>> Tree<F, H> {
     fn query(&self, index: usize, fold_rate: usize) -> LeafProof<F, H> {
         let n = self.num_leaves();
         let reverse_index = reverse_bits(index, n.trailing_zeros() as usize);
-        let size = 1 << fold_rate;
-        let start = reverse_index & !(size - 1);
+        let coset_size = 1 << fold_rate;
+        let start = reverse_index & !(coset_size - 1);
         LeafProof {
-            coset: self.data[start..(start + size)]
+            coset: self.data[start..(start + coset_size)]
                 .iter()
                 .map(|&leaf| utils::decode_scalar(leaf).unwrap())
                 .collect(),
@@ -230,7 +225,7 @@ impl<F: Field256, H: Hasher<F>> Tree<F, H> {
 ///
 /// It consists of the Merkle roots of the folding rounds, one for every round, and of the
 /// polynomial resulting from the last round, which is sent in the clear rather than being folded
-/// further. With zero rounds there are no Merkle roots and the folded quotient is the committed
+/// further. With zero rounds there are no Merkle roots and the folded polynomial is the committed
 /// polynomial itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Commitment<F: Field256> {
@@ -239,14 +234,14 @@ pub struct Commitment<F: Field256> {
     /// polynomial folded by the previous rounds.
     roots: Vec<H256>,
     /// The polynomial resulting from the last folding round.
-    folded_quotient: Polynomial<F>,
+    folded_polynomial: Polynomial<F>,
 }
 
 impl<F: Field256> Commitment<F> {
-    pub(crate) fn new(roots: Vec<H256>, folded_quotient: Polynomial<F>) -> Self {
+    pub(crate) fn new(roots: Vec<H256>, folded_polynomial: Polynomial<F>) -> Self {
         Self {
             roots,
-            folded_quotient,
+            folded_polynomial,
         }
     }
 
@@ -264,13 +259,14 @@ impl<F: Field256> Commitment<F> {
         self.roots.as_slice()
     }
 
-    /// Returns the folded quotient, that is the polynomial resulting from the last folding round.
+    /// Returns a reference to the folded polynomial, that is the polynomial resulting from the last
+    /// folding round.
     ///
     /// Its coefficients are those of the domain-shifted polynomial (see
     /// [`Polynomial::shift_domain`]), so they must be evaluated over the folded domain, not at the
     /// shifted domain points.
-    pub fn folded_quotient(&self) -> &Polynomial<F> {
-        &self.folded_quotient
+    pub fn folded_polynomial(&self) -> &Polynomial<F> {
+        &self.folded_polynomial
     }
 }
 
@@ -321,9 +317,9 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
 
     /// Folds a coset of evaluations into a single evaluation of the folded polynomial.
     ///
-    /// `values` contains the `2^r` evaluations of a coset of the evaluation domain of size `n`,
-    /// in bit-reversed order (see [`Tree`]): the evaluation at index `base_index + j * n / 2^r` is
-    /// in position `reverse_bits(j, r)`, with `base_index < n / 2^r`. The coset is folded `r` times
+    /// `values` contains the `2^r` evaluations of a coset of the evaluation domain of size `n`, in
+    /// bit-reversed order (see [`Tree`]): the evaluation at index `base_index + j * n / 2^r` is in
+    /// position `reverse_bits(j, r)`, with `base_index < n / 2^r`. The coset is folded `r` times
     /// with the challenges `alpha`, `alpha^2`, `alpha^4`, and so on, which is equivalent to folding
     /// it once with arity `2^r` and challenge `alpha`. The result is the evaluation of the folded
     /// polynomial at index `base_index` of the evaluation domain of size `n / 2^r`.
@@ -357,15 +353,15 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
     /// committed polynomials), and every round derives the expected evaluation of the next one by
     /// folding its coset.
     ///
-    /// The number of folding rounds and the maximum number of coefficients of the folded quotient
+    /// The number of folding rounds and the maximum number of coefficients of the folded polynomial
     /// are determined by the degree bound, the fold rate, and the maximum number of rounds (see
     /// [`num_rounds`]). Every round checks that the opened coset contains the expected evaluation,
     /// checks the coset against the Merkle root of the round, and folds it. The result of the last
     /// round, or `value` itself if there are zero rounds, must match the evaluation of the folded
-    /// quotient.
+    /// polynomial.
     ///
     /// If verification succeeds, the committed polynomial has degree less than `2^(rounds * r)`
-    /// times the number of coefficients of the folded quotient, with `r` being the fold rate, and
+    /// times the number of coefficients of the folded polynomial, with `r` being the fold rate, and
     /// therefore less than the degree bound.
     pub fn verify(&self, commitment: &Commitment<F>, mut value: F) -> Result<()> {
         let mut n = self.degree_bound << self.blowup_log2;
@@ -381,10 +377,10 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
             return Err(anyhow!("wrong number of folding rounds"));
         }
         let final_degree_bound = self.degree_bound >> (num_rounds * self.fold_rate);
-        if commitment.folded_quotient().len() > final_degree_bound {
+        if commitment.folded_polynomial().len() > final_degree_bound {
             return Err(anyhow!(
-                "invalid folded quotient size (got {} coefficients, want at most {})",
-                commitment.folded_quotient().len(),
+                "invalid folded polynomial size (got {} coefficients, want at most {})",
+                commitment.folded_polynomial().len(),
                 final_degree_bound
             ));
         }
@@ -407,26 +403,26 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
                 ));
             }
 
-            let offset = reverse_bits(index, k) & ((1 << self.fold_rate) - 1);
-            if proof.coset()[offset] != value {
+            let reverse_index = reverse_bits(index, k) & ((1 << self.fold_rate) - 1);
+            if proof.coset()[reverse_index] != value {
                 return Err(anyhow!("leaf value mismatch"));
             }
             proof.verify(index, root_hash)?;
 
             let alpha = H::challenge(*FOLD_DST, &[root_hash]);
-            let folded_n = n >> self.fold_rate;
-            value = Self::fold_coset(proof.coset().to_vec(), index % folded_n, n, alpha);
-            n = folded_n;
+            let m = n >> self.fold_rate;
+            value = Self::fold_coset(proof.coset().to_vec(), index % m, n, alpha);
+            n = m;
             k -= self.fold_rate;
             index %= n;
         }
 
         if commitment
-            .folded_quotient()
+            .folded_polynomial()
             .evaluate_on_two_adic_domain(index, n)
             != value
         {
-            return Err(anyhow!("folded quotient mismatch"));
+            return Err(anyhow!("folded polynomial mismatch"));
         }
 
         Ok(())
@@ -494,7 +490,7 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
 /// The struct contains the Merkle tree of the committed polynomial and the Merkle trees of the
 /// polynomials folded by every round but the last one, so there's one tree for every round, plus
 /// the polynomial resulting from the last round. Note that, since every round performs exactly
-/// `fold_rate` folds, the folded quotient is not necessarily a constant.
+/// `fold_rate` folds, the folded polynomial is not necessarily a constant.
 #[derive(Debug, Clone)]
 pub struct Prover<F: Field256, H: Hasher<F>> {
     /// The degree bound of the committed polynomial, always a power of 2.
@@ -510,7 +506,7 @@ pub struct Prover<F: Field256, H: Hasher<F>> {
     /// folded by the previous rounds.
     trees: Vec<Tree<F, H>>,
     /// The polynomial resulting from the last folding round.
-    folded_quotient: Polynomial<F>,
+    folded_polynomial: Polynomial<F>,
 }
 
 impl<F: Field256, H: Hasher<F>> Prover<F, H> {
@@ -594,7 +590,7 @@ impl<F: Field256, H: Hasher<F>> Prover<F, H> {
             fold_rate,
             max_rounds,
             trees,
-            folded_quotient: Polynomial::with_coefficients(coefficients),
+            folded_polynomial: Polynomial::with_coefficients(coefficients),
         }
     }
 
@@ -630,7 +626,7 @@ impl<F: Field256, H: Hasher<F>> Prover<F, H> {
     pub fn commit(&self) -> Commitment<F> {
         Commitment {
             roots: self.trees.iter().map(Tree::root_hash).collect(),
-            folded_quotient: self.folded_quotient.clone(),
+            folded_polynomial: self.folded_polynomial.clone(),
         }
     }
 
@@ -1220,7 +1216,7 @@ mod tests {
         fold_rate: usize,
         max_rounds: usize,
         expected_roots: &[&'static str],
-        expected_folded_quotient: &[&'static str],
+        expected_folded_polynomial: &[&'static str],
     ) {
         let prover = Prover::<BS, H>::new(honest_polynomial(), 8, 2, fold_rate, max_rounds);
         let commitment = prover.commit();
@@ -1232,8 +1228,8 @@ mod tests {
                 .collect::<Vec<H256>>()
         );
         assert_eq!(
-            commitment.folded_quotient().coefficients(),
-            expected_folded_quotient
+            commitment.folded_polynomial().coefficients(),
+            expected_folded_polynomial
                 .iter()
                 .map(|&coefficient| parse(coefficient))
                 .collect::<Vec<BS>>()
@@ -1365,7 +1361,7 @@ mod tests {
         let queries: Vec<Query<F, H>> = (0..n).map(|index| prover.query(index)).collect();
         assert_eq!(commitment.len(), num_rounds);
         assert_eq!(
-            commitment.folded_quotient().len(),
+            commitment.folded_polynomial().len(),
             degree_bound >> (num_rounds * fold_rate)
         );
         for (index, query) in queries.iter().enumerate() {
@@ -1723,7 +1719,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reject_tampered_folded_quotient() {
+    fn test_reject_tampered_folded_polynomial() {
         let prover = Prover::<BS, Sha2Hash<BS>>::new(
             honest_polynomial(),
             DEGREE_BOUND,
@@ -1732,9 +1728,9 @@ mod tests {
             MAX_ROUNDS,
         );
         let mut commitment = prover.commit();
-        let mut coefficients = commitment.folded_quotient.take();
+        let mut coefficients = commitment.folded_polynomial.take();
         coefficients[0] += BS::ONE;
-        commitment.folded_quotient = Polynomial::with_coefficients(coefficients);
+        commitment.folded_polynomial = Polynomial::with_coefficients(coefficients);
         let result = prover
             .query(QUERY_INDEX)
             .verify(&commitment, honest_value());
@@ -1742,7 +1738,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reject_oversized_folded_quotient() {
+    fn test_reject_oversized_folded_polynomial() {
         let prover = Prover::<BS, Sha2Hash<BS>>::new(
             honest_polynomial(),
             DEGREE_BOUND,
@@ -1751,9 +1747,9 @@ mod tests {
             MAX_ROUNDS,
         );
         let mut commitment = prover.commit();
-        let mut coefficients = commitment.folded_quotient.take();
+        let mut coefficients = commitment.folded_polynomial.take();
         coefficients.push(BS::ZERO);
-        commitment.folded_quotient = Polynomial::with_coefficients(coefficients);
+        commitment.folded_polynomial = Polynomial::with_coefficients(coefficients);
         let result = prover
             .query(QUERY_INDEX)
             .verify(&commitment, honest_value());
@@ -1761,13 +1757,13 @@ mod tests {
     }
 
     #[test]
-    fn test_reject_oversized_folded_quotient_without_rounds() {
+    fn test_reject_oversized_folded_polynomial_without_rounds() {
         let prover =
             Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2, 1, 0);
         let mut commitment = prover.commit();
-        let mut coefficients = commitment.folded_quotient.take();
+        let mut coefficients = commitment.folded_polynomial.take();
         coefficients.push(BS::ZERO);
-        commitment.folded_quotient = Polynomial::with_coefficients(coefficients);
+        commitment.folded_polynomial = Polynomial::with_coefficients(coefficients);
         let result = prover
             .query(QUERY_INDEX)
             .verify(&commitment, honest_value());
@@ -1775,28 +1771,28 @@ mod tests {
     }
 
     #[test]
-    fn test_accept_trimmed_folded_quotient() {
-        // The polynomial has degree less than 2, so after one round its folded quotient has 4
-        // coefficients of which only the first is non-zero. A shorter folded quotient proves a
+    fn test_accept_trimmed_folded_polynomial() {
+        // The polynomial has degree less than 2, so after one round its folded polynomial has 4
+        // coefficients of which only the first is non-zero. A shorter folded polynomial proves a
         // stronger degree bound.
         let polynomial = make_polynomial(&[12, 34]);
         let prover =
             Prover::<BS, Sha2Hash<BS>>::new(polynomial.clone(), DEGREE_BOUND, BLOWUP_LOG2, 1, 1);
         let mut commitment = prover.commit();
-        commitment.folded_quotient = commitment.folded_quotient.clone().trim();
+        commitment.folded_polynomial = commitment.folded_polynomial.clone().trim();
         let query = prover.query(QUERY_INDEX);
         let result = query.verify(&commitment, polynomial.evaluate(query.x()));
         assert!(result.is_ok());
     }
 
     #[test]
-    fn test_zero_rounds_folded_quotient() {
+    fn test_zero_rounds_folded_polynomial() {
         let prover =
             Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2, 1, 0);
         let commitment = prover.commit();
         assert_eq!(commitment.len(), 0);
         assert_eq!(
-            *commitment.folded_quotient(),
+            *commitment.folded_polynomial(),
             honest_polynomial().shift_domain()
         );
     }
