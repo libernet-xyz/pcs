@@ -323,23 +323,27 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
     /// with the challenges `alpha`, `alpha^2`, `alpha^4`, and so on, which is equivalent to folding
     /// it once with arity `2^r` and challenge `alpha`. The result is the evaluation of the folded
     /// polynomial at index `base_index` of the evaluation domain of size `n / 2^r`.
+    ///
+    /// Our algorithm doesn't perform any memory (re)allocations, it just keeps reusing the `values`
+    /// vector. Every fold halves the number of evaluations, which are kept in the first `m`
+    /// positions. The i-th folded evaluation overwrites position `i` after reading positions `2*i`
+    /// and `2*i+1`, which is safe because position `i` was already read by fold `i / 2`.
     fn fold_coset(mut values: Vec<F>, base_index: usize, mut n: usize, mut alpha: F) -> F {
-        while values.len() > 1 {
-            // Leaves `2*i` and `2*i+1` contain the evaluations at `X` and `-X`. The former is the
-            // one at the lower index, `base_index + reverse_bits(i, log2(half)) * stride`.
-            let half = values.len() / 2;
-            let num_bits = half.trailing_zeros() as usize;
-            let stride = n / 2 / half;
+        let mut m = values.len();
+        assert!(m.is_power_of_two());
+        let r = m.trailing_zeros() as usize;
+        for _ in 0..r {
+            m /= 2;
+            let num_bits = m.trailing_zeros() as usize;
+            let stride = n / 2 / m;
             let omega_inv = Polynomial::<F>::domain_element2(1, n).invert_unwrap();
-            values = (0..half)
-                .map(|i| {
-                    let pos = values[i * 2];
-                    let neg = values[i * 2 + 1];
-                    let index = base_index + reverse_bits(i, num_bits) * stride;
-                    (pos + neg + alpha * omega_inv.pow_small(index) * (pos - neg))
-                        * F::BaseField::TWO_INV
-                })
-                .collect();
+            for i in 0..m {
+                let pos = values[i * 2];
+                let neg = values[i * 2 + 1];
+                let index = base_index + reverse_bits(i, num_bits) * stride;
+                values[i] = (pos + neg + alpha * omega_inv.pow_small(index) * (pos - neg))
+                    * F::BaseField::TWO_INV;
+            }
             n /= 2;
             alpha = alpha.square();
         }
