@@ -15,6 +15,10 @@ use std::sync::LazyLock;
 /// Target security level in bits.
 pub const LAMBDA: usize = 128;
 
+/// The number of bits of a proof-of-work hash, which is also the most leading zero bits it can
+/// have.
+pub const PROOF_OF_WORK_BITS: usize = 256;
+
 /// Domain separator tag used by [`Committer::transcript_hash`].
 static TRANSCRIPT_DST: LazyLock<H256> =
     LazyLock::new(|| utils::make_dst(b"starkom/deep/transcript"));
@@ -97,7 +101,9 @@ pub struct Options {
     /// which takes `2^grinding_bits` hash evaluations on average. Every `blowup_log2` bits of
     /// grinding save one FRI query (see [`num_queries`]). 0 disables grinding.
     ///
-    /// Must be at most half the number of bits of the field (see [`Self::validate`]).
+    /// Must be at most [`PROOF_OF_WORK_BITS`], the number of bits of the proof-of-work hash,
+    /// because no hash can satisfy more (see [`Self::validate`]). Values above [`LAMBDA`] are valid
+    /// but save no further queries, because at least one query is always required.
     pub grinding_bits: usize,
 }
 
@@ -127,7 +133,7 @@ impl Options {
     ///
     /// The degree bound must be a power of 2, `blowup_log2` and `fold_rate` must be greater than 0,
     /// the size of the extended evaluation domain must not exceed the 2-adicity of `F::BaseField`,
-    /// and `grinding_bits` must not exceed `F::NUM_BITS / 2`. `max_rounds` can have any value.
+    /// and `grinding_bits` must not exceed [`PROOF_OF_WORK_BITS`]. `max_rounds` can have any value.
     pub fn validate<F: Field>(&self) -> Result<()> {
         if !self.degree_bound.is_power_of_two() {
             return Err(anyhow!(
@@ -150,11 +156,10 @@ impl Options {
                 F::BaseField::S
             ));
         }
-        if self.grinding_bits > F::NUM_BITS / 2 {
+        if self.grinding_bits > PROOF_OF_WORK_BITS {
             return Err(anyhow!(
-                "invalid number of grinding bits {} (exceeds half the field size, {})",
-                self.grinding_bits,
-                F::NUM_BITS / 2
+                "invalid number of grinding bits {} (exceeds {PROOF_OF_WORK_BITS})",
+                self.grinding_bits
             ));
         }
         Ok(())
@@ -1166,6 +1171,8 @@ mod tests {
     fn test_num_queries_with_full_grinding() {
         test_num_queries_impl(4, 128, 1);
         test_num_queries_impl(4, 256, 1);
+        test_num_queries_impl(4, 257, 1);
+        test_num_queries_impl(4, usize::MAX, 1);
     }
 
     #[test]
@@ -1285,9 +1292,11 @@ mod tests {
     }
 
     #[test]
-    fn test_options_with_most_grinding() {
-        test_valid_options_impl::<BS>(4, 2, 1, 127);
+    fn test_options_with_full_grinding() {
+        test_valid_options_impl::<BS>(4, 2, 1, 128);
+        test_valid_options_impl::<BS>(4, 2, 1, 256);
         test_valid_options_impl::<GL4>(4, 2, 1, 128);
+        test_valid_options_impl::<GL4>(4, 2, 1, 256);
     }
 
     #[test]
@@ -1327,9 +1336,11 @@ mod tests {
     }
 
     #[test]
-    fn test_options_with_excessive_grinding() {
-        test_invalid_options_impl::<BS>(4, 2, 1, 128);
-        test_invalid_options_impl::<GL4>(4, 2, 1, 129);
+    fn test_options_with_unsatisfiable_grinding() {
+        test_invalid_options_impl::<BS>(4, 2, 1, 257);
+        test_invalid_options_impl::<BS>(4, 2, 1, usize::MAX);
+        test_invalid_options_impl::<GL4>(4, 2, 1, 257);
+        test_invalid_options_impl::<GL4>(4, 2, 1, usize::MAX);
     }
 
     #[test]
@@ -1381,6 +1392,7 @@ mod tests {
         let hash = H256::zero();
         test_check_proof_of_work_impl(hash, 256, true);
         test_check_proof_of_work_impl(hash, 257, false);
+        test_check_proof_of_work_impl(hash, usize::MAX, false);
     }
 
     #[test]
@@ -2409,9 +2421,37 @@ mod tests {
     #[test]
     fn test_reject_overstated_grinding() {
         let (commitment, mut proof) = sample_proof(GROUND_OPTIONS);
-        proof.options.grinding_bits = BS::NUM_BITS / 2;
+        proof.options.grinding_bits = 128;
         let result = proof.verify(&commitment);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_unsatisfiable_grinding() {
+        let (commitment, mut proof) = sample_proof(GROUND_OPTIONS);
+        proof.options.grinding_bits = 257;
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_maximum_grinding() {
+        let (commitment, mut proof) = sample_proof(GROUND_OPTIONS);
+        proof.options.grinding_bits = usize::MAX;
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_committer_with_unsatisfiable_grinding() {
+        make_committer::<BS, Sha2Hash<BS>>(
+            Options {
+                grinding_bits: 257,
+                ..OPTIONS
+            },
+            &SAMPLE_BATCHES,
+        );
     }
 
     #[test]
@@ -2541,10 +2581,19 @@ mod tests {
     }
 
     #[test]
-    fn test_reject_excessive_grinding() {
+    fn test_reject_unsatisfiable_grinding_in_proto() {
         let (_, proof) = sample_proof(GROUND_OPTIONS);
         let mut proto = proof.to_proto();
-        proto.grinding_bits = 128;
+        proto.grinding_bits = 257;
+        let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_maximum_grinding_in_proto() {
+        let (_, proof) = sample_proof(GROUND_OPTIONS);
+        let mut proto = proof.to_proto();
+        proto.grinding_bits = u32::MAX;
         let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto);
         assert!(result.is_err());
     }
