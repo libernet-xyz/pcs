@@ -54,7 +54,8 @@ pub fn num_queries(blowup_log2: usize, grinding_bits: usize) -> usize {
 /// The parameters of the DEEP-FRI protocol.
 ///
 /// The prover specifies them in [`Committer::new`] and they're recorded in every [`Proof`], so
-/// verifiers must check them against the expected ones (see [`Proof::options`]).
+/// verifiers must check them against the expected ones (see [`Proof::options`] and
+/// [`Options::satisfies`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Options {
     /// The proven degree bound, which must be a power of 2.
@@ -127,6 +128,22 @@ impl Options {
     /// REQUIRES: the options must be [valid](`Self::validate`).
     pub fn num_rounds(&self) -> usize {
         fri::num_rounds(self.degree_bound, self.fold_rate, self.max_rounds)
+    }
+
+    /// Returns true iff these options are acceptable to a verifier that expects `other`: the
+    /// number of grinding bits must be greater than or equal to the expected one, and all other
+    /// parameters must be equal.
+    ///
+    /// Soundness doesn't depend on the number of grinding bits because the number of queries is
+    /// derived from it (see [`num_queries`]), but more grinding bits mean fewer queries, so a proof
+    /// with more grinding bits than expected is never more expensive to verify.
+    pub fn satisfies(&self, other: &Self) -> bool {
+        self.grinding_bits >= other.grinding_bits
+            && Self {
+                grinding_bits: other.grinding_bits,
+                ..*self
+            }
+            .eq(other)
     }
 
     /// Checks that these options are valid for the field `F`, returning an error otherwise.
@@ -566,9 +583,10 @@ pub struct Proof<F: Field256, H: Hasher<F>> {
 impl<F: Field256, H: Hasher<F>> Proof<F, H> {
     /// Returns the protocol parameters used in the proof.
     ///
-    /// Callers must check them against the expected ones. Note that soundness doesn't depend on the
-    /// number of grinding bits because the number of queries is automatically derived from it, but
-    /// it should still be checked along with the other parameters.
+    /// Callers must check them against the expected ones, typically with [`Options::satisfies`].
+    /// Note that soundness doesn't depend on the number of grinding bits because the number of
+    /// queries is automatically derived from it, but it should still be checked along with the
+    /// other parameters.
     pub fn options(&self) -> &Options {
         &self.options
     }
@@ -1341,6 +1359,115 @@ mod tests {
         test_invalid_options_impl::<BS>(4, 2, 1, usize::MAX);
         test_invalid_options_impl::<GL4>(4, 2, 1, 257);
         test_invalid_options_impl::<GL4>(4, 2, 1, usize::MAX);
+    }
+
+    /// The protocol parameters expected by the verifier in the `Options::satisfies` tests.
+    const EXPECTED_OPTIONS: Options = Options {
+        degree_bound: 4096,
+        blowup_log2: 6,
+        fold_rate: 3,
+        max_rounds: 2,
+        grinding_bits: 20,
+    };
+
+    #[test]
+    fn test_equal_options_satisfy() {
+        assert!(EXPECTED_OPTIONS.satisfies(&EXPECTED_OPTIONS));
+    }
+
+    #[test]
+    fn test_options_with_more_grinding_bits_satisfy() {
+        let options = Options {
+            grinding_bits: 21,
+            ..EXPECTED_OPTIONS
+        };
+        assert!(options.satisfies(&EXPECTED_OPTIONS));
+    }
+
+    #[test]
+    fn test_options_with_full_grinding_satisfy() {
+        let options = Options {
+            grinding_bits: PROOF_OF_WORK_BITS,
+            ..EXPECTED_OPTIONS
+        };
+        assert!(options.satisfies(&EXPECTED_OPTIONS));
+    }
+
+    #[test]
+    fn test_options_with_fewer_grinding_bits_dont_satisfy() {
+        let options = Options {
+            grinding_bits: 19,
+            ..EXPECTED_OPTIONS
+        };
+        assert!(!options.satisfies(&EXPECTED_OPTIONS));
+    }
+
+    #[test]
+    fn test_options_without_grinding_dont_satisfy() {
+        let options = Options {
+            grinding_bits: 0,
+            ..EXPECTED_OPTIONS
+        };
+        assert!(!options.satisfies(&EXPECTED_OPTIONS));
+    }
+
+    fn test_options_dont_satisfy_impl(options: Options) {
+        assert!(!options.satisfies(&EXPECTED_OPTIONS));
+        assert!(
+            !Options {
+                grinding_bits: 21,
+                ..options
+            }
+            .satisfies(&EXPECTED_OPTIONS)
+        );
+    }
+
+    #[test]
+    fn test_options_with_different_degree_bound_dont_satisfy() {
+        test_options_dont_satisfy_impl(Options {
+            degree_bound: 2048,
+            ..EXPECTED_OPTIONS
+        });
+        test_options_dont_satisfy_impl(Options {
+            degree_bound: 8192,
+            ..EXPECTED_OPTIONS
+        });
+    }
+
+    #[test]
+    fn test_options_with_different_blowup_dont_satisfy() {
+        test_options_dont_satisfy_impl(Options {
+            blowup_log2: 5,
+            ..EXPECTED_OPTIONS
+        });
+        test_options_dont_satisfy_impl(Options {
+            blowup_log2: 7,
+            ..EXPECTED_OPTIONS
+        });
+    }
+
+    #[test]
+    fn test_options_with_different_fold_rate_dont_satisfy() {
+        test_options_dont_satisfy_impl(Options {
+            fold_rate: 2,
+            ..EXPECTED_OPTIONS
+        });
+        test_options_dont_satisfy_impl(Options {
+            fold_rate: 4,
+            ..EXPECTED_OPTIONS
+        });
+    }
+
+    #[test]
+    fn test_options_with_different_max_rounds_dont_satisfy() {
+        test_options_dont_satisfy_impl(Options {
+            max_rounds: 1,
+            ..EXPECTED_OPTIONS
+        });
+        test_options_dont_satisfy_impl(Options {
+            max_rounds: 3,
+            ..EXPECTED_OPTIONS
+        });
     }
 
     #[test]
