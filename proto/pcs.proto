@@ -43,26 +43,41 @@ message Commitment {
   repeated Batch batches = 2;
 }
 
-// A Merkle proof for a leaf of the Merkle tree of a polynomial batch (see `Commitment.Batch`).
+// A Merkle multi-proof for several leaves of the Merkle tree of a polynomial batch (see
+// `Commitment.Batch`).
 //
 // Batching is supported at the DEEP level, so these Merkle trees have vector leaves rather than
 // scalar ones: if we're batching K polynomials each leaf is the vector of their K evaluations at a
 // point of the extended domain, and the hashes of these vectors are used to build the higher levels
 // of the Merkle tree.
-message MerkleProof {
-  // The K evaluations in the opened leaf.
-  //
-  // Each value is a field element stored in canonical (non-Montgomery) integer form, in
-  // little-endian byte order.
-  repeated bytes leaf_values = 1;
+//
+// A multi-proof sends every sibling hash at most once, and omits the ones that the verifier can
+// compute from the opened leaves. The opened positions are not stored here because the verifier
+// derives them from the query indices.
+message MerkleMultiProof {
+  // An opened leaf.
+  message Leaf {
+    // The K evaluations in the leaf.
+    //
+    // Each value is a field element stored in canonical (non-Montgomery) integer form, in
+    // little-endian byte order.
+    repeated bytes values = 1;
+  }
 
-  // The leaf-to-root Merkle path, excluding the root hash.
+  // The opened leaves, one for every distinct opened position, in increasing position order.
+  repeated Leaf leaves = 1;
+
+  // The sibling hashes that the verifier can't compute from the opened leaves, in the order in
+  // which it consumes them.
   //
-  // The first element is the hash of the sibling leaf, the second element is the sibling of the
-  // parent node, and so on until the sibling of the child of the root. Each hash is stored as a 32
-  // byte sequence. The root hash is not stored here because the root hashes of all polynomial
-  // batches are sent separately in the `Commitment`.
-  repeated bytes merkle_path = 2;
+  // The verifier walks the tree bottom-up, starting from the hashes of the opened leaves. At every
+  // level it goes through the known nodes in increasing position order: a node whose sibling is
+  // known too is hashed together with it, otherwise its sibling is the next hash of this list.
+  // Either way, the parent of the node at position `p` is at position `p >> 1` of the next level.
+  //
+  // Each hash is stored as a 32 byte sequence. The root hash is not stored here because the root
+  // hashes of all polynomial batches are sent separately in the `Commitment`.
+  repeated bytes siblings = 2;
 }
 
 // A FRI query.
@@ -202,13 +217,10 @@ message Proof {
   // little-endian byte order.
   repeated bytes folded_quotient = 11;
 
-  message Opening {
-    repeated MerkleProof proofs = 1;
-  }
-
-  // Merkle proofs for the points at the query positions, relative to the raw Merkle trees (not the
-  // FRI folds). There's one entry for every FRI query (`openings.len() == queries.len()`).
-  repeated Opening openings = 12;
+  // Merkle multi-proofs for the points at the query positions, relative to the raw Merkle trees
+  // (not the FRI folds). There's one entry for every batch of the `Commitment`, in the same order,
+  // and each one opens the leaves at the indices of `queries`.
+  repeated MerkleMultiProof openings = 12;
 
   // FRI queries on the combined DEEP quotient, that is the random linear combination of the DEEP
   // quotients of all opened points. Every FRI leaf therefore holds exactly one value.

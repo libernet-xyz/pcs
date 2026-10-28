@@ -6,8 +6,9 @@ use primitive_types::{H256, U256, U512};
 use sha2::Digest;
 use starkom_ff::{Field, Field256};
 use std::any::TypeId;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
+use std::ops::Range;
 use std::sync::{LazyLock, Mutex};
 
 fn make_leaf_dst(modulus: U512) -> U256 {
@@ -161,6 +162,9 @@ pub(crate) fn verify_path<H: MerkleHasher>(
 /// it doesn't store the lookup key and the root hash anywhere because those pieces of information
 /// are reconstructed separately during the verification of a whole [`Proof`](`crate::deep::Proof`).
 /// In particular, all root hashes are stored in the [`Commitment`](`crate::deep::Commitment`).
+///
+/// The proofs of several leaves of the same tree are serialized together, into a single
+/// [`MerkleMultiProof`](`proto::MerkleMultiProof`) (see [`Self::to_proto`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Proof<F: Field256, H: Hasher<F>> {
     leaf: Vec<F>,
@@ -186,40 +190,176 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
         verify_path::<H>(leaf, self.path.as_slice(), index, root_hash)
     }
 
-    /// Serializes this Merkle proof to a [`MerkleProof`](`proto::MerkleProof`) protobuf.
-    pub(crate) fn to_proto(&self) -> proto::MerkleProof {
-        proto::MerkleProof {
-            leaf_values: self
-                .leaf
+    /// Serializes the Merkle proofs of several leaves of the same tree to a single
+    /// [`MerkleMultiProof`](`proto::MerkleMultiProof`) protobuf.
+    ///
+    /// `proofs` contains the opened positions along with their proofs, in any order. A position can
+    /// appear more than once, in which case its proofs are the same and only one of them is
+    /// serialized.
+    ///
+    /// The multi-proof omits every sibling hash that the verifier can compute from the opened
+    /// leaves, so the remaining ones are taken from the Merkle paths without any hashing.
+    ///
+    /// REQUIRES: all the proofs must belong to the same tree, so their Merkle paths must have the
+    /// same length `h` and all the positions must be less than `2^h`.
+    pub(crate) fn to_proto<'a>(
+        proofs: impl IntoIterator<Item = (usize, &'a Self)>,
+    ) -> proto::MerkleMultiProof
+    where
+        Self: 'a,
+    {
+        let proofs: BTreeMap<usize, &Self> = proofs.into_iter().collect();
+        let height = proofs.values().next().map_or(0, |proof| proof.path.len());
+        assert!(
+            proofs
                 .iter()
-                .map(|&value| value.to_le_bytes().to_vec())
-                .collect(),
-            merkle_path: self
-                .path
-                .iter()
-                .map(|&hash| hash.as_bytes().to_vec())
-                .collect(),
+                .all(|(&position, proof)| proof.path.len() == height && position >> height == 0)
+        );
+        let leaves = proofs
+            .values()
+            .map(|proof| proto::merkle_multi_proof::Leaf {
+                values: proof
+                    .leaf
+                    .iter()
+                    .map(|&value| value.to_le_bytes().to_vec())
+                    .collect(),
+            })
+            .collect();
+        let mut siblings = vec![];
+        // The known nodes of the current level in increasing position order, each one along with
+        // the proof of a leaf below it. The sibling of the node is in the Merkle path of that leaf.
+        let mut nodes: Vec<(usize, &Self)> = proofs.into_iter().collect();
+        for level in 0..height {
+            let mut parents = Vec::with_capacity(nodes.len());
+            let mut i = 0;
+            while i < nodes.len() {
+                let (position, proof) = nodes[i];
+                if i + 1 < nodes.len() && nodes[i + 1].0 == position ^ 1 {
+                    i += 2;
+                } else {
+                    siblings.push(proof.path[level].as_bytes().to_vec());
+                    i += 1;
+                }
+                parents.push((position >> 1, proof));
+            }
+            nodes = parents;
         }
+        proto::MerkleMultiProof { leaves, siblings }
     }
 
-    /// Deserializes a Merkle proof from a [`MerkleProof`](`proto::MerkleProof`) protobuf.
+    /// Deserializes the Merkle proofs of several leaves of the same tree from a
+    /// [`MerkleMultiProof`](`proto::MerkleMultiProof`) protobuf.
     ///
-    /// NOTE: this method does not validate the proof, it only deserializes it. The caller must
-    /// invoke [`Self::verify`] separately.
-    pub(crate) fn from_proto(proto: &proto::MerkleProof) -> Result<Self> {
-        Ok(Self {
-            leaf: proto
-                .leaf_values
-                .iter()
-                .map(|value| utils::load_scalar(value.as_slice()))
-                .collect::<Result<_>>()?,
-            path: proto
-                .merkle_path
-                .iter()
-                .map(|hash| H::load_hash(hash.as_slice()))
-                .collect::<Result<_>>()?,
-            _data: PhantomData,
-        })
+    /// `indices` contains the opened positions, in any order and possibly with repetitions, and
+    /// `height` is the height of the tree, that is the length of every Merkle path. The returned
+    /// vector contains one proof for every entry of `indices`, in the same order.
+    ///
+    /// The Merkle paths are reconstructed by hashing the opened leaves and the siblings of the
+    /// multi-proof up to, but excluding, the root. An error is returned if any of the indices is
+    /// out of range, if there isn't exactly one leaf for every distinct index, if there are missing
+    /// or extra siblings, or if any of the values or hashes is malformed.
+    ///
+    /// NOTE: this method does not validate the proofs, it only deserializes them. The caller must
+    /// invoke [`Self::verify`] separately on each of them.
+    pub(crate) fn from_proto(
+        proto: &proto::MerkleMultiProof,
+        indices: &[usize],
+        height: usize,
+    ) -> Result<Vec<Self>> {
+        if let Some(index) = indices.iter().find(|&&index| index >> height != 0) {
+            return Err(anyhow!(
+                "invalid index {index}: the tree has {} leaves",
+                1usize << height
+            ));
+        }
+        let positions: Vec<usize> = indices
+            .iter()
+            .copied()
+            .collect::<BTreeSet<usize>>()
+            .into_iter()
+            .collect();
+        if proto.leaves.len() != positions.len() {
+            return Err(anyhow!(
+                "incorrect number of leaves (got {}, want {})",
+                proto.leaves.len(),
+                positions.len()
+            ));
+        }
+        let leaves: Vec<Vec<F>> = proto
+            .leaves
+            .iter()
+            .map(|leaf| {
+                leaf.values
+                    .iter()
+                    .map(|value| utils::load_scalar(value.as_slice()))
+                    .collect::<Result<_>>()
+            })
+            .collect::<Result<_>>()?;
+        let mut siblings = proto
+            .siblings
+            .iter()
+            .map(|hash| H::load_hash(hash.as_slice()));
+        let mut paths = vec![Vec::with_capacity(height); positions.len()];
+        let dst = get_leaf_dst::<F>();
+        // The known nodes of the current level in increasing position order, each one along with
+        // its hash and the range of the leaves below it.
+        let mut nodes: Vec<(usize, H256, Range<usize>)> = positions
+            .iter()
+            .zip(&leaves)
+            .enumerate()
+            .map(|(i, (&position, leaf))| {
+                let hash = hash_leaf::<F, H>(dst, leaf.iter().copied());
+                (position, hash, i..(i + 1))
+            })
+            .collect();
+        for _ in 0..height {
+            let mut parents = Vec::with_capacity(nodes.len());
+            let mut i = 0;
+            while i < nodes.len() {
+                let (position, hash, ref range) = nodes[i];
+                if i + 1 < nodes.len() && nodes[i + 1].0 == position ^ 1 {
+                    let (_, right_hash, ref right_range) = nodes[i + 1];
+                    for path in &mut paths[range.clone()] {
+                        path.push(right_hash);
+                    }
+                    for path in &mut paths[right_range.clone()] {
+                        path.push(hash);
+                    }
+                    let parent = H::hash_binary(hash, right_hash);
+                    parents.push((position >> 1, parent, range.start..right_range.end));
+                    i += 2;
+                } else {
+                    let sibling = siblings
+                        .next()
+                        .ok_or_else(|| anyhow!("missing sibling hashes"))??;
+                    for path in &mut paths[range.clone()] {
+                        path.push(sibling);
+                    }
+                    let parent = if position & 1 != 0 {
+                        H::hash_binary(sibling, hash)
+                    } else {
+                        H::hash_binary(hash, sibling)
+                    };
+                    parents.push((position >> 1, parent, range.clone()));
+                    i += 1;
+                }
+            }
+            nodes = parents;
+        }
+        if siblings.next().is_some() {
+            return Err(anyhow!("too many sibling hashes"));
+        }
+        Ok(indices
+            .iter()
+            .map(|index| {
+                let rank = positions.binary_search(index).unwrap();
+                Self {
+                    leaf: leaves[rank].clone(),
+                    path: paths[rank].clone(),
+                    _data: PhantomData,
+                }
+            })
+            .collect())
     }
 }
 
@@ -1000,21 +1140,61 @@ mod tests {
         test_all_proofs_verify_impl::<GL4, Keccak256Hash<GL4>>();
     }
 
+    /// The positions opened by most multi-proof tests: 2 and 3 are siblings, 6 isn't a sibling of
+    /// either of them.
+    const SAMPLE_POSITIONS: [usize; 3] = [6, 2, 3];
+
+    /// Serializes the proofs of the given positions of `tree` into a multi-proof.
+    fn make_multi_proof<F: Field256, H: Hasher<F>>(
+        tree: &Tree<F, H>,
+        positions: &[usize],
+    ) -> proto::MerkleMultiProof {
+        let proofs: Vec<Proof<F, H>> = positions
+            .iter()
+            .map(|&position| tree.query(position))
+            .collect();
+        Proof::to_proto(positions.iter().copied().zip(&proofs))
+    }
+
+    /// Converts small integers into a serialized leaf of a multi-proof.
+    fn make_leaf_proto(values: &[u16]) -> proto::merkle_multi_proof::Leaf {
+        proto::merkle_multi_proof::Leaf {
+            values: make_values::<BS>(values)
+                .iter()
+                .map(|value| value.to_le_bytes().to_vec())
+                .collect(),
+        }
+    }
+
     #[test]
-    fn test_proof_to_proto() {
+    fn test_multi_proof_to_proto() {
         let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
-        let proof = tree.query(2);
-        let proto = proof.to_proto();
+        let proto = make_multi_proof(&tree, &[6, 2, 3, 6]);
         assert_eq!(
-            proto.leaf_values,
+            proto.leaves,
             [
-                BS::from(56u16).to_le_bytes().to_vec(),
-                BS::from(44u16).to_le_bytes().to_vec(),
-                BS::from(34u16).to_le_bytes().to_vec(),
+                make_leaf_proto(&[56, 44, 34]),
+                make_leaf_proto(&[78, 45, 12]),
+                make_leaf_proto(&[34, 48, 56]),
             ]
         );
         assert_eq!(
-            proto.merkle_path,
+            proto.siblings,
+            [
+                tree.hashes[7].as_bytes().to_vec(),
+                tree.hashes[8].as_bytes().to_vec(),
+                tree.hashes[8 + 2].as_bytes().to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_multi_proof_of_one_leaf_to_proto() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
+        let proto = make_multi_proof(&tree, &[2]);
+        assert_eq!(proto.leaves, [make_leaf_proto(&[56, 44, 34])]);
+        assert_eq!(
+            proto.siblings,
             [
                 tree.hashes[3].as_bytes().to_vec(),
                 tree.hashes[8].as_bytes().to_vec(),
@@ -1024,39 +1204,169 @@ mod tests {
     }
 
     #[test]
-    fn test_proof_from_proto() {
+    fn test_multi_proof_of_all_leaves_to_proto() {
         let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
-        let proof = tree.query(2);
-        let proto = proof.to_proto();
-        let decoded = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
-        assert_eq!(decoded, proof);
+        let proto = make_multi_proof(&tree, &[0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(proto.leaves.len(), 8);
+        assert!(proto.siblings.is_empty());
     }
 
     #[test]
-    fn test_proof_from_proto_with_non_canonical_value() {
+    fn test_multi_proof_of_no_leaves_to_proto() {
         let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
-        let mut proto = tree.query(2).to_proto();
+        let proto = make_multi_proof(&tree, &[]);
+        assert_eq!(proto, proto::MerkleMultiProof::default());
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_multi_proof_to_proto_with_out_of_range_position() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
+        let proof = tree.query(5);
+        Proof::to_proto([(5 + 8, &proof)]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_multi_proof_to_proto_with_different_trees() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
+        let other_tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&[&[12, 34]]));
+        let proof = tree.query(0);
+        let other_proof = other_tree.query(1);
+        Proof::to_proto([(0, &proof), (1, &other_proof)]);
+    }
+
+    fn test_multi_proof_from_proto_impl<F: Field256, H: Hasher<F> + PartialEq + Debug>(
+        indices: &[usize],
+    ) {
+        let tree = Tree::<F, H>::new(make_columns(&SAMPLE_COLUMNS));
+        let proto = make_multi_proof(&tree, indices);
+        let decoded = Proof::<F, H>::from_proto(&proto, indices, 3).unwrap();
+        let expected: Vec<Proof<F, H>> = indices.iter().map(|&index| tree.query(index)).collect();
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn test_multi_proof_from_proto() {
+        test_multi_proof_from_proto_impl::<BS, Sha2Hash<BS>>(&[6, 2, 3, 6]);
+        test_multi_proof_from_proto_impl::<BS, Sha2Hash<BS>>(&[5]);
+        test_multi_proof_from_proto_impl::<BS, Sha2Hash<BS>>(&[1, 0]);
+        test_multi_proof_from_proto_impl::<BS, Sha2Hash<BS>>(&[7, 0]);
+        test_multi_proof_from_proto_impl::<BS, Sha2Hash<BS>>(&[3, 0, 5, 6]);
+        test_multi_proof_from_proto_impl::<BS, Sha2Hash<BS>>(&[0, 1, 2, 3, 4, 5, 6, 7]);
+        test_multi_proof_from_proto_impl::<BS, Sha2Hash<BS>>(&[]);
+        test_multi_proof_from_proto_impl::<BS, Keccak256Hash<BS>>(&[6, 2, 3, 6]);
+        test_multi_proof_from_proto_impl::<GL4, Sha2Hash<GL4>>(&[6, 2, 3, 6]);
+        test_multi_proof_from_proto_impl::<GL4, Keccak256Hash<GL4>>(&[6, 2, 3, 6]);
+    }
+
+    #[test]
+    fn test_single_leaf_multi_proof_from_proto() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&[&[12], &[34]]));
+        let proto = make_multi_proof(&tree, &[0]);
+        let decoded = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto, &[0], 0).unwrap();
+        assert_eq!(decoded, [tree.query(0)]);
+    }
+
+    #[test]
+    fn test_multi_proof_from_proto_with_tampered_sibling() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
+        let mut proto = make_multi_proof(&tree, &SAMPLE_POSITIONS);
+        proto.siblings[1] = tree.hashes[9].as_bytes().to_vec();
+        let decoded = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto, &SAMPLE_POSITIONS, 3).unwrap();
+        assert!(decoded[0].verify(6, tree.root_hash()).is_err());
+        assert!(decoded[1].verify(2, tree.root_hash()).is_err());
+        assert!(decoded[2].verify(3, tree.root_hash()).is_err());
+    }
+
+    #[test]
+    fn test_multi_proof_from_proto_with_tampered_leaf() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
+        let mut proto = make_multi_proof(&tree, &SAMPLE_POSITIONS);
+        proto.leaves[2] = make_leaf_proto(&[34, 48, 57]);
+        let decoded = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto, &SAMPLE_POSITIONS, 3).unwrap();
+        assert!(decoded[0].verify(6, tree.root_hash()).is_err());
+        assert!(decoded[1].verify(2, tree.root_hash()).is_err());
+        assert!(decoded[2].verify(3, tree.root_hash()).is_err());
+    }
+
+    #[test]
+    fn test_multi_proof_from_proto_with_out_of_range_index() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
+        let proto = make_multi_proof(&tree, &SAMPLE_POSITIONS);
+        let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto, &[6, 2, 3 + 8], 3);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_multi_proof_from_proto_with_missing_leaf() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
+        let mut proto = make_multi_proof(&tree, &SAMPLE_POSITIONS);
+        proto.leaves.pop();
+        let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto, &SAMPLE_POSITIONS, 3);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_multi_proof_from_proto_with_extra_leaf() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
+        let mut proto = make_multi_proof(&tree, &SAMPLE_POSITIONS);
+        proto.leaves.push(make_leaf_proto(&[90, 46, 90]));
+        let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto, &SAMPLE_POSITIONS, 3);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_multi_proof_from_proto_with_missing_sibling() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
+        let mut proto = make_multi_proof(&tree, &SAMPLE_POSITIONS);
+        proto.siblings.pop();
+        let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto, &SAMPLE_POSITIONS, 3);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_multi_proof_from_proto_with_extra_sibling() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
+        let mut proto = make_multi_proof(&tree, &SAMPLE_POSITIONS);
+        proto.siblings.push(tree.hashes[0].as_bytes().to_vec());
+        let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto, &SAMPLE_POSITIONS, 3);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_multi_proof_from_proto_with_wrong_height() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
+        let proto = make_multi_proof(&tree, &SAMPLE_POSITIONS);
+        let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto, &SAMPLE_POSITIONS, 4);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_multi_proof_from_proto_with_non_canonical_value() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
+        let mut proto = make_multi_proof(&tree, &SAMPLE_POSITIONS);
         let modulus: U256 = BS::MODULUS.parse().unwrap();
-        proto.leaf_values[1] = modulus.to_little_endian().to_vec();
-        let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto);
+        proto.leaves[1].values[1] = modulus.to_little_endian().to_vec();
+        let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto, &SAMPLE_POSITIONS, 3);
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_proof_from_proto_with_long_value() {
+    fn test_multi_proof_from_proto_with_long_value() {
         let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
-        let mut proto = tree.query(2).to_proto();
-        proto.leaf_values[0].resize(33, 0);
-        let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto);
+        let mut proto = make_multi_proof(&tree, &SAMPLE_POSITIONS);
+        proto.leaves[0].values[0].resize(33, 0);
+        let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto, &SAMPLE_POSITIONS, 3);
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_proof_from_proto_with_short_hash() {
+    fn test_multi_proof_from_proto_with_short_hash() {
         let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
-        let mut proto = tree.query(2).to_proto();
-        proto.merkle_path[1].pop();
-        let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto);
+        let mut proto = make_multi_proof(&tree, &SAMPLE_POSITIONS);
+        proto.siblings[1].pop();
+        let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto, &SAMPLE_POSITIONS, 3);
         assert!(result.is_err());
     }
 }

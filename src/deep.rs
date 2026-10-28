@@ -789,11 +789,14 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
                 .iter()
                 .map(|coefficient| coefficient.to_le_bytes().to_vec())
                 .collect(),
-            openings: self
-                .openings
-                .iter()
-                .map(|proofs| proto::proof::Opening {
-                    proofs: proofs.iter().map(|proof| proof.to_proto()).collect(),
+            openings: (0..self.openings.first().map_or(0, Vec::len))
+                .map(|batch| {
+                    LeafProof::to_proto(
+                        self.queries
+                            .iter()
+                            .zip(&self.openings)
+                            .map(|(query, proofs)| (query.index(), &proofs[batch])),
+                    )
                 })
                 .collect(),
             queries: self.queries.iter().map(|query| query.to_proto()).collect(),
@@ -815,6 +818,38 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
             grinding_bits: proto.grinding_bits as usize,
         };
         options.validate::<F>()?;
+
+        let queries: Vec<fri::Query<F, H>> = proto
+            .queries
+            .iter()
+            .map(|query| {
+                fri::Query::from_proto(
+                    options.degree_bound,
+                    options.blowup_log2,
+                    options.fold_rate,
+                    options.max_rounds,
+                    query,
+                )
+            })
+            .collect::<Result<_>>()?;
+
+        let indices: Vec<usize> = queries.iter().map(fri::Query::index).collect();
+        let height = options.extended_domain_size().trailing_zeros() as usize;
+        let mut batches = proto
+            .openings
+            .iter()
+            .map(|opening| LeafProof::from_proto(opening, &indices, height).map(Vec::into_iter))
+            .collect::<Result<Vec<_>>>()?;
+        // `batches` has one entry for every batch, `openings` has one entry for every query.
+        let openings = indices
+            .iter()
+            .map(|_| {
+                batches
+                    .iter_mut()
+                    .map(|proofs| proofs.next().unwrap())
+                    .collect()
+            })
+            .collect();
 
         Ok(Self {
             options,
@@ -848,30 +883,8 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
                         .collect::<Result<_>>()?,
                 ),
             ),
-            openings: proto
-                .openings
-                .iter()
-                .map(|opening| {
-                    opening
-                        .proofs
-                        .iter()
-                        .map(LeafProof::from_proto)
-                        .collect::<Result<_>>()
-                })
-                .collect::<Result<_>>()?,
-            queries: proto
-                .queries
-                .iter()
-                .map(|query| {
-                    fri::Query::from_proto(
-                        options.degree_bound,
-                        options.blowup_log2,
-                        options.fold_rate,
-                        options.max_rounds,
-                        query,
-                    )
-                })
-                .collect::<Result<_>>()?,
+            openings,
+            queries,
         })
     }
 }
@@ -1075,6 +1088,13 @@ mod tests {
     const GROUND_OPTIONS: Options = Options {
         grinding_bits: 8,
         ..OPTIONS
+    };
+
+    /// Same as [`GROUND_OPTIONS`] but with a blowup factor of 64, so that the 20 queries open only
+    /// a few of the 256 leaves of the extended domain and the Merkle multi-proofs have siblings.
+    const LARGE_BLOWUP_OPTIONS: Options = Options {
+        blowup_log2: 6,
+        ..GROUND_OPTIONS
     };
 
     /// Two batches of polynomials of degree 3, the first with two polynomials and the second with
@@ -2634,8 +2654,29 @@ mod tests {
                 .to_le_bytes()
                 .to_vec()]
         );
-        assert_eq!(proto.openings.len(), 60);
+        // The 60 queries open all 16 leaves of the extended domain, so there are no siblings.
+        assert_eq!(proto.openings.len(), 2);
+        assert_eq!(proto.openings[0].leaves.len(), 16);
+        assert_eq!(proto.openings[0].leaves[0].values.len(), 2);
+        assert_eq!(proto.openings[0].siblings.len(), 0);
+        assert_eq!(proto.openings[1].leaves.len(), 16);
+        assert_eq!(proto.openings[1].leaves[0].values.len(), 1);
+        assert_eq!(proto.openings[1].siblings.len(), 0);
         assert_eq!(proto.queries.len(), 60);
+    }
+
+    #[test]
+    fn test_proof_to_proto_with_large_blowup() {
+        let (_, proof) = sample_proof(LARGE_BLOWUP_OPTIONS);
+        let proto = proof.to_proto();
+        // The 20 queries open 20 distinct leaves out of 256, and the multi-proof of each batch has
+        // 60 siblings rather than the 20 * 8 hashes of the separate Merkle paths.
+        assert_eq!(proto.openings.len(), 2);
+        assert_eq!(proto.openings[0].leaves.len(), 20);
+        assert_eq!(proto.openings[0].siblings.len(), 60);
+        assert_eq!(proto.openings[1].leaves.len(), 20);
+        assert_eq!(proto.openings[1].siblings.len(), 60);
+        assert_eq!(proto.queries.len(), 20);
     }
 
     #[test]
@@ -2655,6 +2696,73 @@ mod tests {
         let proof = Proof::<BS, Sha2Hash<BS>>::from_proto(&proof_proto).unwrap();
         let result = proof.verify(&commitment);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_accept_decoded_proof_with_large_blowup() {
+        let (commitment, proof) = sample_proof(LARGE_BLOWUP_OPTIONS);
+        let proof_proto = proof.to_proto();
+        let proof = Proof::<BS, Sha2Hash<BS>>::from_proto(&proof_proto).unwrap();
+        let result = proof.verify(&commitment);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_reject_decoded_proof_with_tampered_opening() {
+        let (commitment, proof) = sample_proof(LARGE_BLOWUP_OPTIONS);
+        let mut proof_proto = proof.to_proto();
+        proof_proto.openings[0].leaves[0].values[1] = BS::from_const(42).to_le_bytes().to_vec();
+        let proof = Proof::<BS, Sha2Hash<BS>>::from_proto(&proof_proto).unwrap();
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_decoded_proof_with_tampered_sibling() {
+        let (commitment, proof) = sample_proof(LARGE_BLOWUP_OPTIONS);
+        let mut proof_proto = proof.to_proto();
+        proof_proto.openings[1].siblings[0] = H256::repeat_byte(0x42).as_bytes().to_vec();
+        let proof = Proof::<BS, Sha2Hash<BS>>::from_proto(&proof_proto).unwrap();
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_decoded_proof_with_missing_batch() {
+        let (commitment, proof) = sample_proof(LARGE_BLOWUP_OPTIONS);
+        let mut proof_proto = proof.to_proto();
+        proof_proto.openings.pop();
+        let proof = Proof::<BS, Sha2Hash<BS>>::from_proto(&proof_proto).unwrap();
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_decoded_proof_with_swapped_batches() {
+        let (commitment, proof) = sample_proof(LARGE_BLOWUP_OPTIONS);
+        let mut proof_proto = proof.to_proto();
+        proof_proto.openings.swap(0, 1);
+        let proof = Proof::<BS, Sha2Hash<BS>>::from_proto(&proof_proto).unwrap();
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_proof_with_missing_opened_leaf() {
+        let (_, proof) = sample_proof(LARGE_BLOWUP_OPTIONS);
+        let mut proto = proof.to_proto();
+        proto.openings[0].leaves.pop();
+        let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_proof_with_extra_sibling() {
+        let (_, proof) = sample_proof(LARGE_BLOWUP_OPTIONS);
+        let mut proto = proof.to_proto();
+        proto.openings[1].siblings.push(vec![0; 32]);
+        let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto);
+        assert!(result.is_err());
     }
 
     #[test]
