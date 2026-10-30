@@ -21,14 +21,14 @@ prost = "0.14.4"
 prost-types = "0.14.4"
 sha2 = "0.11.1"
 sha3 = "0.12.0"
-starkom-ff = "4.2.0"
-starkom-poly = "4.6.2"
-starkom-poseidon = "5.1.2"
-starkom-poseidon2 = "7.1.1"
+starkom-ff = "4.2.1"
+starkom-poly = "4.6.3"
+starkom-poseidon = "5.1.3"
+starkom-poseidon2 = "7.1.2"
 
 [dev-dependencies]
-starkom-bluesky = "3.8.0"
-starkom-goldilocks = "3.4.1"
+starkom-bluesky = "3.9.0"
+starkom-goldilocks = "3.4.2"
 
 [build-dependencies]
 prost-build = "0.14.4"
