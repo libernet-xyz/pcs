@@ -12,9 +12,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 use std::sync::LazyLock;
 
-/// Target security level in bits.
-pub const LAMBDA: usize = 128;
-
 /// The number of bits of a proof-of-work hash, which is also the most leading zero bits it can
 /// have.
 pub const PROOF_OF_WORK_BITS: usize = 256;
@@ -39,13 +36,13 @@ static QUOTIENT_DST: LazyLock<H256> = LazyLock::new(|| utils::make_dst(b"starkom
 /// Domain separator tag for the proof-of-work hash used for grinding.
 static POW_DST: LazyLock<H256> = LazyLock::new(|| utils::make_dst(b"starkom/deep/pow"));
 
-/// Returns the number of FRI queries required to achieve 128-bit security using a blowup factor of
-/// `2^blowup_log2` and `grinding_bits` bits of grinding.
+/// Returns the number of FRI queries required to achieve `security_bits` bits of security using a
+/// blowup factor of `2^blowup_log2` and `grinding_bits` bits of grinding.
 ///
 /// Every query provides `blowup_log2` bits of security and grinding provides the rest. At least
 /// one query is always required.
-pub fn num_queries(blowup_log2: usize, grinding_bits: usize) -> usize {
-    LAMBDA
+pub fn num_queries(security_bits: usize, blowup_log2: usize, grinding_bits: usize) -> usize {
+    security_bits
         .saturating_sub(grinding_bits)
         .div_ceil(blowup_log2)
         .max(1)
@@ -63,6 +60,16 @@ pub struct Options {
     /// Honest provers commit polynomials of degree strictly less than this value, but a valid proof
     /// only guarantees a degree at most equal to it (see [`Proof::verify`]).
     pub degree_bound: usize,
+
+    /// The target security level in bits.
+    ///
+    /// Every FRI query provides [`blowup_log2`](`Self::blowup_log2`) bits of security and grinding
+    /// provides [`grinding_bits`](`Self::grinding_bits`), so a proof has the smallest number of
+    /// queries that reaches this many bits (see [`num_queries`]). Any value is valid.
+    ///
+    /// The prover chooses it, so verifiers must check it against the expected one (see
+    /// [`Self::satisfies`]).
+    pub security_bits: usize,
 
     /// The base-2 logarithm of the blowup factor, which must be greater than 0.
     ///
@@ -103,8 +110,9 @@ pub struct Options {
     /// grinding save one FRI query (see [`num_queries`]). 0 disables grinding.
     ///
     /// Must be at most [`PROOF_OF_WORK_BITS`], the number of bits of the proof-of-work hash,
-    /// because no hash can satisfy more (see [`Self::validate`]). Values above [`LAMBDA`] are valid
-    /// but save no further queries, because at least one query is always required.
+    /// because no hash can satisfy more (see [`Self::validate`]). Values above
+    /// [`security_bits`](`Self::security_bits`) are valid but save no further queries, because at
+    /// least one query is always required.
     pub grinding_bits: usize,
 }
 
@@ -116,10 +124,11 @@ impl Options {
         self.degree_bound << self.blowup_log2
     }
 
-    /// Returns the number of FRI queries required to achieve 128-bit security with these options
-    /// (see [`num_queries`]).
+    /// Returns the number of FRI queries required to achieve
+    /// [`security_bits`](`Self::security_bits`) bits of security with these options (see
+    /// [`num_queries`]).
     pub fn num_queries(&self) -> usize {
-        num_queries(self.blowup_log2, self.grinding_bits)
+        num_queries(self.security_bits, self.blowup_log2, self.grinding_bits)
     }
 
     /// Returns the number of FRI folding rounds (see [`Self::max_rounds`]), which is also the
@@ -131,15 +140,18 @@ impl Options {
     }
 
     /// Returns true iff these options are acceptable to a verifier that expects `other`: the
-    /// number of grinding bits must be greater than or equal to the expected one, and all other
-    /// parameters must be equal.
+    /// security level and the number of grinding bits must be greater than or equal to the expected
+    /// ones, and all other parameters must be equal.
     ///
-    /// Soundness doesn't depend on the number of grinding bits because the number of queries is
-    /// derived from it (see [`num_queries`]), but more grinding bits mean fewer queries, so a proof
-    /// with more grinding bits than expected is never more expensive to verify.
+    /// The number of queries is derived from both (see [`num_queries`]), so a proof with a higher
+    /// security level than expected is at least as sound. Soundness doesn't depend on the number of
+    /// grinding bits, but more grinding bits mean fewer queries, so a proof with more grinding bits
+    /// than expected is never more expensive to verify.
     pub fn satisfies(&self, other: &Self) -> bool {
-        self.grinding_bits >= other.grinding_bits
+        self.security_bits >= other.security_bits
+            && self.grinding_bits >= other.grinding_bits
             && Self {
+                security_bits: other.security_bits,
                 grinding_bits: other.grinding_bits,
                 ..*self
             }
@@ -150,7 +162,8 @@ impl Options {
     ///
     /// The degree bound must be a power of 2, `blowup_log2` and `fold_rate` must be greater than 0,
     /// the size of the extended evaluation domain must not exceed the 2-adicity of `F::BaseField`,
-    /// and `grinding_bits` must not exceed [`PROOF_OF_WORK_BITS`]. `max_rounds` can have any value.
+    /// and `grinding_bits` must not exceed [`PROOF_OF_WORK_BITS`]. `security_bits` and `max_rounds`
+    /// can have any value.
     pub fn validate<F: Field>(&self) -> Result<()> {
         if !self.degree_bound.is_power_of_two() {
             return Err(anyhow!(
@@ -574,9 +587,9 @@ pub struct Proof<F: Field256, H: Hasher<F>> {
     /// (`openings.len() == queries.len()`), and the inner arrays contain one proof for every Merkle
     /// tree.
     openings: Vec<Vec<LeafProof<F, H>>>,
-    /// FRI queries on the combined DEEP quotient (see [`Prover::prove`]). The number of queries
-    /// is calculated by [`num_queries`] above and is tuned to achieve 128-bit security together
-    /// with grinding.
+    /// FRI queries on the combined DEEP quotient (see [`Prover::prove`]). The number of queries is
+    /// calculated by [`num_queries`] above and is tuned to achieve [`Options::security_bits`] bits
+    /// of security together with grinding.
     queries: Vec<fri::Query<F, H>>,
 }
 
@@ -584,9 +597,10 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
     /// Returns the protocol parameters used in the proof.
     ///
     /// Callers must check them against the expected ones, typically with [`Options::satisfies`].
-    /// Note that soundness doesn't depend on the number of grinding bits because the number of
-    /// queries is automatically derived from it, but it should still be checked along with the
-    /// other parameters.
+    /// In particular the security level is chosen by the prover, so a proof that isn't checked can
+    /// have as few as one query. Soundness doesn't depend on the number of grinding bits because
+    /// the number of queries is automatically derived from it, but it should still be checked
+    /// along with the other parameters.
     pub fn options(&self) -> &Options {
         &self.options
     }
@@ -664,6 +678,24 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
             }
         }
 
+        // The number of queries must be checked before deriving the query indices, so that the work
+        // of deriving them is bounded by the size of the proof even if its security level is huge.
+        let num_queries = self.options.num_queries();
+        if self.openings.len() != num_queries {
+            return Err(anyhow!(
+                "incorrect number of openings (got {}, want {})",
+                self.openings.len(),
+                num_queries
+            ));
+        }
+        if self.queries.len() != num_queries {
+            return Err(anyhow!(
+                "incorrect number of queries (got {}, want {})",
+                self.queries.len(),
+                num_queries
+            ));
+        }
+
         let seed = query_seed::<F, H>(
             commitment.tree_roots(),
             self.num_polys,
@@ -675,20 +707,6 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
             return Err(anyhow!("insufficient proof of work"));
         }
         let indices = get_query_indices::<F, H>(pow, &self.options);
-        if self.openings.len() != indices.len() {
-            return Err(anyhow!(
-                "incorrect number of openings (got {}, want {})",
-                self.openings.len(),
-                indices.len()
-            ));
-        }
-        if self.queries.len() != indices.len() {
-            return Err(anyhow!(
-                "incorrect number of queries (got {}, want {})",
-                self.queries.len(),
-                indices.len()
-            ));
-        }
 
         let (alpha, beta) =
             deep_challenges::<F, H>(commitment.tree_roots(), self.num_polys, &self.points);
@@ -759,6 +777,7 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
         proto::Proof {
             hash_backend: Some(Any::from_msg(&H::ProtoTag::default()).unwrap()),
             degree_bound: self.options.degree_bound as u64,
+            security_bits: self.options.security_bits as u32,
             blowup_log2: self.options.blowup_log2 as u32,
             fold_rate: self.options.fold_rate as u32,
             max_rounds: self.options.max_rounds as u64,
@@ -809,6 +828,7 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
 
         let options = Options {
             degree_bound: proto.degree_bound as usize,
+            security_bits: proto.security_bits as usize,
             blowup_log2: proto.blowup_log2 as usize,
             fold_rate: proto.fold_rate as usize,
             max_rounds: proto.max_rounds as usize,
@@ -1065,6 +1085,7 @@ mod tests {
     /// The protocol parameters used in most tests.
     const OPTIONS: Options = Options {
         degree_bound: 4,
+        security_bits: 128,
         blowup_log2: 2,
         fold_rate: 1,
         max_rounds: usize::MAX,
@@ -1165,38 +1186,58 @@ mod tests {
         );
     }
 
-    fn test_num_queries_impl(blowup_log2: usize, grinding_bits: usize, expected: usize) {
-        let result = num_queries(blowup_log2, grinding_bits);
+    fn test_num_queries_impl(
+        security_bits: usize,
+        blowup_log2: usize,
+        grinding_bits: usize,
+        expected: usize,
+    ) {
+        let result = num_queries(security_bits, blowup_log2, grinding_bits);
         assert_eq!(result, expected);
     }
 
     #[test]
     fn test_num_queries_without_grinding() {
-        test_num_queries_impl(1, 0, 128);
-        test_num_queries_impl(4, 0, 32);
-        test_num_queries_impl(6, 0, 22);
+        test_num_queries_impl(128, 1, 0, 128);
+        test_num_queries_impl(128, 4, 0, 32);
+        test_num_queries_impl(128, 6, 0, 22);
     }
 
     #[test]
     fn test_num_queries_with_grinding() {
-        test_num_queries_impl(4, 1, 32);
-        test_num_queries_impl(4, 4, 31);
-        test_num_queries_impl(4, 20, 27);
-        test_num_queries_impl(6, 20, 18);
+        test_num_queries_impl(128, 4, 1, 32);
+        test_num_queries_impl(128, 4, 4, 31);
+        test_num_queries_impl(128, 4, 20, 27);
+        test_num_queries_impl(128, 6, 20, 18);
     }
 
     #[test]
     fn test_num_queries_with_full_grinding() {
-        test_num_queries_impl(4, 128, 1);
-        test_num_queries_impl(4, 256, 1);
-        test_num_queries_impl(4, 257, 1);
-        test_num_queries_impl(4, usize::MAX, 1);
+        test_num_queries_impl(128, 4, 128, 1);
+        test_num_queries_impl(128, 4, 256, 1);
+        test_num_queries_impl(128, 4, 257, 1);
+        test_num_queries_impl(128, 4, usize::MAX, 1);
+    }
+
+    #[test]
+    fn test_num_queries_with_different_security_levels() {
+        test_num_queries_impl(0, 4, 0, 1);
+        test_num_queries_impl(1, 4, 0, 1);
+        test_num_queries_impl(64, 4, 0, 16);
+        test_num_queries_impl(96, 1, 26, 70);
+        test_num_queries_impl(100, 3, 0, 34);
+        test_num_queries_impl(256, 4, 0, 64);
+        test_num_queries_impl(256, 4, 20, 59);
+        test_num_queries_impl(256, 8, 20, 30);
+        test_num_queries_impl(256, 4, 250, 2);
+        test_num_queries_impl(256, 4, 256, 1);
     }
 
     #[test]
     fn test_options_extended_domain_size() {
         let options = Options {
             degree_bound: 4096,
+            security_bits: 128,
             blowup_log2: 6,
             fold_rate: 1,
             max_rounds: usize::MAX,
@@ -1209,6 +1250,7 @@ mod tests {
     fn test_options_num_queries_without_grinding() {
         let options = Options {
             degree_bound: 4096,
+            security_bits: 128,
             blowup_log2: 6,
             fold_rate: 1,
             max_rounds: usize::MAX,
@@ -1221,12 +1263,33 @@ mod tests {
     fn test_options_num_queries_with_grinding() {
         let options = Options {
             degree_bound: 4096,
+            security_bits: 128,
             blowup_log2: 6,
             fold_rate: 1,
             max_rounds: usize::MAX,
             grinding_bits: 20,
         };
         assert_eq!(options.num_queries(), 18);
+    }
+
+    fn test_options_num_queries_impl(security_bits: usize, grinding_bits: usize, expected: usize) {
+        let options = Options {
+            degree_bound: 4096,
+            security_bits,
+            blowup_log2: 6,
+            fold_rate: 1,
+            max_rounds: usize::MAX,
+            grinding_bits,
+        };
+        assert_eq!(options.num_queries(), expected);
+    }
+
+    #[test]
+    fn test_options_num_queries_with_different_security_levels() {
+        test_options_num_queries_impl(64, 0, 11);
+        test_options_num_queries_impl(64, 20, 8);
+        test_options_num_queries_impl(256, 0, 43);
+        test_options_num_queries_impl(256, 20, 40);
     }
 
     fn test_options_num_rounds_impl(
@@ -1237,6 +1300,7 @@ mod tests {
     ) {
         let options = Options {
             degree_bound,
+            security_bits: 128,
             blowup_log2: 6,
             fold_rate,
             max_rounds,
@@ -1271,6 +1335,7 @@ mod tests {
     ) {
         let options = Options {
             degree_bound,
+            security_bits: 128,
             blowup_log2,
             fold_rate,
             max_rounds: usize::MAX,
@@ -1288,6 +1353,7 @@ mod tests {
     ) {
         let options = Options {
             degree_bound,
+            security_bits: 128,
             blowup_log2,
             fold_rate,
             max_rounds: usize::MAX,
@@ -1364,6 +1430,7 @@ mod tests {
     /// The protocol parameters expected by the verifier in the `Options::satisfies` tests.
     const EXPECTED_OPTIONS: Options = Options {
         degree_bound: 4096,
+        security_bits: 128,
         blowup_log2: 6,
         fold_rate: 3,
         max_rounds: 2,
@@ -1411,11 +1478,46 @@ mod tests {
         assert!(!options.satisfies(&EXPECTED_OPTIONS));
     }
 
+    #[test]
+    fn test_options_with_higher_security_level_satisfy() {
+        let options = Options {
+            security_bits: 256,
+            ..EXPECTED_OPTIONS
+        };
+        assert!(options.satisfies(&EXPECTED_OPTIONS));
+    }
+
+    #[test]
+    fn test_options_with_lower_security_level_dont_satisfy() {
+        let options = Options {
+            security_bits: 127,
+            ..EXPECTED_OPTIONS
+        };
+        assert!(!options.satisfies(&EXPECTED_OPTIONS));
+    }
+
+    #[test]
+    fn test_options_with_higher_security_level_and_fewer_grinding_bits_dont_satisfy() {
+        let options = Options {
+            security_bits: 256,
+            grinding_bits: 19,
+            ..EXPECTED_OPTIONS
+        };
+        assert!(!options.satisfies(&EXPECTED_OPTIONS));
+    }
+
     fn test_options_dont_satisfy_impl(options: Options) {
         assert!(!options.satisfies(&EXPECTED_OPTIONS));
         assert!(
             !Options {
                 grinding_bits: 21,
+                ..options
+            }
+            .satisfies(&EXPECTED_OPTIONS)
+        );
+        assert!(
+            !Options {
+                security_bits: 256,
                 ..options
             }
             .satisfies(&EXPECTED_OPTIONS)
@@ -1526,6 +1628,7 @@ mod tests {
     fn test_query_indices() {
         let options = Options {
             degree_bound: 4,
+            security_bits: 128,
             blowup_log2: 4,
             fold_rate: 1,
             max_rounds: usize::MAX,
@@ -1652,6 +1755,7 @@ mod tests {
         Committer::<BS, Sha2Hash<BS>>::new(
             Options {
                 degree_bound: 6,
+                security_bits: 128,
                 blowup_log2: 2,
                 fold_rate: 1,
                 max_rounds: usize::MAX,
@@ -2009,6 +2113,32 @@ mod tests {
         assert_eq!(proof.queries.len(), 60);
     }
 
+    fn test_proof_num_queries_impl(security_bits: usize, grinding_bits: usize, expected: usize) {
+        let options = Options {
+            security_bits,
+            grinding_bits,
+            ..OPTIONS
+        };
+        let (commitment, proof) = sample_proof(options);
+        let result = proof.verify(&commitment);
+        assert_eq!(proof.options().security_bits, security_bits);
+        assert_eq!(proof.openings.len(), expected);
+        assert_eq!(proof.queries.len(), expected);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_proof_num_queries_with_different_security_levels() {
+        test_proof_num_queries_impl(0, 0, 1);
+        test_proof_num_queries_impl(3, 0, 2);
+        test_proof_num_queries_impl(64, 0, 32);
+        test_proof_num_queries_impl(128, 0, 64);
+        test_proof_num_queries_impl(256, 0, 128);
+        test_proof_num_queries_impl(8, 8, 1);
+        test_proof_num_queries_impl(128, 8, 60);
+        test_proof_num_queries_impl(256, 8, 124);
+    }
+
     fn test_honest_proof_impl<F: Field256, H: Hasher<F>>(
         batches: &[&[&[u64]]],
         points: &[u64],
@@ -2163,6 +2293,7 @@ mod tests {
             &[123],
             Options {
                 degree_bound: 1,
+                security_bits: 128,
                 blowup_log2: 1,
                 fold_rate: 1,
                 max_rounds: usize::MAX,
@@ -2186,6 +2317,7 @@ mod tests {
             &[123],
             Options {
                 degree_bound: 1,
+                security_bits: 128,
                 blowup_log2: 3,
                 fold_rate: 1,
                 max_rounds: usize::MAX,
@@ -2554,6 +2686,32 @@ mod tests {
     }
 
     #[test]
+    fn test_reject_overstated_security_level() {
+        let (commitment, mut proof) = sample_proof(OPTIONS);
+        proof.options.security_bits = 130;
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_understated_security_level() {
+        let (commitment, mut proof) = sample_proof(OPTIONS);
+        proof.options.security_bits = 126;
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
+    }
+
+    /// Deriving the query indices before checking the number of queries would try to derive 2^63
+    /// indices here.
+    #[test]
+    fn test_reject_huge_security_level() {
+        let (commitment, mut proof) = sample_proof(OPTIONS);
+        proof.options.security_bits = usize::MAX;
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_reject_unsatisfiable_grinding() {
         let (commitment, mut proof) = sample_proof(GROUND_OPTIONS);
         proof.options.grinding_bits = 257;
@@ -2594,6 +2752,7 @@ mod tests {
         let (_, proof) = sample_proof(GROUND_OPTIONS);
         let proto = proof.to_proto();
         assert_eq!(proto.degree_bound, 4);
+        assert_eq!(proto.security_bits, 128);
         assert_eq!(proto.blowup_log2, 2);
         assert_eq!(proto.fold_rate, 1);
         assert_eq!(proto.max_rounds, u64::MAX);
@@ -2644,6 +2803,15 @@ mod tests {
         let proto = proof.to_proto();
         let decoded = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
         assert_eq!(decoded.to_proto(), proto);
+    }
+
+    #[test]
+    fn test_proof_security_level_from_proto() {
+        let (_, proof) = sample_proof(OPTIONS);
+        let mut proto = proof.to_proto();
+        proto.security_bits = 256;
+        let decoded = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
+        assert_eq!(decoded.options().security_bits, 256);
     }
 
     #[test]

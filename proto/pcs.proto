@@ -132,8 +132,16 @@ message Proof {
   // quotients (f(X) - f(z)) / (X - z) rather than that of the committed polynomials f(X).
   uint64 degree_bound = 2;
 
+  // The target security level in bits.
+  //
+  // Together with `blowup_log2` and `grinding_bits` it determines the number of FRI queries: every
+  // query provides `blowup_log2` bits of security and grinding provides the rest, so there are
+  // `max(1, ceil((security_bits - grinding_bits) / blowup_log2))` queries, with the subtraction
+  // clamped to 0. The prover chooses it, so verifiers must check that it's high enough.
+  uint32 security_bits = 3;
+
   // The base-2 logarithm of the blowup factor.
-  uint32 blowup_log2 = 3;
+  uint32 blowup_log2 = 4;
 
   // Number of FRI folds per round.
   //
@@ -142,7 +150,7 @@ message Proof {
   // corresponding Merkle tree.
   //
   // `fold_rate` must be greater than 0.
-  uint32 fold_rate = 4;
+  uint32 fold_rate = 5;
 
   // Maximum number of FRI folding rounds.
   //
@@ -150,20 +158,20 @@ message Proof {
   // `log2(degree_bound) / fold_rate`, rounded down. Rather than being folded further, the
   // polynomial resulting from the last round is sent in the clear (see `folded_quotient`). With 0
   // there's no folding at all and the whole DEEP quotient is sent in the clear.
-  uint64 max_rounds = 5;
+  uint64 max_rounds = 6;
 
   // Number of grinding bits.
   //
   // A nonce is valid if the proof-of-work hash, interpreted as a big-endian integer, has at least
   // this many leading zero bits. This also determines the number of queries, because grinding
   // provides part of the target security level.
-  uint32 grinding_bits = 6;
+  uint32 grinding_bits = 7;
 
   // The proof-of-work nonce found by the prover.
-  uint64 nonce = 7;
+  uint64 nonce = 8;
 
   // Number of committed polynomials.
-  uint64 num_polys = 8;
+  uint64 num_polys = 9;
 
   // A point opened by the proof.
   message Point {
@@ -179,7 +187,7 @@ message Proof {
   }
 
   // The points opened by the proof.
-  repeated Point points = 9;
+  repeated Point points = 10;
 
   // Merkle roots of the FRI folding argument, one for every folding round.
   //
@@ -189,7 +197,7 @@ message Proof {
   // if there are zero rounds.
   //
   // Each root hash is stored as a 32 byte sequence.
-  repeated bytes fri_roots = 10;
+  repeated bytes fri_roots = 11;
 
   // The coefficients of the DEEP quotient folded by all the FRI rounds, which is sent in the clear
   // rather than being folded further. With zero rounds this is the whole (unfolded) DEEP quotient.
@@ -200,7 +208,7 @@ message Proof {
   //
   // Each coefficient is a field element stored in canonical (non-Montgomery) integer form, in
   // little-endian byte order.
-  repeated bytes folded_quotient = 11;
+  repeated bytes folded_quotient = 12;
 
   message Opening {
     repeated MerkleProof proofs = 1;
@@ -208,9 +216,9 @@ message Proof {
 
   // Merkle proofs for the points at the query positions, relative to the raw Merkle trees (not the
   // FRI folds). There's one entry for every FRI query (`openings.len() == queries.len()`).
-  repeated Opening openings = 12;
+  repeated Opening openings = 13;
 
   // FRI queries on the combined DEEP quotient, that is the random linear combination of the DEEP
   // quotients of all opened points. Every FRI leaf therefore holds exactly one value.
-  repeated Query queries = 13;
+  repeated Query queries = 14;
 }
