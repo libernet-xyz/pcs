@@ -1,12 +1,12 @@
 [package]
 name = "starkom-pcs"
-version = "8.0.1"
+version = "9.0.0"
 description = "The DEEP-FRI polynomial commitment scheme used in Starkom."
 license = "Apache-2.0"
 repository = "https://github.com/libernet-xyz/pcs.git"
 readme = "README.md"
 edition = "2024"
-links = "starkom-pcs-v8"
+links = "starkom-pcs-v9"
 
 [package.metadata.docs.rs]
 all-features = true
@@ -19,16 +19,16 @@ anyhow = "1.0.104"
 primitive-types = "0.14.0"
 prost = "0.14.4"
 prost-types = "0.14.4"
-sha2 = "0.11.0"
+sha2 = "0.11.1"
 sha3 = "0.12.0"
-starkom-ff = "4.1.0"
-starkom-poly = "4.6.1"
-starkom-poseidon = "5.1.1"
-starkom-poseidon2 = "7.1.0"
+starkom-ff = "5.0.2"
+starkom-poly = "4.6.4"
+starkom-poseidon = "5.1.4"
+starkom-poseidon2 = "7.1.3"
 
 [dev-dependencies]
-starkom-bluesky = "3.7.2"
-starkom-goldilocks = "3.3.0"
+starkom-bluesky = "4.0.1"
+starkom-goldilocks = "4.0.0"
 
 [build-dependencies]
 prost-build = "0.14.4"

@@ -1,5 +1,5 @@
 use crate::hash::{Hasher, MerkleHasher};
-use crate::starkom::proto::pcs::v8 as proto;
+use crate::starkom::proto::pcs::v9 as proto;
 use crate::utils;
 use anyhow::{Result, anyhow};
 use primitive_types::{H256, U256, U512};
@@ -82,15 +82,85 @@ pub(crate) fn merklify<H: MerkleHasher>(mut hashes: &mut [H256], mut n: usize) {
     }
 }
 
+/// Computes the Merkle root of a set of values on the fly, without allocating space for the
+/// intermediate nodes.
+///
+/// The computed root is compatible with the one resulting from a call to [`merklify`] for the same
+/// values.
+///
+/// REQUIRES: `values.len()` must be a power of two.
+pub(crate) fn merkle_root<H: MerkleHasher>(values: &[H256]) -> H256 {
+    assert!(values.len().is_power_of_two());
+    match values.len() {
+        1 => values[0],
+        n => {
+            let m = n >> 1;
+            let left = merkle_root::<H>(&values[0..m]);
+            let right = merkle_root::<H>(&values[m..]);
+            H::hash_binary(left, right)
+        }
+    }
+}
+
+/// Returns the Merkle path of the leaf at `index`, that is the sibling hashes from the leaf up to,
+/// but excluding, the root.
+///
+/// `tree` must contain a full Merkle tree with `n` leaves, stored as described in [`merklify`]. `n`
+/// must be a power of two and `index` must be less than `n`.
+pub(crate) fn merkle_path(mut tree: &[H256], mut n: usize, mut index: usize) -> Vec<H256> {
+    assert!(n.is_power_of_two());
+    assert!(index < n);
+    let mut path = Vec::with_capacity(n.trailing_zeros() as usize);
+    while n > 1 {
+        path.push(tree[index ^ 1]);
+        tree = &tree[n..];
+        n /= 2;
+        index >>= 1;
+    }
+    path
+}
+
+/// Recomputes a Merkle root from a leaf and its Merkle path, and checks it against `root_hash`.
+///
+/// `leaf` is the 32-byte leaf at position `index`: the hash of the leaf values for vector leaves
+/// (see [`Proof`]), or the leaf itself for trees whose leaves are single 32-byte values, like the
+/// FRI ones.
+pub(crate) fn verify_path<H: MerkleHasher>(
+    leaf: H256,
+    path: &[H256],
+    mut index: usize,
+    root_hash: H256,
+) -> Result<()> {
+    let mut hash = leaf;
+    for &sibling in path {
+        hash = if index & 1 != 0 {
+            H::hash_binary(sibling, hash)
+        } else {
+            H::hash_binary(hash, sibling)
+        };
+        index >>= 1;
+    }
+    if index != 0 {
+        return Err(anyhow!("invalid index"));
+    }
+    if hash != root_hash {
+        return Err(anyhow!(
+            "root hash mismatch (got {}, want {})",
+            hash,
+            root_hash
+        ));
+    }
+    Ok(())
+}
+
 /// A Merkle proof.
 ///
-/// A FRI `Query` uses several of these: two from the main Merkle tree and two for each folding
-/// round.
+/// The DEEP layer uses these to open the committed polynomial batches at the queried positions.
 ///
 /// NOTE: this object only stores the sister hashes of the Merkle path and the opened leaf values,
 /// it doesn't store the lookup key and the root hash anywhere because those pieces of information
-/// are reconstructed separately during the verification of a whole `Query`. In particular, all root
-/// hashes are stored in the `Commitment`.
+/// are reconstructed separately during the verification of a whole [`Proof`](`crate::deep::Proof`).
+/// In particular, all root hashes are stored in the [`Commitment`](`crate::deep::Commitment`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Proof<F: Field256, H: Hasher<F>> {
     leaf: Vec<F>,
@@ -104,16 +174,6 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
         self.leaf.as_slice()
     }
 
-    /// Checks the leaf of this proof against the provided slice.
-    ///
-    /// The two must match or an error is returned.
-    pub(crate) fn check_leaf(&self, expected: &[F]) -> Result<()> {
-        if expected.len() != self.leaf.len() || self.leaf.as_slice() != expected {
-            return Err(anyhow!("leaf value mismatch"));
-        }
-        Ok(())
-    }
-
     /// Returns the length of the Merkle path, corresponding to the height of the tree minus 1 (the
     /// root hash is not included in this count).
     pub(crate) fn len(&self) -> usize {
@@ -121,50 +181,14 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
     }
 
     /// Verifies the proof against the given root hash.
-    pub(crate) fn verify(&self, mut index: usize, root_hash: H256) -> Result<()> {
-        let mut hash = hash_leaf::<F, H>(get_leaf_dst::<F>(), self.leaf.iter().copied());
-        for &sibling in &self.path {
-            hash = if index & 1 != 0 {
-                H::hash_binary(sibling, hash)
-            } else {
-                H::hash_binary(hash, sibling)
-            };
-            index >>= 1;
-        }
-        if index != 0 {
-            return Err(anyhow!("invalid index"));
-        }
-        if hash != root_hash {
-            return Err(anyhow!(
-                "root hash mismatch (got {}, want {})",
-                hash,
-                root_hash
-            ));
-        }
-        Ok(())
+    pub(crate) fn verify(&self, index: usize, root_hash: H256) -> Result<()> {
+        let leaf = hash_leaf::<F, H>(get_leaf_dst::<F>(), self.leaf.iter().copied());
+        verify_path::<H>(leaf, self.path.as_slice(), index, root_hash)
     }
 
-    /// Returns a boolean indicating whether or not the committed polynomials are constant.
-    ///
-    /// This function is used in low degree testing to check when the folding process collapses to
-    /// degree-0 polynomials.
-    ///
-    /// Note that some polynomials may collapse earlier than others, and this function returns false
-    /// if one or more haven't collapsed yet. So it returns true if and only if all have collapsed.
-    pub(crate) fn is_constant(&self) -> bool {
-        let mut hash = hash_leaf::<F, H>(get_leaf_dst::<F>(), self.leaf.iter().copied());
-        for &sibling in &self.path {
-            if sibling != hash {
-                return false;
-            }
-            hash = H::hash_binary(hash, hash);
-        }
-        true
-    }
-
-    /// Serializes this Merkle proof to a [`LeafProof`](`proto::LeafProof`) protobuf.
-    pub(crate) fn to_proto(&self) -> proto::LeafProof {
-        proto::LeafProof {
+    /// Serializes this Merkle proof to a [`MerkleProof`](`proto::MerkleProof`) protobuf.
+    pub(crate) fn to_proto(&self) -> proto::MerkleProof {
+        proto::MerkleProof {
             leaf_values: self
                 .leaf
                 .iter()
@@ -178,11 +202,11 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
         }
     }
 
-    /// Deserializes a Merkle proof from a [`LeafProof`](`proto::LeafProof`) protobuf.
+    /// Deserializes a Merkle proof from a [`MerkleProof`](`proto::MerkleProof`) protobuf.
     ///
     /// NOTE: this method does not validate the proof, it only deserializes it. The caller must
     /// invoke [`Self::verify`] separately.
-    pub(crate) fn from_proto(proto: &proto::LeafProof) -> Result<Self> {
+    pub(crate) fn from_proto(proto: &proto::MerkleProof) -> Result<Self> {
         Ok(Self {
             leaf: proto
                 .leaf_values
@@ -273,32 +297,12 @@ impl<F: Field256, H: Hasher<F>> Tree<F, H> {
         self.leaves.iter().map(|values| values[index]).collect()
     }
 
-    /// Returns the value at a given leaf for a specific polynomial.
-    ///
-    /// `polynomial_index` must be less than [`Self::num_polys()`] and `leaf_index` must be less
-    /// than [`Self::num_leaves()`].
-    pub(crate) fn leaf_value(&self, polynomial_index: usize, leaf_index: usize) -> F {
-        self.leaves[polynomial_index][leaf_index]
-    }
-
     /// Returns a Merkle proof for the leaf at `index`.
-    pub(crate) fn query(&self, mut index: usize) -> Proof<F, H> {
-        let mut n = self.num_leaves();
-        assert!(n.is_power_of_two());
-        assert!(index < n);
-        let leaf = self.leaf(index);
-        let mut path = Vec::with_capacity(n.trailing_zeros() as usize);
-        let mut hashes = self.hashes.as_slice();
-        while n > 1 {
-            path.push(hashes[index ^ 1]);
-            hashes = &hashes[n..];
-            n /= 2;
-            index >>= 1;
-        }
+    pub(crate) fn query(&self, index: usize) -> Proof<F, H> {
         Proof {
-            leaf,
-            path,
-            _data: Default::default(),
+            leaf: self.leaf(index),
+            path: merkle_path(self.hashes.as_slice(), self.num_leaves(), index),
+            _data: PhantomData,
         }
     }
 }
@@ -320,565 +324,739 @@ mod tests {
         s.parse().unwrap()
     }
 
+    /// Converts small integers into field elements.
+    fn make_values<F: Field>(values: &[u16]) -> Vec<F> {
+        values.iter().copied().map(from_const).collect()
+    }
+
+    /// Converts a matrix of small integers, one row for every polynomial, into field elements.
+    fn make_columns<F: Field>(columns: &[&[u16]]) -> Vec<Vec<F>> {
+        columns.iter().map(|column| make_values(column)).collect()
+    }
+
+    /// Eight distinct leaf hashes.
+    fn sample_leaves() -> Vec<H256> {
+        (1..=8).map(H256::from_low_u64_be).collect()
+    }
+
+    /// Builds a Merkle tree on the given leaf hashes with [`merklify`] and returns all its nodes.
+    fn make_hashes(leaves: &[H256]) -> Vec<H256> {
+        let mut hashes = leaves.to_vec();
+        hashes.resize(leaves.len() * 2 - 1, H256::zero());
+        merklify::<Sha2Hash<BS>>(hashes.as_mut_slice(), leaves.len());
+        hashes
+    }
+
+    /// The evaluations of three polynomials over eight points.
+    const SAMPLE_COLUMNS: [&[u16]; 3] = [
+        &[12, 34, 56, 78, 90, 12, 34, 56],
+        &[42, 43, 44, 45, 46, 47, 48, 49],
+        &[78, 56, 34, 12, 90, 78, 56, 34],
+    ];
+
     #[test]
-    fn test_dsts() {
+    fn test_leaf_dst_bluesky() {
         assert_eq!(
             get_leaf_dst::<BS>(),
             parse("0x08cb2652a56289bd316cfcb356f5d2be485538e04a601fb14fc2c98f03077fcb")
         );
+    }
+
+    #[test]
+    fn test_leaf_dst_goldilocks() {
         assert_eq!(
             get_leaf_dst::<GL4>(),
             parse("0x5c2a4bcf48496a9c0b5c038ecd6a7977e055af164d18a3a8ce1012be480276be")
         );
     }
 
+    fn test_hash_leaf_impl<F: Field256, H: Hasher<F>>(values: &[u16], expected: &'static str) {
+        let values = make_values::<F>(values);
+        let hash = hash_leaf::<F, H>(get_leaf_dst::<F>(), values);
+        assert_eq!(hash, parse::<H256>(expected));
+    }
+
     #[test]
     fn test_hash_leaf_sha2_bluesky() {
-        assert_eq!(
-            hash_leaf::<BS, Sha2Hash<BS>>(get_leaf_dst::<BS>(), [from_const(12)]),
-            parse("0x0bd187bc3deea1ef6c2a9ae254cf4e493f1dbbda32c79a662fc1d8437ab7e7c6")
+        test_hash_leaf_impl::<BS, Sha2Hash<BS>>(
+            &[12],
+            "0x0bd187bc3deea1ef6c2a9ae254cf4e493f1dbbda32c79a662fc1d8437ab7e7c6",
         );
-        assert_eq!(
-            hash_leaf::<BS, Sha2Hash<BS>>(get_leaf_dst::<BS>(), [from_const(34), from_const(56)]),
-            parse("0xbcd7235ceb553ca6682fd2df813650cad056a20fd6c76e1e04ae9f6a248c6c02")
+        test_hash_leaf_impl::<BS, Sha2Hash<BS>>(
+            &[34, 56],
+            "0xbcd7235ceb553ca6682fd2df813650cad056a20fd6c76e1e04ae9f6a248c6c02",
         );
-        assert_eq!(
-            hash_leaf::<BS, Sha2Hash<BS>>(
-                get_leaf_dst::<BS>(),
-                [from_const(78), from_const(90), from_const(12)]
-            ),
-            parse("0xeb8b9e0099332552744b9111d5a478dc61b231407d6c776586a50a3fc4513ca4")
+        test_hash_leaf_impl::<BS, Sha2Hash<BS>>(
+            &[78, 90, 12],
+            "0xeb8b9e0099332552744b9111d5a478dc61b231407d6c776586a50a3fc4513ca4",
         );
     }
 
     #[test]
     fn test_hash_leaf_sha2_goldilocks() {
-        assert_eq!(
-            hash_leaf::<GL4, Sha2Hash<GL4>>(get_leaf_dst::<GL4>(), [from_const(12)]),
-            parse("0x35b8c46b2ddc91d8b6bf3a5f5c53be0fb8856ea801986a278693d6c5f0233c59")
+        test_hash_leaf_impl::<GL4, Sha2Hash<GL4>>(
+            &[12],
+            "0x35b8c46b2ddc91d8b6bf3a5f5c53be0fb8856ea801986a278693d6c5f0233c59",
         );
-        assert_eq!(
-            hash_leaf::<GL4, Sha2Hash<GL4>>(
-                get_leaf_dst::<GL4>(),
-                [from_const(34), from_const(56)]
-            ),
-            parse("0x16b937b4393988c76386bb0fbda2ade97c28ec6b6f4d4aa49ce61fece35a48ec")
+        test_hash_leaf_impl::<GL4, Sha2Hash<GL4>>(
+            &[34, 56],
+            "0x16b937b4393988c76386bb0fbda2ade97c28ec6b6f4d4aa49ce61fece35a48ec",
         );
-        assert_eq!(
-            hash_leaf::<GL4, Sha2Hash<GL4>>(
-                get_leaf_dst::<GL4>(),
-                [from_const(78), from_const(90), from_const(12)]
-            ),
-            parse("0x36b7284c5d4b93f9a4d75343ca68866fbb39c773ff956a6ae9d7f7552a7a7051")
+        test_hash_leaf_impl::<GL4, Sha2Hash<GL4>>(
+            &[78, 90, 12],
+            "0x36b7284c5d4b93f9a4d75343ca68866fbb39c773ff956a6ae9d7f7552a7a7051",
         );
     }
 
     #[test]
     fn test_hash_leaf_keccak256_bluesky() {
-        assert_eq!(
-            hash_leaf::<BS, Keccak256Hash<BS>>(get_leaf_dst::<BS>(), [from_const(12)]),
-            parse("0x5e70242e081756f445b5f3048611464568002e68800238dcfef718504de01782")
+        test_hash_leaf_impl::<BS, Keccak256Hash<BS>>(
+            &[12],
+            "0x5e70242e081756f445b5f3048611464568002e68800238dcfef718504de01782",
         );
-        assert_eq!(
-            hash_leaf::<BS, Keccak256Hash<BS>>(
-                get_leaf_dst::<BS>(),
-                [from_const(34), from_const(56)]
-            ),
-            parse("0x6cbf9a3af9793caffe8c509dfaccf0198e833cafa8eb83a0a7d57ce35a97dbd1")
+        test_hash_leaf_impl::<BS, Keccak256Hash<BS>>(
+            &[34, 56],
+            "0x6cbf9a3af9793caffe8c509dfaccf0198e833cafa8eb83a0a7d57ce35a97dbd1",
         );
-        assert_eq!(
-            hash_leaf::<BS, Keccak256Hash<BS>>(
-                get_leaf_dst::<BS>(),
-                [from_const(78), from_const(90), from_const(12)]
-            ),
-            parse("0x05ce2ee03a570540c8a67a9b5a419dc7813922da6a39dff3c293806ed0f88fbb")
+        test_hash_leaf_impl::<BS, Keccak256Hash<BS>>(
+            &[78, 90, 12],
+            "0x05ce2ee03a570540c8a67a9b5a419dc7813922da6a39dff3c293806ed0f88fbb",
         );
     }
 
     #[test]
     fn test_hash_leaf_keccak256_goldilocks() {
-        assert_eq!(
-            hash_leaf::<GL4, Keccak256Hash<GL4>>(get_leaf_dst::<GL4>(), [from_const(12)]),
-            parse("0x0582d9f0e3652d6cef9c301b16fbff366dd1e8910befbc7f991cf7a4862574d3")
+        test_hash_leaf_impl::<GL4, Keccak256Hash<GL4>>(
+            &[12],
+            "0x0582d9f0e3652d6cef9c301b16fbff366dd1e8910befbc7f991cf7a4862574d3",
         );
-        assert_eq!(
-            hash_leaf::<GL4, Keccak256Hash<GL4>>(
-                get_leaf_dst::<GL4>(),
-                [from_const(34), from_const(56)]
-            ),
-            parse("0x0c8448a67efe90928470801e2b75ece4fb838f232ae4bb79e361b1bb97813dbd")
+        test_hash_leaf_impl::<GL4, Keccak256Hash<GL4>>(
+            &[34, 56],
+            "0x0c8448a67efe90928470801e2b75ece4fb838f232ae4bb79e361b1bb97813dbd",
         );
-        assert_eq!(
-            hash_leaf::<GL4, Keccak256Hash<GL4>>(
-                get_leaf_dst::<GL4>(),
-                [from_const(78), from_const(90), from_const(12)]
-            ),
-            parse("0x48769fec704d28d0747b4bd8cd4fdef4025dfbfc9afb301f0bec283e9c0a6e6d")
+        test_hash_leaf_impl::<GL4, Keccak256Hash<GL4>>(
+            &[78, 90, 12],
+            "0x48769fec704d28d0747b4bd8cd4fdef4025dfbfc9afb301f0bec283e9c0a6e6d",
         );
     }
 
-    #[test]
-    fn test_merklify_one_sha2() {
-        let mut hashes = vec![parse(
-            "0x1fe9e33b7ff790473e13eb6384d61d6abb32d2e50b30a382c9767b5347f5846b",
-        )];
-        merklify::<Sha2Hash<BS>>(&mut hashes, 1);
-        assert_eq!(
-            hashes,
-            vec![parse(
-                "0x1fe9e33b7ff790473e13eb6384d61d6abb32d2e50b30a382c9767b5347f5846b"
-            )]
-        );
-    }
-
-    #[test]
-    fn test_merklify_one_keccak256() {
-        let mut hashes = vec![parse(
-            "0x1fe9e33b7ff790473e13eb6384d61d6abb32d2e50b30a382c9767b5347f5846b",
-        )];
-        merklify::<Keccak256Hash<BS>>(&mut hashes, 1);
-        assert_eq!(
-            hashes,
-            vec![parse(
-                "0x1fe9e33b7ff790473e13eb6384d61d6abb32d2e50b30a382c9767b5347f5846b"
-            )]
-        );
-    }
-
-    #[test]
-    fn test_merklify_two_sha2() {
-        let mut hashes = vec![
-            parse("0x0cbb1061e55efef40fae3c8e34d301c9940889146f816edd475052fc45caf060"),
-            parse("0x2d8257d72c4b6e6bfa3a21a22c053d02d1d52b4b5e6097acfd0ed45f827d6ba4"),
-        ];
-        hashes.resize(3, H256::default());
-        merklify::<Sha2Hash<BS>>(&mut hashes, 2);
-        assert_eq!(
-            hashes,
-            vec![
-                parse("0x0cbb1061e55efef40fae3c8e34d301c9940889146f816edd475052fc45caf060"),
-                parse("0x2d8257d72c4b6e6bfa3a21a22c053d02d1d52b4b5e6097acfd0ed45f827d6ba4"),
-                parse("0x3af448b6612ac9931b7413ecca5d209187cd808ae2d3647099aa99fada16c955")
-            ]
-        );
-    }
-
-    #[test]
-    fn test_merklify_two_keccak256() {
-        let mut hashes = vec![
-            parse("0x0cbb1061e55efef40fae3c8e34d301c9940889146f816edd475052fc45caf060"),
-            parse("0x2d8257d72c4b6e6bfa3a21a22c053d02d1d52b4b5e6097acfd0ed45f827d6ba4"),
-        ];
-        hashes.resize(3, H256::default());
-        merklify::<Keccak256Hash<BS>>(&mut hashes, 2);
-        assert_eq!(
-            hashes,
-            vec![
-                parse("0x0cbb1061e55efef40fae3c8e34d301c9940889146f816edd475052fc45caf060"),
-                parse("0x2d8257d72c4b6e6bfa3a21a22c053d02d1d52b4b5e6097acfd0ed45f827d6ba4"),
-                parse("0x6e70b19bd160e181bb367ab730eababc6e3673977f7fdce38934ee197bbcb568")
-            ]
-        );
-    }
-
-    #[test]
-    fn test_merklify_four_sha2() {
-        let mut hashes = vec![
-            parse("0x034acf2cced8e9744784ec9c3c626fa83f6f8ddd83faed9d5caa5ad72c91eb1c"),
-            parse("0x39dce95a2271a57f999981eef6917f3df8ad25d116c98d809a3b7da5d54805a3"),
-            parse("0x435246f701f1483adcb7037fa64b3fa027c41e13a52d1e6c502e9b71dea3ca81"),
-            parse("0x7952ed41c4062f594b53b8c548874b41a7a7f05593d7a5a313ed82c2fe1c62d7"),
-        ];
-        hashes.resize(7, H256::default());
-        merklify::<Sha2Hash<BS>>(&mut hashes, 4);
-        assert_eq!(
-            hashes,
-            vec![
-                parse("0x034acf2cced8e9744784ec9c3c626fa83f6f8ddd83faed9d5caa5ad72c91eb1c"),
-                parse("0x39dce95a2271a57f999981eef6917f3df8ad25d116c98d809a3b7da5d54805a3"),
-                parse("0x435246f701f1483adcb7037fa64b3fa027c41e13a52d1e6c502e9b71dea3ca81"),
-                parse("0x7952ed41c4062f594b53b8c548874b41a7a7f05593d7a5a313ed82c2fe1c62d7"),
-                parse("0x3d139c65859969e86db444ccc0d36ffd0456b3f92d3dfb34fa10c8c07f5ada06"),
-                parse("0xdc3dd313db4b53f2720fcfe6373d286a9c40911546e1c434fa24ab650a75b586"),
-                parse("0xed171c6bd6876b93f4fc8914e0b2a8db53d7204048ad9fdff6e7127c077ca072"),
-            ]
-        );
-    }
-
-    #[test]
-    fn test_merklify_four_keccak256() {
-        let mut hashes = vec![
-            parse("0x034acf2cced8e9744784ec9c3c626fa83f6f8ddd83faed9d5caa5ad72c91eb1c"),
-            parse("0x39dce95a2271a57f999981eef6917f3df8ad25d116c98d809a3b7da5d54805a3"),
-            parse("0x435246f701f1483adcb7037fa64b3fa027c41e13a52d1e6c502e9b71dea3ca81"),
-            parse("0x7952ed41c4062f594b53b8c548874b41a7a7f05593d7a5a313ed82c2fe1c62d7"),
-        ];
-        hashes.resize(7, H256::default());
-        merklify::<Keccak256Hash<BS>>(&mut hashes, 4);
-        assert_eq!(
-            hashes,
-            vec![
-                parse("0x034acf2cced8e9744784ec9c3c626fa83f6f8ddd83faed9d5caa5ad72c91eb1c"),
-                parse("0x39dce95a2271a57f999981eef6917f3df8ad25d116c98d809a3b7da5d54805a3"),
-                parse("0x435246f701f1483adcb7037fa64b3fa027c41e13a52d1e6c502e9b71dea3ca81"),
-                parse("0x7952ed41c4062f594b53b8c548874b41a7a7f05593d7a5a313ed82c2fe1c62d7"),
-                parse("0x8a2dbe0367d89a172a0eb470026f5bb85ddd542e0d93885318c5d6b8a3764f28"),
-                parse("0x31354bf6d6ca07dbde80395609890a558ff35587ddc2b5c72ccde2b4e15d114f"),
-                parse("0xbd82b7f4f83de57b73e00aa0924a5fc4dfaf959bd252aa3fda8abdaf87713dc0"),
-            ]
-        );
-    }
-
-    fn test_merkle_tree<F: Field256, H: Hasher<F>>(
-        evaluations: Vec<Vec<F>>,
-        expected_root_hash: H256,
+    fn test_merklify_impl<H: MerkleHasher>(
+        leaves: &[&'static str],
+        expected_internal_nodes: &[&'static str],
     ) {
-        let k = evaluations.len();
-        let n = evaluations[0].len();
-        let tree = Tree::<F, H>::new(evaluations.clone());
-        assert_eq!(tree.num_polys(), k);
-        assert_eq!(tree.num_leaves(), n);
-        assert_eq!(tree.root_hash(), expected_root_hash);
-        for i in 0..n {
-            let proof = tree.query(i);
-            assert!(proof.verify(i, expected_root_hash).is_ok());
-            assert_eq!(proof.leaf().len(), k);
-            assert!(
-                proof
-                    .leaf()
-                    .iter()
-                    .zip(evaluations.iter())
-                    .all(|(&lhs, values)| lhs == values[i])
-            );
-            for j in 0..k {
-                assert_eq!(tree.leaf_value(j, i), evaluations[j][i]);
-            }
-        }
+        let n = leaves.len();
+        let leaves: Vec<H256> = leaves.iter().map(|&leaf| parse(leaf)).collect();
+        let expected_internal_nodes: Vec<H256> = expected_internal_nodes
+            .iter()
+            .map(|&node| parse(node))
+            .collect();
+        let mut hashes = leaves.clone();
+        hashes.resize(n * 2 - 1, H256::zero());
+        merklify::<H>(hashes.as_mut_slice(), n);
+        assert_eq!(hashes[0..n], leaves);
+        assert_eq!(hashes[n..], expected_internal_nodes);
+    }
+
+    #[test]
+    fn test_merklify_one_leaf() {
+        test_merklify_impl::<Sha2Hash<BS>>(
+            &["0x1fe9e33b7ff790473e13eb6384d61d6abb32d2e50b30a382c9767b5347f5846b"],
+            &[],
+        );
+        test_merklify_impl::<Keccak256Hash<BS>>(
+            &["0x1fe9e33b7ff790473e13eb6384d61d6abb32d2e50b30a382c9767b5347f5846b"],
+            &[],
+        );
+    }
+
+    #[test]
+    fn test_merklify_two_leaves() {
+        test_merklify_impl::<Sha2Hash<BS>>(
+            &[
+                "0x0cbb1061e55efef40fae3c8e34d301c9940889146f816edd475052fc45caf060",
+                "0x2d8257d72c4b6e6bfa3a21a22c053d02d1d52b4b5e6097acfd0ed45f827d6ba4",
+            ],
+            &["0x3af448b6612ac9931b7413ecca5d209187cd808ae2d3647099aa99fada16c955"],
+        );
+        test_merklify_impl::<Keccak256Hash<BS>>(
+            &[
+                "0x0cbb1061e55efef40fae3c8e34d301c9940889146f816edd475052fc45caf060",
+                "0x2d8257d72c4b6e6bfa3a21a22c053d02d1d52b4b5e6097acfd0ed45f827d6ba4",
+            ],
+            &["0x6e70b19bd160e181bb367ab730eababc6e3673977f7fdce38934ee197bbcb568"],
+        );
+    }
+
+    #[test]
+    fn test_merklify_four_leaves() {
+        test_merklify_impl::<Sha2Hash<BS>>(
+            &[
+                "0x034acf2cced8e9744784ec9c3c626fa83f6f8ddd83faed9d5caa5ad72c91eb1c",
+                "0x39dce95a2271a57f999981eef6917f3df8ad25d116c98d809a3b7da5d54805a3",
+                "0x435246f701f1483adcb7037fa64b3fa027c41e13a52d1e6c502e9b71dea3ca81",
+                "0x7952ed41c4062f594b53b8c548874b41a7a7f05593d7a5a313ed82c2fe1c62d7",
+            ],
+            &[
+                "0x3d139c65859969e86db444ccc0d36ffd0456b3f92d3dfb34fa10c8c07f5ada06",
+                "0xdc3dd313db4b53f2720fcfe6373d286a9c40911546e1c434fa24ab650a75b586",
+                "0xed171c6bd6876b93f4fc8914e0b2a8db53d7204048ad9fdff6e7127c077ca072",
+            ],
+        );
+        test_merklify_impl::<Keccak256Hash<BS>>(
+            &[
+                "0x034acf2cced8e9744784ec9c3c626fa83f6f8ddd83faed9d5caa5ad72c91eb1c",
+                "0x39dce95a2271a57f999981eef6917f3df8ad25d116c98d809a3b7da5d54805a3",
+                "0x435246f701f1483adcb7037fa64b3fa027c41e13a52d1e6c502e9b71dea3ca81",
+                "0x7952ed41c4062f594b53b8c548874b41a7a7f05593d7a5a313ed82c2fe1c62d7",
+            ],
+            &[
+                "0x8a2dbe0367d89a172a0eb470026f5bb85ddd542e0d93885318c5d6b8a3764f28",
+                "0x31354bf6d6ca07dbde80395609890a558ff35587ddc2b5c72ccde2b4e15d114f",
+                "0xbd82b7f4f83de57b73e00aa0924a5fc4dfaf959bd252aa3fda8abdaf87713dc0",
+            ],
+        );
+    }
+
+    fn test_merkle_root_impl<H: MerkleHasher>(leaves: &[&'static str], expected: &'static str) {
+        let leaves: Vec<H256> = leaves.iter().map(|&leaf| parse(leaf)).collect();
+        let root = merkle_root::<H>(leaves.as_slice());
+        assert_eq!(root, parse::<H256>(expected));
+    }
+
+    #[test]
+    fn test_merkle_root_one_leaf() {
+        test_merkle_root_impl::<Sha2Hash<BS>>(
+            &["0x1fe9e33b7ff790473e13eb6384d61d6abb32d2e50b30a382c9767b5347f5846b"],
+            "0x1fe9e33b7ff790473e13eb6384d61d6abb32d2e50b30a382c9767b5347f5846b",
+        );
+        test_merkle_root_impl::<Keccak256Hash<BS>>(
+            &["0x1fe9e33b7ff790473e13eb6384d61d6abb32d2e50b30a382c9767b5347f5846b"],
+            "0x1fe9e33b7ff790473e13eb6384d61d6abb32d2e50b30a382c9767b5347f5846b",
+        );
+    }
+
+    #[test]
+    fn test_merkle_root_two_leaves() {
+        test_merkle_root_impl::<Sha2Hash<BS>>(
+            &[
+                "0x0cbb1061e55efef40fae3c8e34d301c9940889146f816edd475052fc45caf060",
+                "0x2d8257d72c4b6e6bfa3a21a22c053d02d1d52b4b5e6097acfd0ed45f827d6ba4",
+            ],
+            "0x3af448b6612ac9931b7413ecca5d209187cd808ae2d3647099aa99fada16c955",
+        );
+        test_merkle_root_impl::<Keccak256Hash<BS>>(
+            &[
+                "0x0cbb1061e55efef40fae3c8e34d301c9940889146f816edd475052fc45caf060",
+                "0x2d8257d72c4b6e6bfa3a21a22c053d02d1d52b4b5e6097acfd0ed45f827d6ba4",
+            ],
+            "0x6e70b19bd160e181bb367ab730eababc6e3673977f7fdce38934ee197bbcb568",
+        );
+    }
+
+    #[test]
+    fn test_merkle_root_four_leaves() {
+        test_merkle_root_impl::<Sha2Hash<BS>>(
+            &[
+                "0x034acf2cced8e9744784ec9c3c626fa83f6f8ddd83faed9d5caa5ad72c91eb1c",
+                "0x39dce95a2271a57f999981eef6917f3df8ad25d116c98d809a3b7da5d54805a3",
+                "0x435246f701f1483adcb7037fa64b3fa027c41e13a52d1e6c502e9b71dea3ca81",
+                "0x7952ed41c4062f594b53b8c548874b41a7a7f05593d7a5a313ed82c2fe1c62d7",
+            ],
+            "0xed171c6bd6876b93f4fc8914e0b2a8db53d7204048ad9fdff6e7127c077ca072",
+        );
+        test_merkle_root_impl::<Keccak256Hash<BS>>(
+            &[
+                "0x034acf2cced8e9744784ec9c3c626fa83f6f8ddd83faed9d5caa5ad72c91eb1c",
+                "0x39dce95a2271a57f999981eef6917f3df8ad25d116c98d809a3b7da5d54805a3",
+                "0x435246f701f1483adcb7037fa64b3fa027c41e13a52d1e6c502e9b71dea3ca81",
+                "0x7952ed41c4062f594b53b8c548874b41a7a7f05593d7a5a313ed82c2fe1c62d7",
+            ],
+            "0xbd82b7f4f83de57b73e00aa0924a5fc4dfaf959bd252aa3fda8abdaf87713dc0",
+        );
+    }
+
+    #[test]
+    fn test_merkle_root_matches_merklify() {
+        let leaves = sample_leaves();
+        let hashes = make_hashes(leaves.as_slice());
+        let root = merkle_root::<Sha2Hash<BS>>(leaves.as_slice());
+        assert_eq!(root, *hashes.last().unwrap());
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_merkle_root_of_no_leaves() {
+        merkle_root::<Sha2Hash<BS>>(&[]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_merkle_root_of_three_leaves() {
+        let leaves = sample_leaves();
+        merkle_root::<Sha2Hash<BS>>(&leaves[0..3]);
+    }
+
+    #[test]
+    fn test_merkle_path_of_left_leaf() {
+        let leaves = sample_leaves();
+        let hashes = make_hashes(leaves.as_slice());
+        let path = merkle_path(hashes.as_slice(), 8, 0);
+        assert_eq!(path, [leaves[1], hashes[8 + 1], hashes[12 + 1]]);
+    }
+
+    #[test]
+    fn test_merkle_path_of_right_leaf() {
+        let leaves = sample_leaves();
+        let hashes = make_hashes(leaves.as_slice());
+        let path = merkle_path(hashes.as_slice(), 8, 5);
+        assert_eq!(path, [leaves[4], hashes[8 + 3], hashes[12]]);
+    }
+
+    #[test]
+    fn test_merkle_path_of_single_leaf() {
+        let leaf = H256::from_low_u64_be(42);
+        let path = merkle_path(&[leaf], 1, 0);
+        assert_eq!(path, []);
+    }
+
+    #[test]
+    fn test_verify_path() {
+        let leaves = sample_leaves();
+        let hashes = make_hashes(leaves.as_slice());
+        let path = merkle_path(hashes.as_slice(), 8, 5);
+        let result = verify_path::<Sha2Hash<BS>>(leaves[5], &path, 5, *hashes.last().unwrap());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_verify_all_paths() {
+        let leaves = sample_leaves();
+        let hashes = make_hashes(leaves.as_slice());
+        let root_hash = *hashes.last().unwrap();
+        let results: Vec<bool> = (0..8)
+            .map(|index| {
+                let path = merkle_path(hashes.as_slice(), 8, index);
+                verify_path::<Sha2Hash<BS>>(leaves[index], &path, index, root_hash).is_ok()
+            })
+            .collect();
+        assert_eq!(results, [true; 8]);
+    }
+
+    #[test]
+    fn test_verify_path_with_wrong_index() {
+        let leaves = sample_leaves();
+        let hashes = make_hashes(leaves.as_slice());
+        let path = merkle_path(hashes.as_slice(), 8, 5);
+        let result = verify_path::<Sha2Hash<BS>>(leaves[5], &path, 4, *hashes.last().unwrap());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_verify_path_with_out_of_range_index() {
+        let leaves = sample_leaves();
+        let hashes = make_hashes(leaves.as_slice());
+        let path = merkle_path(hashes.as_slice(), 8, 5);
+        let result = verify_path::<Sha2Hash<BS>>(leaves[5], &path, 5 + 8, *hashes.last().unwrap());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_verify_path_with_wrong_leaf() {
+        let leaves = sample_leaves();
+        let hashes = make_hashes(leaves.as_slice());
+        let path = merkle_path(hashes.as_slice(), 8, 5);
+        let result = verify_path::<Sha2Hash<BS>>(leaves[4], &path, 5, *hashes.last().unwrap());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_verify_path_with_wrong_root() {
+        let leaves = sample_leaves();
+        let hashes = make_hashes(leaves.as_slice());
+        let path = merkle_path(hashes.as_slice(), 8, 5);
+        let result = verify_path::<Sha2Hash<BS>>(leaves[5], &path, 5, leaves[0]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_verify_empty_path() {
+        let leaf = H256::from_low_u64_be(42);
+        let result = verify_path::<Sha2Hash<BS>>(leaf, &[], 0, leaf);
+        assert!(result.is_ok());
+    }
+
+    fn test_merkle_tree_impl<F: Field256, H: Hasher<F>>(
+        columns: &[&[u16]],
+        expected_root_hash: &'static str,
+    ) {
+        let tree = Tree::<F, H>::new(make_columns(columns));
+        assert_eq!(tree.num_polys(), columns.len());
+        assert_eq!(tree.num_leaves(), columns[0].len());
+        assert_eq!(tree.root_hash(), parse::<H256>(expected_root_hash));
     }
 
     #[test]
     fn test_merkle_tree_one_leaf_1() {
-        test_merkle_tree::<BS, Sha2Hash<BS>>(
-            vec![vec![from_const(12)]],
-            parse("0x0bd187bc3deea1ef6c2a9ae254cf4e493f1dbbda32c79a662fc1d8437ab7e7c6"),
+        test_merkle_tree_impl::<BS, Sha2Hash<BS>>(
+            &[&[12]],
+            "0x0bd187bc3deea1ef6c2a9ae254cf4e493f1dbbda32c79a662fc1d8437ab7e7c6",
         );
-        test_merkle_tree::<GL4, Sha2Hash<GL4>>(
-            vec![vec![from_const(12)]],
-            parse("0x35b8c46b2ddc91d8b6bf3a5f5c53be0fb8856ea801986a278693d6c5f0233c59"),
+        test_merkle_tree_impl::<GL4, Sha2Hash<GL4>>(
+            &[&[12]],
+            "0x35b8c46b2ddc91d8b6bf3a5f5c53be0fb8856ea801986a278693d6c5f0233c59",
         );
-        test_merkle_tree::<BS, Keccak256Hash<BS>>(
-            vec![vec![from_const(12)]],
-            parse("0x5e70242e081756f445b5f3048611464568002e68800238dcfef718504de01782"),
+        test_merkle_tree_impl::<BS, Keccak256Hash<BS>>(
+            &[&[12]],
+            "0x5e70242e081756f445b5f3048611464568002e68800238dcfef718504de01782",
         );
-        test_merkle_tree::<GL4, Keccak256Hash<GL4>>(
-            vec![vec![from_const(12)]],
-            parse("0x0582d9f0e3652d6cef9c301b16fbff366dd1e8910befbc7f991cf7a4862574d3"),
+        test_merkle_tree_impl::<GL4, Keccak256Hash<GL4>>(
+            &[&[12]],
+            "0x0582d9f0e3652d6cef9c301b16fbff366dd1e8910befbc7f991cf7a4862574d3",
         );
     }
 
     #[test]
     fn test_merkle_tree_one_leaf_2() {
-        test_merkle_tree::<BS, Sha2Hash<BS>>(
-            vec![vec![from_const(34)]],
-            parse("0x825f71a1d38bedb88129450457f7943f988ee940aa1755aa89982e139e67047a"),
+        test_merkle_tree_impl::<BS, Sha2Hash<BS>>(
+            &[&[34]],
+            "0x825f71a1d38bedb88129450457f7943f988ee940aa1755aa89982e139e67047a",
         );
-        test_merkle_tree::<GL4, Sha2Hash<GL4>>(
-            vec![vec![from_const(34)]],
-            parse("0xfef88d77ef0fd0acf4b65461542e8103d2161112bd6e60ed1c5c1b89c18e27fd"),
+        test_merkle_tree_impl::<GL4, Sha2Hash<GL4>>(
+            &[&[34]],
+            "0xfef88d77ef0fd0acf4b65461542e8103d2161112bd6e60ed1c5c1b89c18e27fd",
         );
-        test_merkle_tree::<BS, Keccak256Hash<BS>>(
-            vec![vec![from_const(34)]],
-            parse("0xe6b7d9bb7fab250037d1ede2453bf936d350c03d028048fa491663a8d4a070ae"),
+        test_merkle_tree_impl::<BS, Keccak256Hash<BS>>(
+            &[&[34]],
+            "0xe6b7d9bb7fab250037d1ede2453bf936d350c03d028048fa491663a8d4a070ae",
         );
-        test_merkle_tree::<GL4, Keccak256Hash<GL4>>(
-            vec![vec![from_const(34)]],
-            parse("0x3c54733b9ccb4772ed9a7d7c1ad6d3f6b34a9644f3aa1aa5f09c0fae24b45500"),
+        test_merkle_tree_impl::<GL4, Keccak256Hash<GL4>>(
+            &[&[34]],
+            "0x3c54733b9ccb4772ed9a7d7c1ad6d3f6b34a9644f3aa1aa5f09c0fae24b45500",
         );
     }
 
     #[test]
     fn test_merkle_tree_one_leaf_two_polynomials_1() {
-        test_merkle_tree::<BS, Sha2Hash<BS>>(
-            vec![vec![from_const(12)], vec![from_const(34)]],
-            parse("0x41c90ef8e7fa7e79e54b14cf8395f9707e9768a02aa79ce7f0f4e68668837c26"),
+        test_merkle_tree_impl::<BS, Sha2Hash<BS>>(
+            &[&[12], &[34]],
+            "0x41c90ef8e7fa7e79e54b14cf8395f9707e9768a02aa79ce7f0f4e68668837c26",
         );
-        test_merkle_tree::<GL4, Sha2Hash<GL4>>(
-            vec![vec![from_const(12)], vec![from_const(34)]],
-            parse("0xdeb1534e334b8008495afddf7146a6ebbc9f7d7a1dcff2c1b21c05ae612aae25"),
+        test_merkle_tree_impl::<GL4, Sha2Hash<GL4>>(
+            &[&[12], &[34]],
+            "0xdeb1534e334b8008495afddf7146a6ebbc9f7d7a1dcff2c1b21c05ae612aae25",
         );
-        test_merkle_tree::<BS, Keccak256Hash<BS>>(
-            vec![vec![from_const(12)], vec![from_const(34)]],
-            parse("0x8a39979b1cf9df3dd02d420608cb73a92423a9ef2e44afb1118f5d62a1e35b59"),
+        test_merkle_tree_impl::<BS, Keccak256Hash<BS>>(
+            &[&[12], &[34]],
+            "0x8a39979b1cf9df3dd02d420608cb73a92423a9ef2e44afb1118f5d62a1e35b59",
         );
-        test_merkle_tree::<GL4, Keccak256Hash<GL4>>(
-            vec![vec![from_const(12)], vec![from_const(34)]],
-            parse("0x1c2534e0c33573bb8e8fab98b0972a32cc1fe3effab73ff8603b8186c55906d1"),
+        test_merkle_tree_impl::<GL4, Keccak256Hash<GL4>>(
+            &[&[12], &[34]],
+            "0x1c2534e0c33573bb8e8fab98b0972a32cc1fe3effab73ff8603b8186c55906d1",
         );
     }
 
     #[test]
     fn test_merkle_tree_one_leaf_two_polynomials_2() {
-        test_merkle_tree::<BS, Sha2Hash<BS>>(
-            vec![vec![from_const(34)], vec![from_const(12)]],
-            parse("0xc3dbf8cc67db17f01dd3527ab16da2120af998c7ebe3d06a2d9dff445e1adaee"),
+        test_merkle_tree_impl::<BS, Sha2Hash<BS>>(
+            &[&[34], &[12]],
+            "0xc3dbf8cc67db17f01dd3527ab16da2120af998c7ebe3d06a2d9dff445e1adaee",
         );
-        test_merkle_tree::<GL4, Sha2Hash<GL4>>(
-            vec![vec![from_const(34)], vec![from_const(12)]],
-            parse("0x0a0d5b00cb05493d56cab5077a39a12f6fe4c0f7c6a53fdc268d9a3be1190591"),
+        test_merkle_tree_impl::<GL4, Sha2Hash<GL4>>(
+            &[&[34], &[12]],
+            "0x0a0d5b00cb05493d56cab5077a39a12f6fe4c0f7c6a53fdc268d9a3be1190591",
         );
-        test_merkle_tree::<BS, Keccak256Hash<BS>>(
-            vec![vec![from_const(34)], vec![from_const(12)]],
-            parse("0xa8f2b055d24c330298c32a0ed891a91378af0a495403fd5f95eca566e34a1c39"),
+        test_merkle_tree_impl::<BS, Keccak256Hash<BS>>(
+            &[&[34], &[12]],
+            "0xa8f2b055d24c330298c32a0ed891a91378af0a495403fd5f95eca566e34a1c39",
         );
-        test_merkle_tree::<GL4, Keccak256Hash<GL4>>(
-            vec![vec![from_const(34)], vec![from_const(12)]],
-            parse("0xb1e2a185742ede9bc1a085cedec939ee6b24658996b068555cf8f45bc738e3e2"),
+        test_merkle_tree_impl::<GL4, Keccak256Hash<GL4>>(
+            &[&[34], &[12]],
+            "0xb1e2a185742ede9bc1a085cedec939ee6b24658996b068555cf8f45bc738e3e2",
         );
     }
 
     #[test]
     fn test_merkle_tree_one_leaf_three_polynomials_1() {
-        test_merkle_tree::<BS, Sha2Hash<BS>>(
-            vec![
-                vec![from_const(12)],
-                vec![from_const(34)],
-                vec![from_const(56)],
-            ],
-            parse("0x9bca77d625d9a50f1807d27c273cae980f706ef734a014c00e6a97bbb77472e3"),
+        test_merkle_tree_impl::<BS, Sha2Hash<BS>>(
+            &[&[12], &[34], &[56]],
+            "0x9bca77d625d9a50f1807d27c273cae980f706ef734a014c00e6a97bbb77472e3",
         );
-        test_merkle_tree::<GL4, Sha2Hash<GL4>>(
-            vec![
-                vec![from_const(12)],
-                vec![from_const(34)],
-                vec![from_const(56)],
-            ],
-            parse("0x03e100a3e1b7dc7047f362676d6d44704eeda9dfac6714417330c4f232b5ae92"),
+        test_merkle_tree_impl::<GL4, Sha2Hash<GL4>>(
+            &[&[12], &[34], &[56]],
+            "0x03e100a3e1b7dc7047f362676d6d44704eeda9dfac6714417330c4f232b5ae92",
         );
-        test_merkle_tree::<BS, Keccak256Hash<BS>>(
-            vec![
-                vec![from_const(12)],
-                vec![from_const(34)],
-                vec![from_const(56)],
-            ],
-            parse("0x11e4b3b9246b3678b751e40aac1ceb433a51be72a6c3560a49e0954d04689017"),
+        test_merkle_tree_impl::<BS, Keccak256Hash<BS>>(
+            &[&[12], &[34], &[56]],
+            "0x11e4b3b9246b3678b751e40aac1ceb433a51be72a6c3560a49e0954d04689017",
         );
-        test_merkle_tree::<GL4, Keccak256Hash<GL4>>(
-            vec![
-                vec![from_const(12)],
-                vec![from_const(34)],
-                vec![from_const(56)],
-            ],
-            parse("0x1795b3459e1e257a198dbaf5ffbb31274db87b7cf785d96fc97762d0a144f417"),
+        test_merkle_tree_impl::<GL4, Keccak256Hash<GL4>>(
+            &[&[12], &[34], &[56]],
+            "0x1795b3459e1e257a198dbaf5ffbb31274db87b7cf785d96fc97762d0a144f417",
         );
     }
 
     #[test]
     fn test_merkle_tree_one_leaf_three_polynomials_2() {
-        test_merkle_tree::<BS, Sha2Hash<BS>>(
-            vec![
-                vec![from_const(34)],
-                vec![from_const(12)],
-                vec![from_const(78)],
-            ],
-            parse("0xf48317b0be7caae4a15185cc8d0795c15c2bc98e18b8cbdc906270ada921fd25"),
+        test_merkle_tree_impl::<BS, Sha2Hash<BS>>(
+            &[&[34], &[12], &[78]],
+            "0xf48317b0be7caae4a15185cc8d0795c15c2bc98e18b8cbdc906270ada921fd25",
         );
-        test_merkle_tree::<GL4, Sha2Hash<GL4>>(
-            vec![
-                vec![from_const(34)],
-                vec![from_const(12)],
-                vec![from_const(78)],
-            ],
-            parse("0x3fb57228b65495ac10bd7c27c04934f652d740f36ccc4308dfc663b99e9a7476"),
+        test_merkle_tree_impl::<GL4, Sha2Hash<GL4>>(
+            &[&[34], &[12], &[78]],
+            "0x3fb57228b65495ac10bd7c27c04934f652d740f36ccc4308dfc663b99e9a7476",
         );
-        test_merkle_tree::<BS, Keccak256Hash<BS>>(
-            vec![
-                vec![from_const(34)],
-                vec![from_const(12)],
-                vec![from_const(78)],
-            ],
-            parse("0xf3f5da8d03ec645ab1624876b7515f440d6dbbb5366e9e2da5218f9c603e990d"),
+        test_merkle_tree_impl::<BS, Keccak256Hash<BS>>(
+            &[&[34], &[12], &[78]],
+            "0xf3f5da8d03ec645ab1624876b7515f440d6dbbb5366e9e2da5218f9c603e990d",
         );
-        test_merkle_tree::<GL4, Keccak256Hash<GL4>>(
-            vec![
-                vec![from_const(34)],
-                vec![from_const(12)],
-                vec![from_const(78)],
-            ],
-            parse("0x19285d2130c6c6b5827034e3a48fe4a108901d098456aeb43e07dfd5ffc73775"),
+        test_merkle_tree_impl::<GL4, Keccak256Hash<GL4>>(
+            &[&[34], &[12], &[78]],
+            "0x19285d2130c6c6b5827034e3a48fe4a108901d098456aeb43e07dfd5ffc73775",
         );
     }
 
     #[test]
     fn test_merkle_tree_two_leaves_1() {
-        test_merkle_tree::<BS, Sha2Hash<BS>>(
-            vec![vec![from_const(12), from_const(34)]],
-            parse("0x2624006228d517eeda393d1440f25ed1c20887664f2444021849345167aadaf4"),
+        test_merkle_tree_impl::<BS, Sha2Hash<BS>>(
+            &[&[12, 34]],
+            "0x2624006228d517eeda393d1440f25ed1c20887664f2444021849345167aadaf4",
         );
-        test_merkle_tree::<GL4, Sha2Hash<GL4>>(
-            vec![vec![from_const(12), from_const(34)]],
-            parse("0x46e71c8cf94bae7f04ab0ec21c6341bce3b5293da7be6b9b2ed75fcf526b9a86"),
+        test_merkle_tree_impl::<GL4, Sha2Hash<GL4>>(
+            &[&[12, 34]],
+            "0x46e71c8cf94bae7f04ab0ec21c6341bce3b5293da7be6b9b2ed75fcf526b9a86",
         );
-        test_merkle_tree::<BS, Keccak256Hash<BS>>(
-            vec![vec![from_const(12), from_const(34)]],
-            parse("0xc781424ee41551ea0e56431b57519317a836b94c193ee898b39d058507217ee4"),
+        test_merkle_tree_impl::<BS, Keccak256Hash<BS>>(
+            &[&[12, 34]],
+            "0xc781424ee41551ea0e56431b57519317a836b94c193ee898b39d058507217ee4",
         );
-        test_merkle_tree::<GL4, Keccak256Hash<GL4>>(
-            vec![vec![from_const(12), from_const(34)]],
-            parse("0x7086d87f5a1f7187c16a0b3a18e1ec6454adfba533a9bb32b5d3f0f28c4e88b5"),
+        test_merkle_tree_impl::<GL4, Keccak256Hash<GL4>>(
+            &[&[12, 34]],
+            "0x7086d87f5a1f7187c16a0b3a18e1ec6454adfba533a9bb32b5d3f0f28c4e88b5",
         );
     }
 
     #[test]
     fn test_merkle_tree_two_leaves_2() {
-        test_merkle_tree::<BS, Sha2Hash<BS>>(
-            vec![vec![from_const(34), from_const(56)]],
-            parse("0x85d6170f1dcec468c3a42f35d24b7689733abf26ff0278a9bc1edc7a9a0a7333"),
+        test_merkle_tree_impl::<BS, Sha2Hash<BS>>(
+            &[&[34, 56]],
+            "0x85d6170f1dcec468c3a42f35d24b7689733abf26ff0278a9bc1edc7a9a0a7333",
         );
-        test_merkle_tree::<GL4, Sha2Hash<GL4>>(
-            vec![vec![from_const(34), from_const(56)]],
-            parse("0x3ddde531f8532974c5911f7107567f0f216feb1856a63d06eec9859957aafa96"),
+        test_merkle_tree_impl::<GL4, Sha2Hash<GL4>>(
+            &[&[34, 56]],
+            "0x3ddde531f8532974c5911f7107567f0f216feb1856a63d06eec9859957aafa96",
         );
-        test_merkle_tree::<BS, Keccak256Hash<BS>>(
-            vec![vec![from_const(34), from_const(56)]],
-            parse("0x00526855bdd13b55968dd71bddfca2409e77ee8c75cdc17fcdb641673558ae51"),
+        test_merkle_tree_impl::<BS, Keccak256Hash<BS>>(
+            &[&[34, 56]],
+            "0x00526855bdd13b55968dd71bddfca2409e77ee8c75cdc17fcdb641673558ae51",
         );
-        test_merkle_tree::<GL4, Keccak256Hash<GL4>>(
-            vec![vec![from_const(34), from_const(56)]],
-            parse("0x57dee6e134693b1ebe8536a46f20fd22ba7fee68ad3af4156427dee220ef951e"),
+        test_merkle_tree_impl::<GL4, Keccak256Hash<GL4>>(
+            &[&[34, 56]],
+            "0x57dee6e134693b1ebe8536a46f20fd22ba7fee68ad3af4156427dee220ef951e",
         );
     }
 
     #[test]
     fn test_merkle_tree_two_leaves_two_polynomials_1() {
-        test_merkle_tree::<BS, Sha2Hash<BS>>(
-            vec![
-                vec![from_const(12), from_const(56)],
-                vec![from_const(34), from_const(78)],
-            ],
-            parse("0xdc144d55dd7a9c48f00b495d30172b38db7d4dc71ee4a0feab99177e30a10d21"),
+        test_merkle_tree_impl::<BS, Sha2Hash<BS>>(
+            &[&[12, 56], &[34, 78]],
+            "0xdc144d55dd7a9c48f00b495d30172b38db7d4dc71ee4a0feab99177e30a10d21",
         );
-        test_merkle_tree::<GL4, Sha2Hash<GL4>>(
-            vec![
-                vec![from_const(12), from_const(56)],
-                vec![from_const(34), from_const(78)],
-            ],
-            parse("0x8533f65a8cc96ace4b1c9c676d12ddd4dbc8f1a4fc7d161fa274985615d332f6"),
+        test_merkle_tree_impl::<GL4, Sha2Hash<GL4>>(
+            &[&[12, 56], &[34, 78]],
+            "0x8533f65a8cc96ace4b1c9c676d12ddd4dbc8f1a4fc7d161fa274985615d332f6",
         );
-        test_merkle_tree::<BS, Keccak256Hash<BS>>(
-            vec![
-                vec![from_const(12), from_const(56)],
-                vec![from_const(34), from_const(78)],
-            ],
-            parse("0x086ff3e1257cbff588f5d01ce891ea152e15863c5e0d4407d4c3564d354b0614"),
+        test_merkle_tree_impl::<BS, Keccak256Hash<BS>>(
+            &[&[12, 56], &[34, 78]],
+            "0x086ff3e1257cbff588f5d01ce891ea152e15863c5e0d4407d4c3564d354b0614",
         );
-        test_merkle_tree::<GL4, Keccak256Hash<GL4>>(
-            vec![
-                vec![from_const(12), from_const(56)],
-                vec![from_const(34), from_const(78)],
-            ],
-            parse("0xcbe8abdd08b5a47254beb0e73ea2191f120c40b310268985a6c96306e73395b3"),
+        test_merkle_tree_impl::<GL4, Keccak256Hash<GL4>>(
+            &[&[12, 56], &[34, 78]],
+            "0xcbe8abdd08b5a47254beb0e73ea2191f120c40b310268985a6c96306e73395b3",
         );
     }
 
     #[test]
     fn test_merkle_tree_two_leaves_two_polynomials_2() {
-        test_merkle_tree::<BS, Sha2Hash<BS>>(
-            vec![
-                vec![from_const(78), from_const(34)],
-                vec![from_const(56), from_const(12)],
-            ],
-            parse("0xfb5a002c9ef7dad6d9b4edc690f323f4c302c665926c085dd5d8681496c937c6"),
+        test_merkle_tree_impl::<BS, Sha2Hash<BS>>(
+            &[&[78, 34], &[56, 12]],
+            "0xfb5a002c9ef7dad6d9b4edc690f323f4c302c665926c085dd5d8681496c937c6",
         );
-        test_merkle_tree::<GL4, Sha2Hash<GL4>>(
-            vec![
-                vec![from_const(78), from_const(34)],
-                vec![from_const(56), from_const(12)],
-            ],
-            parse("0xb330dd303935029654afd13ea17eda755842eca21b3152bd570550d3bdaed46f"),
+        test_merkle_tree_impl::<GL4, Sha2Hash<GL4>>(
+            &[&[78, 34], &[56, 12]],
+            "0xb330dd303935029654afd13ea17eda755842eca21b3152bd570550d3bdaed46f",
         );
-        test_merkle_tree::<BS, Keccak256Hash<BS>>(
-            vec![
-                vec![from_const(78), from_const(34)],
-                vec![from_const(56), from_const(12)],
-            ],
-            parse("0xb18e697b08221e2f411826d3c17c80bff6e06e90a55bcd5cc191ad67f1eb657a"),
+        test_merkle_tree_impl::<BS, Keccak256Hash<BS>>(
+            &[&[78, 34], &[56, 12]],
+            "0xb18e697b08221e2f411826d3c17c80bff6e06e90a55bcd5cc191ad67f1eb657a",
         );
-        test_merkle_tree::<GL4, Keccak256Hash<GL4>>(
-            vec![
-                vec![from_const(78), from_const(34)],
-                vec![from_const(56), from_const(12)],
-            ],
-            parse("0x763ae7db144ceade048b6f96efb13975cefa9cd9874fe57469ff8e1f6cff2512"),
+        test_merkle_tree_impl::<GL4, Keccak256Hash<GL4>>(
+            &[&[78, 34], &[56, 12]],
+            "0x763ae7db144ceade048b6f96efb13975cefa9cd9874fe57469ff8e1f6cff2512",
         );
-    }
-
-    fn convert<F: Field>(values: &[Vec<u16>]) -> Vec<Vec<F>> {
-        values
-            .iter()
-            .map(|row| row.iter().copied().map(from_const).collect())
-            .collect()
-    }
-
-    fn test_query_roundtrip<F: Field256, H: Hasher<F>>(evaluations: Vec<Vec<F>>) {
-        let n = evaluations[0].len();
-        assert!(n > 1);
-        let tree = Tree::<F, H>::new(evaluations);
-        let root_hash = tree.root_hash();
-        for i in 0..n {
-            let proof = tree.query(i);
-            assert_eq!(proof.len(), n.trailing_zeros() as usize);
-            assert!(proof.verify(i, root_hash).is_ok());
-            for j in 0..n {
-                if j != i {
-                    assert!(proof.verify(j, root_hash).is_err());
-                }
-            }
-        }
     }
 
     #[test]
-    fn test_query_roundtrip_four_leaves() {
-        let values: Vec<Vec<u16>> = vec![vec![12, 34, 56, 78], vec![90, 12, 34, 56]];
-        test_query_roundtrip::<BS, Sha2Hash<BS>>(convert(&values));
-        test_query_roundtrip::<BS, Keccak256Hash<BS>>(convert(&values));
-        test_query_roundtrip::<GL4, Sha2Hash<GL4>>(convert(&values));
-        test_query_roundtrip::<GL4, Keccak256Hash<GL4>>(convert(&values));
+    fn test_tree_leaves() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
+        assert_eq!(tree.leaf(0), make_values::<BS>(&[12, 42, 78]));
+        assert_eq!(tree.leaf(1), make_values::<BS>(&[34, 43, 56]));
+        assert_eq!(tree.leaf(2), make_values::<BS>(&[56, 44, 34]));
+        assert_eq!(tree.leaf(3), make_values::<BS>(&[78, 45, 12]));
+        assert_eq!(tree.leaf(4), make_values::<BS>(&[90, 46, 90]));
+        assert_eq!(tree.leaf(5), make_values::<BS>(&[12, 47, 78]));
+        assert_eq!(tree.leaf(6), make_values::<BS>(&[34, 48, 56]));
+        assert_eq!(tree.leaf(7), make_values::<BS>(&[56, 49, 34]));
     }
 
     #[test]
-    fn test_query_roundtrip_eight_leaves() {
-        let values: Vec<Vec<u16>> = vec![
-            vec![12, 34, 56, 78, 90, 12, 34, 56],
-            vec![42, 43, 44, 45, 46, 47, 48, 49],
-            vec![78, 56, 34, 12, 90, 78, 56, 34],
-        ];
-        test_query_roundtrip::<BS, Sha2Hash<BS>>(convert(&values));
-        test_query_roundtrip::<BS, Keccak256Hash<BS>>(convert(&values));
-        test_query_roundtrip::<GL4, Sha2Hash<GL4>>(convert(&values));
-        test_query_roundtrip::<GL4, Keccak256Hash<GL4>>(convert(&values));
+    fn test_query_leaf() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
+        let proof = tree.query(5);
+        assert_eq!(proof.leaf(), make_values::<BS>(&[12, 47, 78]));
     }
 
     #[test]
-    fn test_serialization() {
-        let values: Vec<Vec<u16>> = vec![
-            vec![12, 34, 56, 78],
-            vec![90, 12, 34, 56],
-            vec![42, 43, 44, 45],
-        ];
-        let tree = Tree::<BS, Sha2Hash<BS>>::new(convert(&values));
+    fn test_query_path() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
+        let proof = tree.query(5);
+        assert_eq!(proof.len(), 3);
+        assert_eq!(
+            proof.path,
+            [tree.hashes[4], tree.hashes[8 + 3], tree.hashes[12]]
+        );
+    }
+
+    #[test]
+    fn test_query_path_starts_with_sibling_leaf_hash() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
+        let proof = tree.query(5);
+        assert_eq!(
+            proof.path[0],
+            hash_leaf::<BS, Sha2Hash<BS>>(get_leaf_dst::<BS>(), make_values(&[90, 46, 90]))
+        );
+    }
+
+    #[test]
+    fn test_single_leaf_tree_query() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&[&[12], &[34]]));
+        let proof = tree.query(0);
+        assert_eq!(proof.leaf(), make_values::<BS>(&[12, 34]));
+        assert_eq!(proof.path, []);
+    }
+
+    #[test]
+    fn test_proof_verify() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
+        let proof = tree.query(5);
+        let result = proof.verify(5, tree.root_hash());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_proof_verify_with_wrong_index() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
+        let proof = tree.query(5);
+        let result = proof.verify(4, tree.root_hash());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_proof_verify_with_out_of_range_index() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
+        let proof = tree.query(5);
+        let result = proof.verify(5 + 8, tree.root_hash());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_proof_verify_with_wrong_root() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
+        let proof = tree.query(5);
+        let result = proof.verify(5, tree.hashes[0]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_single_leaf_proof_verify() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&[&[12], &[34]]));
+        let proof = tree.query(0);
+        let result = proof.verify(0, tree.root_hash());
+        assert!(result.is_ok());
+    }
+
+    fn test_all_proofs_verify_impl<F: Field256, H: Hasher<F>>() {
+        let tree = Tree::<F, H>::new(make_columns(&SAMPLE_COLUMNS));
+        let results: Vec<bool> = (0..8)
+            .map(|index| tree.query(index).verify(index, tree.root_hash()).is_ok())
+            .collect();
+        assert_eq!(results, [true; 8]);
+    }
+
+    #[test]
+    fn test_all_proofs_verify() {
+        test_all_proofs_verify_impl::<BS, Sha2Hash<BS>>();
+        test_all_proofs_verify_impl::<BS, Keccak256Hash<BS>>();
+        test_all_proofs_verify_impl::<GL4, Sha2Hash<GL4>>();
+        test_all_proofs_verify_impl::<GL4, Keccak256Hash<GL4>>();
+    }
+
+    #[test]
+    fn test_proof_to_proto() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
         let proof = tree.query(2);
         let proto = proof.to_proto();
-        let proof = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
-        assert_eq!(proof.len(), 2);
-        assert!(!proof.is_constant());
-        assert!(
-            proof
-                .check_leaf(&[from_const(56), from_const(34), from_const(44)])
-                .is_ok()
+        assert_eq!(
+            proto.leaf_values,
+            [
+                BS::from(56u16).to_le_bytes().to_vec(),
+                BS::from(44u16).to_le_bytes().to_vec(),
+                BS::from(34u16).to_le_bytes().to_vec(),
+            ]
         );
-        assert!(proof.verify(0, tree.root_hash()).is_err());
-        assert!(proof.verify(1, tree.root_hash()).is_err());
-        assert!(proof.verify(2, tree.root_hash()).is_ok());
-        assert!(proof.verify(3, tree.root_hash()).is_err());
+        assert_eq!(
+            proto.merkle_path,
+            [
+                tree.hashes[3].as_bytes().to_vec(),
+                tree.hashes[8].as_bytes().to_vec(),
+                tree.hashes[13].as_bytes().to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_proof_from_proto() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
+        let proof = tree.query(2);
+        let proto = proof.to_proto();
+        let decoded = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
+        assert_eq!(decoded, proof);
+    }
+
+    #[test]
+    fn test_proof_from_proto_with_non_canonical_value() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
+        let mut proto = tree.query(2).to_proto();
+        let modulus: U256 = BS::MODULUS.parse().unwrap();
+        proto.leaf_values[1] = modulus.to_little_endian().to_vec();
+        let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_proof_from_proto_with_long_value() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
+        let mut proto = tree.query(2).to_proto();
+        proto.leaf_values[0].resize(33, 0);
+        let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_proof_from_proto_with_short_hash() {
+        let tree = Tree::<BS, Sha2Hash<BS>>::new(make_columns(&SAMPLE_COLUMNS));
+        let mut proto = tree.query(2).to_proto();
+        proto.merkle_path[1].pop();
+        let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto);
+        assert!(result.is_err());
     }
 }

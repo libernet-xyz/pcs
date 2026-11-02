@@ -1,7 +1,7 @@
 use crate::fri;
 use crate::hash::Hasher;
 use crate::merkle::{Proof as LeafProof, Tree};
-use crate::starkom::proto::pcs::v8 as proto;
+use crate::starkom::proto::pcs::v9 as proto;
 use crate::utils;
 use anyhow::{Result, anyhow};
 use primitive_types::{H256, U256};
@@ -12,8 +12,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 use std::sync::LazyLock;
 
-/// Target security level in bits.
-pub const LAMBDA: usize = 128;
+/// The number of bits of a proof-of-work hash, which is also the most leading zero bits it can
+/// have.
+pub const PROOF_OF_WORK_BITS: usize = 256;
 
 /// Domain separator tag used by [`Committer::transcript_hash`].
 static TRANSCRIPT_DST: LazyLock<H256> =
@@ -28,17 +29,201 @@ static QUERY_DST1: LazyLock<H256> = LazyLock::new(|| utils::make_dst(b"starkom/d
 /// Domain separator tag for the Fiat-Shamir challenge used to build the random linear combination.
 static RLC_DST: LazyLock<H256> = LazyLock::new(|| utils::make_dst(b"starkom/deep/rlc"));
 
-/// Returns the number of FRI queries required to achieve 128-bit security using a blowup factor of
-/// `2^blowup_log2`.
-pub fn num_queries(blowup_log2: usize) -> usize {
-    LAMBDA.div_ceil(blowup_log2)
+/// Domain separator tag for the Fiat-Shamir challenge used to combine the DEEP quotients of all
+/// opened points into a single polynomial.
+static QUOTIENT_DST: LazyLock<H256> = LazyLock::new(|| utils::make_dst(b"starkom/deep/quotient"));
+
+/// Domain separator tag for the proof-of-work hash used for grinding.
+static POW_DST: LazyLock<H256> = LazyLock::new(|| utils::make_dst(b"starkom/deep/pow"));
+
+/// Returns the number of FRI queries required to achieve `security_bits` bits of security using a
+/// blowup factor of `2^blowup_log2` and `grinding_bits` bits of grinding.
+///
+/// Every query provides `blowup_log2` bits of security and grinding provides the rest. At least
+/// one query is always required.
+pub fn num_queries(security_bits: usize, blowup_log2: usize, grinding_bits: usize) -> usize {
+    security_bits
+        .saturating_sub(grinding_bits)
+        .div_ceil(blowup_log2)
+        .max(1)
 }
 
-/// Encodes a `usize` into a `H256` for use in various transcript hashes.
-fn encode_usize(value: usize) -> H256 {
-    let mut bytes = [0u8; 32];
-    bytes[24..32].copy_from_slice(&(value as u64).to_be_bytes());
-    H256::from_slice(&bytes)
+/// The parameters of the DEEP-FRI protocol.
+///
+/// The prover specifies them in [`Committer::new`] and they're recorded in every [`Proof`], so
+/// verifiers must check them against the expected ones (see [`Proof::options`] and
+/// [`Options::satisfies`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Options {
+    /// The proven degree bound, which must be a power of 2.
+    ///
+    /// Honest provers commit polynomials of degree strictly less than this value, but a valid proof
+    /// only guarantees a degree at most equal to it (see [`Proof::verify`]).
+    pub degree_bound: usize,
+
+    /// The target security level in bits.
+    ///
+    /// Every FRI query provides [`blowup_log2`](`Self::blowup_log2`) bits of security and grinding
+    /// provides [`grinding_bits`](`Self::grinding_bits`), so a proof has the smallest number of
+    /// queries that reaches this many bits (see [`num_queries`]). Any value is valid.
+    ///
+    /// The prover chooses it, so verifiers must check it against the expected one (see
+    /// [`Self::satisfies`]).
+    pub security_bits: usize,
+
+    /// The base-2 logarithm of the blowup factor, which must be greater than 0.
+    ///
+    /// The extended evaluation domain has `degree_bound * 2^blowup_log2` elements and its size must
+    /// not exceed the 2-adicity of the base field.
+    pub blowup_log2: usize,
+
+    /// The number of FRI folds per round, which must be greater than 0.
+    ///
+    /// This is the base-2 logarithm of the folding arity: for example, with a fold rate of 3 every
+    /// FRI round folds the polynomial 3 times, dividing its degree bound by 2^3 = 8, and every
+    /// query opens a coset of 8 evaluations in each Merkle tree. Every round performs exactly this
+    /// many folds (see [`Self::max_rounds`]).
+    ///
+    /// Higher rates mean fewer Merkle trees and therefore fewer Merkle paths per query, but larger
+    /// cosets. The optimum depends on the size of the extended domain, and 3 is a good default.
+    pub fold_rate: usize,
+
+    /// The maximum number of FRI folding rounds.
+    ///
+    /// Since every round performs exactly [`fold_rate`](`Self::fold_rate`) folds, the actual number
+    /// of rounds is the minimum between this value and `log2(degree_bound) / fold_rate`, rounded
+    /// down (see [`Self::num_rounds`]). Rather than being folded further, the polynomial resulting
+    /// from the last round is sent in the clear, so it has degree less than
+    /// `degree_bound / 2^(rounds * fold_rate)`. With 0 there's no folding at all and the whole DEEP
+    /// quotient is sent in the clear.
+    ///
+    /// Every round costs a Merkle proof per query, while every coefficient of the folded quotient
+    /// is sent only once, so the optimum stops folding when the number of coefficients is roughly
+    /// comparable to the number of queries times the size of a round's Merkle proof (a few hundred
+    /// coefficients in practice). Any value is valid.
+    pub max_rounds: usize,
+
+    /// The number of grinding bits.
+    ///
+    /// The prover grinds a nonce whose proof-of-work hash has at least this many leading zero bits,
+    /// which takes `2^grinding_bits` hash evaluations on average. Every `blowup_log2` bits of
+    /// grinding save one FRI query (see [`num_queries`]). 0 disables grinding.
+    ///
+    /// Must be at most [`PROOF_OF_WORK_BITS`], the number of bits of the proof-of-work hash,
+    /// because no hash can satisfy more (see [`Self::validate`]). Values above
+    /// [`security_bits`](`Self::security_bits`) are valid but save no further queries, because at
+    /// least one query is always required.
+    pub grinding_bits: usize,
+}
+
+impl Options {
+    /// Returns the size of the extended evaluation domain, `degree_bound * 2^blowup_log2`.
+    ///
+    /// REQUIRES: the options must be [valid](`Self::validate`).
+    pub fn extended_domain_size(&self) -> usize {
+        self.degree_bound << self.blowup_log2
+    }
+
+    /// Returns the number of FRI queries required to achieve
+    /// [`security_bits`](`Self::security_bits`) bits of security with these options (see
+    /// [`num_queries`]).
+    pub fn num_queries(&self) -> usize {
+        num_queries(self.security_bits, self.blowup_log2, self.grinding_bits)
+    }
+
+    /// Returns the number of FRI folding rounds (see [`Self::max_rounds`]), which is also the
+    /// number of Merkle trees of the FRI folding argument.
+    ///
+    /// REQUIRES: the options must be [valid](`Self::validate`).
+    pub fn num_rounds(&self) -> usize {
+        fri::num_rounds(self.degree_bound, self.fold_rate, self.max_rounds)
+    }
+
+    /// Returns true iff these options are acceptable to a verifier that expects `other`: the
+    /// security level and the number of grinding bits must be greater than or equal to the expected
+    /// ones, and all other parameters must be equal.
+    ///
+    /// The number of queries is derived from both (see [`num_queries`]), so a proof with a higher
+    /// security level than expected is at least as sound. Soundness doesn't depend on the number of
+    /// grinding bits, but more grinding bits mean fewer queries, so a proof with more grinding bits
+    /// than expected is never more expensive to verify.
+    pub fn satisfies(&self, other: &Self) -> bool {
+        self.security_bits >= other.security_bits
+            && self.grinding_bits >= other.grinding_bits
+            && Self {
+                security_bits: other.security_bits,
+                grinding_bits: other.grinding_bits,
+                ..*self
+            }
+            .eq(other)
+    }
+
+    /// Checks that these options are valid for the field `F`, returning an error otherwise.
+    ///
+    /// The degree bound must be a power of 2, `blowup_log2` and `fold_rate` must be greater than 0,
+    /// the size of the extended evaluation domain must not exceed the 2-adicity of `F::BaseField`,
+    /// and `grinding_bits` must not exceed [`PROOF_OF_WORK_BITS`]. `security_bits` and `max_rounds`
+    /// can have any value.
+    pub fn validate<F: Field>(&self) -> Result<()> {
+        if !self.degree_bound.is_power_of_two() {
+            return Err(anyhow!(
+                "invalid degree bound {} (not a power of two)",
+                self.degree_bound
+            ));
+        }
+        if self.blowup_log2 == 0 {
+            return Err(anyhow!("invalid blowup factor 2^0"));
+        }
+        if self.fold_rate == 0 {
+            return Err(anyhow!("invalid fold rate 0"));
+        }
+        let degree_bound_log2 = self.degree_bound.trailing_zeros() as usize;
+        if degree_bound_log2 + self.blowup_log2 > F::BaseField::S {
+            return Err(anyhow!(
+                "invalid extended domain size 2^{{{}+{}}} (exceeds the 2-adicity of the field, {})",
+                degree_bound_log2,
+                self.blowup_log2,
+                F::BaseField::S
+            ));
+        }
+        if self.grinding_bits > PROOF_OF_WORK_BITS {
+            return Err(anyhow!(
+                "invalid number of grinding bits {} (exceeds {PROOF_OF_WORK_BITS})",
+                self.grinding_bits
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Computes the proof-of-work hash of a nonce.
+///
+/// `seed` is the hash of the full proof transcript returned by [`query_seed`], so that changing
+/// anything sent before the queries requires redoing the proof of work.
+fn proof_of_work<F: Field256, H: Hasher<F>>(seed: H256, nonce: u64) -> H256 {
+    H::hash_transcript(*POW_DST, &[seed, utils::encode_u64(nonce)])
+}
+
+/// Checks that a proof-of-work hash, interpreted as a big-endian 256-bit integer, has at least
+/// `grinding_bits` leading zero bits.
+fn check_proof_of_work(pow: H256, grinding_bits: usize) -> bool {
+    U256::from_big_endian(pow.as_bytes()).leading_zeros() as usize >= grinding_bits
+}
+
+/// Derives the FRI query indices from a proof-of-work hash via Fiat-Shamir.
+///
+/// The indices are derived from the proof-of-work hash rather than from the query seed, so that a
+/// cheating prover has to find a new valid nonce for every set of indices it wants to try. A single
+/// nonce covers all queries: one nonce per query would allow grinding every index independently,
+/// which defeats the purpose.
+fn get_query_indices<F: Field256, H: Hasher<F>>(pow: H256, options: &Options) -> Vec<usize> {
+    let n = U256::from(options.extended_domain_size() as u64);
+    (0..options.num_queries())
+        .map(|i| {
+            let hash = H::challenge(*QUERY_DST1, &[pow, utils::encode_usize(i)]);
+            (hash.to_u256() % n).as_u64() as usize
+        })
+        .collect()
 }
 
 /// Checks that none of the given points lies inside the evaluation domain of size `n`.
@@ -73,6 +258,74 @@ fn rlc<F: Field>(values: impl IntoIterator<Item = F>, alpha: F) -> F {
     rlc
 }
 
+/// Encodes the transcript of the DEEP layer, that is all Merkle roots of the committed polynomials,
+/// all opened points, and their claimed evaluations.
+fn deep_transcript<F: Field256>(
+    tree_roots: &[H256],
+    num_polys: usize,
+    points: &BTreeMap<F, Vec<F>>,
+) -> impl Iterator<Item = H256> {
+    std::iter::once(utils::encode_usize(tree_roots.len()))
+        .chain(tree_roots.iter().copied())
+        .chain(std::iter::once(utils::encode_usize(num_polys)))
+        .chain(std::iter::once(utils::encode_usize(points.len())))
+        .chain(points.iter().flat_map(|(z, values)| {
+            std::iter::once(z)
+                .chain(values.iter())
+                .map(|value| H256::from_slice(&value.to_be_bytes()))
+        }))
+}
+
+/// Derives the two Fiat-Shamir challenges of the DEEP layer.
+///
+/// The first challenge uses [`RLC_DST`] and is used by the caller to combine all committed
+/// polynomials, while the second one uses [`QUOTIENT_DST`] and is used to combine all DEEP
+/// quotients.
+///
+/// Both challenges are bound to all Merkle roots of the committed polynomials and to all opened
+/// points and their claimed evaluations.
+fn deep_challenges<F: Field256, H: Hasher<F>>(
+    tree_roots: &[H256],
+    num_polys: usize,
+    points: &BTreeMap<F, Vec<F>>,
+) -> (F, F) {
+    let transcript: Vec<H256> = deep_transcript(tree_roots, num_polys, points).collect();
+    (
+        H::challenge(*RLC_DST, transcript.as_slice()),
+        H::challenge(*QUOTIENT_DST, transcript.as_slice()),
+    )
+}
+
+/// Hashes the full transcript of a proof up to the queries: all Merkle roots of the committed
+/// polynomials, all opened points and their claimed evaluations, all FRI roots, and the
+/// coefficients of the folded quotient.
+///
+/// The returned seed is the input of the proof of work, which in turn determines the FRI query
+/// indices (see [`get_query_indices`]).
+fn query_seed<F: Field256, H: Hasher<F>>(
+    tree_roots: &[H256],
+    num_polys: usize,
+    points: &BTreeMap<F, Vec<F>>,
+    fri_commitment: &fri::Commitment<F>,
+) -> H256 {
+    let folded_quotient = fri_commitment.folded_polynomial();
+    H::hash_transcript(
+        *QUERY_DST0,
+        deep_transcript(tree_roots, num_polys, points)
+            .chain(std::iter::once(utils::encode_usize(fri_commitment.len())))
+            .chain(fri_commitment.roots().iter().copied())
+            .chain(std::iter::once(utils::encode_usize(folded_quotient.len())))
+            .chain(
+                folded_quotient
+                    .coefficients()
+                    .iter()
+                    .map(|coefficient| H256::from_slice(&coefficient.to_be_bytes())),
+            )
+            .collect::<Vec<H256>>()
+            .as_slice(),
+    )
+}
+
 /// Checks that the `hash_backend` field of a protobuf identifies the hash backend `T`.
 fn check_hash_backend<T: prost::Name + Default>(
     hash_backend: &Option<prost_types::Any>,
@@ -93,6 +346,9 @@ fn check_hash_backend<T: prost::Name + Default>(
 }
 
 /// A batched DEEP-FRI polynomial commitment (see [`Committer`] for details).
+///
+/// The commitment only depends on the committed polynomials, not on the points opened by a
+/// [`Proof`], so the points can be chosen after committing (see [`Prover::prove`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Commitment<F: Field256, H: Hasher<F>> {
     /// The root hashes of the Merkle trees where the evaluations of all batched polynomials are
@@ -101,8 +357,6 @@ pub struct Commitment<F: Field256, H: Hasher<F>> {
     /// The number of polynomials in each batch, which is also the number of evaluations stored in
     /// each leaf of the corresponding Merkle tree. There is one entry per polynomial batch.
     batch_sizes: Vec<usize>,
-    /// The underlying FRI commitment.
-    inner: fri::Commitment,
     _data: PhantomData<(F, H)>,
 }
 
@@ -120,12 +374,6 @@ impl<F: Field256, H: Hasher<F>> Commitment<F, H> {
         self.batch_sizes.as_slice()
     }
 
-    /// The degree bound this commitment attests to, implied by the number of FRI folding rounds.
-    /// Always equals [`Proof::degree_bound`].
-    pub fn degree_bound(&self) -> usize {
-        1usize << (self.inner.len() - 1)
-    }
-
     /// Hashes the first `batch_count` [tree roots](`Self::tree_roots`).
     ///
     /// The returned hash is cryptographically bound to the full transcript up to the given
@@ -141,34 +389,11 @@ impl<F: Field256, H: Hasher<F>> Commitment<F, H> {
         assert!(batch_count <= self.tree_roots.len());
         H::hash_transcript(
             *TRANSCRIPT_DST,
-            std::iter::once(encode_usize(batch_count))
+            std::iter::once(utils::encode_usize(batch_count))
                 .chain(self.tree_roots[..batch_count].iter().copied())
                 .collect::<Vec<H256>>()
                 .as_slice(),
         )
-    }
-
-    /// Returns the FRI query indices derived via Fiat-Shamir from the full commitment transcript
-    /// (all polynomial and FRI Merkle root hashes).
-    fn get_query_indices(&self, degree_bound: usize, blowup_log2: usize) -> Vec<usize> {
-        let n = U256::from((degree_bound << blowup_log2) as u64);
-        let k = num_queries(blowup_log2);
-        let mut indices = Vec::with_capacity(k);
-        let seed = H::hash_transcript(
-            *QUERY_DST0,
-            std::iter::once(encode_usize(self.tree_roots.len()))
-                .chain(self.tree_roots.iter().copied())
-                .chain(std::iter::once(encode_usize(self.inner.len())))
-                .chain(self.inner.roots().iter().copied())
-                .collect::<Vec<H256>>()
-                .as_slice(),
-        );
-        for i in 0..k {
-            let hash = H::challenge(*QUERY_DST1, &[seed, encode_usize(i)]);
-            let index = hash.to_u256() % n;
-            indices.push(index.as_u64() as usize);
-        }
-        indices
     }
 
     /// Serializes this commitment to a [`Commitment`](`proto::Commitment`) protobuf.
@@ -184,12 +409,6 @@ impl<F: Field256, H: Hasher<F>> Commitment<F, H> {
                     num_polys: num_polys as u64,
                 })
                 .collect(),
-            fri_roots: self
-                .inner
-                .roots()
-                .iter()
-                .map(|&hash| hash.as_bytes().to_vec())
-                .collect(),
         }
     }
 
@@ -199,9 +418,6 @@ impl<F: Field256, H: Hasher<F>> Commitment<F, H> {
 
         if proto.batches.is_empty() {
             return Err(anyhow!("the commitment has no polynomial batches"));
-        }
-        if proto.fri_roots.is_empty() {
-            return Err(anyhow!("the commitment has no FRI roots"));
         }
 
         Ok(Self {
@@ -215,13 +431,6 @@ impl<F: Field256, H: Hasher<F>> Commitment<F, H> {
                 .iter()
                 .map(|batch| Ok(usize::try_from(batch.num_polys)?))
                 .collect::<Result<_>>()?,
-            inner: fri::Commitment::with_roots(
-                proto
-                    .fri_roots
-                    .iter()
-                    .map(|bytes| H::load_hash(bytes.as_slice()))
-                    .collect::<Result<_>>()?,
-            ),
             _data: PhantomData,
         })
     }
@@ -234,14 +443,14 @@ impl<F: Field256, H: Hasher<F>> Commitment<F, H> {
 /// method).
 ///
 /// This two-stage Committer-Prover architecture allows getting Merkle roots for the proven
-/// polynomials before running the FRI folding argument and even before batching all polynomials, so
-/// that Fiat-Shamir challenges can be derived before any quotients are built.
+/// polynomials before batching all of them, so that Fiat-Shamir challenges can be derived between
+/// batches (see [`Self::transcript_hash`]). The opened points don't need to be known at commitment
+/// time either: the [`Prover`] receives them later (see [`Prover::prove`]).
 #[derive(Debug, Clone)]
 pub struct Committer<F: Field256, H: Hasher<F>> {
-    /// The proven degree bound. The degree of all batched polynomials must be less than this value.
-    degree_bound: usize,
-    /// The base-2 logarithm of the blowup factor.
-    blowup_log2: usize,
+    /// The protocol parameters. The degree of all batched polynomials must be less than the degree
+    /// bound.
+    options: Options,
     /// All polynomials batched so far.
     polynomials: Vec<Polynomial<F>>,
     /// The Merkle trees built so far.
@@ -251,21 +460,17 @@ pub struct Committer<F: Field256, H: Hasher<F>> {
 }
 
 impl<F: Field256, H: Hasher<F>> Committer<F, H> {
-    /// Constructs a [`Committer`] with the given degree bound, blowup factor, and first batch of
-    /// polynomials.
+    /// Constructs a [`Committer`] with the given options and first batch of polynomials.
     ///
     /// We require specifying the first batch because our DEEP-FRI protocol requires at least one
     /// committed polynomial to work.
     ///
-    /// `degree_bound` must be a power of 2 less than or equal to `2^(F::BaseField::S)`, and
-    /// `blowup_log2` must not be zero.
-    pub fn new(degree_bound: usize, blowup_log2: usize, polynomials: Vec<Polynomial<F>>) -> Self {
-        assert!(degree_bound.is_power_of_two());
-        assert!(blowup_log2 > 0);
+    /// Panics if the options are [invalid](`Options::validate`).
+    pub fn new(options: Options, polynomials: Vec<Polynomial<F>>) -> Self {
+        options.validate::<F>().expect("invalid DEEP-FRI options");
         assert!(!polynomials.is_empty());
         let mut committer = Self {
-            degree_bound,
-            blowup_log2,
+            options,
             polynomials: vec![],
             trees: vec![],
         };
@@ -273,14 +478,9 @@ impl<F: Field256, H: Hasher<F>> Committer<F, H> {
         committer
     }
 
-    /// Returns the proven degree bound.
-    pub fn degree_bound(&self) -> usize {
-        self.degree_bound
-    }
-
-    /// Returns the size of the extended evaluation domain.
-    pub fn extended_domain_size(&self) -> usize {
-        self.degree_bound << self.blowup_log2
+    /// Returns the protocol parameters.
+    pub fn options(&self) -> &Options {
+        &self.options
     }
 
     /// Returns the number of Merkle trees constructed so far, corresponding to the number of
@@ -307,7 +507,7 @@ impl<F: Field256, H: Hasher<F>> Committer<F, H> {
     pub fn transcript_hash(&self) -> H256 {
         H::hash_transcript(
             *TRANSCRIPT_DST,
-            std::iter::once(encode_usize(self.trees.len()))
+            std::iter::once(utils::encode_usize(self.trees.len()))
                 .chain(self.trees.iter().map(Tree::root_hash))
                 .collect::<Vec<H256>>()
                 .as_slice(),
@@ -320,7 +520,7 @@ impl<F: Field256, H: Hasher<F>> Committer<F, H> {
     /// for the batch.
     ///
     /// REQUIRES: the degree of all specified polynomials must be strictly less than
-    /// [`Self::degree_bound()`].
+    /// the [`degree_bound`](`Options::degree_bound`).
     pub fn add_batch(&mut self, polynomials: Vec<Polynomial<F>>) -> usize {
         assert!(!polynomials.is_empty());
 
@@ -330,9 +530,8 @@ impl<F: Field256, H: Hasher<F>> Committer<F, H> {
             .max()
             .unwrap()
             .next_power_of_two();
-        assert!(degree_bound <= self.degree_bound);
-        let n = self.degree_bound << self.blowup_log2;
-        assert!(n.trailing_zeros() as usize <= F::BaseField::S);
+        assert!(degree_bound <= self.options.degree_bound);
+        let n = self.options.extended_domain_size();
 
         let evaluations = polynomials
             .iter()
@@ -347,77 +546,22 @@ impl<F: Field256, H: Hasher<F>> Committer<F, H> {
         index
     }
 
-    /// Consumes the [`Committer`], calculates all DEEP quotients, and returns a polynomial
-    /// [`Commitment`] and a DEEP-FRI [`Prover`].
+    /// Consumes the [`Committer`] and returns a polynomial [`Commitment`] and a DEEP-FRI [`Prover`]
+    /// for the committed polynomials.
     ///
-    /// `points` is the set of points to open in the [`Prover`]. The contained scalars are
-    /// (off-domain) X-coordinates; the corresponding Y-coordinates will be computed automatically
-    /// for every batched polynomial.
-    pub fn commit(self, points: BTreeSet<F>) -> (Commitment<F, H>, Prover<F, H>) {
-        check_points_off_domain(points.iter().copied(), self.extended_domain_size()).unwrap();
-
-        let points: BTreeMap<F, Vec<F>> = points
-            .iter()
-            .map(|&z| {
-                (
-                    z,
-                    self.polynomials
-                        .iter()
-                        .map(|polynomial| polynomial.evaluate(z))
-                        .collect(),
-                )
-            })
-            .collect();
-
-        let alpha = H::challenge(
-            *RLC_DST,
-            std::iter::once(encode_usize(self.trees.len()))
-                .chain(self.trees.iter().map(Tree::root_hash))
-                .chain(std::iter::once(encode_usize(self.polynomials.len())))
-                .chain(std::iter::once(encode_usize(points.len())))
-                .chain(points.iter().flat_map(|(z, values)| {
-                    std::iter::once(z)
-                        .chain(values.iter())
-                        .map(|value| H256::from_slice(&value.to_be_bytes()))
-                }))
-                .collect::<Vec<H256>>()
-                .as_slice(),
-        );
-
-        let combined = {
-            let mut combined = Polynomial::default();
-            let mut pow = F::ONE;
-            for polynomial in &self.polynomials {
-                combined += polynomial.clone() * pow;
-                pow *= alpha;
-            }
-            combined
-        };
-
-        let quotients = points
-            .iter()
-            .map(|(&z, values)| {
-                let value = rlc(values.iter().copied(), alpha);
-                let (quotient, remainder) = (combined.clone() - value).horner(z);
-                assert_eq!(remainder, F::ZERO);
-                quotient
-            })
-            .collect();
-
-        let inner_prover = fri::Prover::<F, H>::new(quotients, self.degree_bound, self.blowup_log2);
-
+    /// The commitment only depends on the committed polynomials, so the points to open can be
+    /// chosen afterwards, for example by deriving them from the commitment via Fiat-Shamir or by
+    /// letting an interactive verifier request them (see [`Prover::prove`]).
+    pub fn commit(self) -> (Commitment<F, H>, Prover<F, H>) {
         let commitment = Commitment {
             tree_roots: self.trees.iter().map(Tree::root_hash).collect(),
             batch_sizes: self.trees.iter().map(Tree::num_polys).collect(),
-            inner: inner_prover.commit(),
-            _data: Default::default(),
+            _data: PhantomData,
         };
         let prover = Prover {
-            degree_bound: self.degree_bound,
-            blowup_log2: self.blowup_log2,
+            options: self.options,
+            polynomials: self.polynomials,
             trees: self.trees,
-            points,
-            inner_prover,
         };
         (commitment, prover)
     }
@@ -426,44 +570,44 @@ impl<F: Field256, H: Hasher<F>> Committer<F, H> {
 /// A DEEP-FRI proof.
 #[derive(Debug, Clone)]
 pub struct Proof<F: Field256, H: Hasher<F>> {
-    /// The proven degree bound. Honest provers commit polynomials of degree strictly less than this
-    /// value, but a valid proof only guarantees a degree at most equal to it (see
-    /// [`Self::verify`]).
-    degree_bound: usize,
-    /// The base-2 logarithm of the blowup factor.
-    blowup_log2: usize,
+    /// The protocol parameters.
+    options: Options,
+    /// The proof-of-work nonce found by the prover.
+    nonce: u64,
     /// Number of committed polynomials.
     num_polys: usize,
     /// The opened points. Keys are (off-domain) X-coordinates, values are the corresponding
     /// evaluations (one for every committed polynomial).
     points: BTreeMap<F, Vec<F>>,
+    /// The FRI commitment to the combined DEEP quotient of all opened points (see
+    /// [`Prover::prove`]), that is the Merkle roots of the folding rounds and the folded quotient.
+    fri_commitment: fri::Commitment<F>,
     /// Merkle proofs for the points at the query positions, relative to the raw Merkle trees (not
     /// the FRI folds). The outer array has one entry for every FRI query
     /// (`openings.len() == queries.len()`), and the inner arrays contain one proof for every Merkle
     /// tree.
     openings: Vec<Vec<LeafProof<F, H>>>,
-    /// FRI queries on the DEEP quotients. The number of queries is calculated by [`num_queries`]
-    /// above and is tuned so as to achieve 128-bit security.
+    /// FRI queries on the combined DEEP quotient (see [`Prover::prove`]). The number of queries is
+    /// calculated by [`num_queries`] above and is tuned to achieve [`Options::security_bits`] bits
+    /// of security together with grinding.
     queries: Vec<fri::Query<F, H>>,
 }
 
 impl<F: Field256, H: Hasher<F>> Proof<F, H> {
-    /// Returns the proven degree bound.
+    /// Returns the protocol parameters used in the proof.
     ///
-    /// NOTE: a valid proof guarantees that the committed polynomials have degree *at most* this
-    /// value, not strictly less than it. See [`Self::verify`] for details.
-    pub fn degree_bound(&self) -> usize {
-        self.degree_bound
+    /// Callers must check them against the expected ones, typically with [`Options::satisfies`].
+    /// In particular the security level is chosen by the prover, so a proof that isn't checked can
+    /// have as few as one query. Soundness doesn't depend on the number of grinding bits because
+    /// the number of queries is automatically derived from it, but it should still be checked
+    /// along with the other parameters.
+    pub fn options(&self) -> &Options {
+        &self.options
     }
 
-    /// Returns the base-2 logarithm of the blowup factor used in the proof.
-    pub fn blowup_log2(&self) -> usize {
-        self.blowup_log2
-    }
-
-    /// Returns the size of the extended evaluation domain.
-    pub fn extended_domain_size(&self) -> usize {
-        self.degree_bound << self.blowup_log2
+    /// Returns the proof-of-work nonce found by the prover.
+    pub fn nonce(&self) -> u64 {
+        self.nonce
     }
 
     /// Returns the number of committed polynomials.
@@ -480,11 +624,11 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
     /// Verifies this proof against the given commitment.
     ///
     /// If verification succeeds, the committed polynomials have degree *at most*
-    /// [`Self::degree_bound`] and their evaluations at the [opened points](`Self::points`) are the
-    /// ones claimed by the proof.
+    /// [`Options::degree_bound`] and their evaluations at the [opened points](`Self::points`) are
+    /// the ones claimed by the proof.
     ///
     /// WARNING: honest provers commit polynomials of degree *strictly less* than
-    /// [`Self::degree_bound`], but a valid proof only guarantees a degree *at most* equal to it.
+    /// [`Options::degree_bound`], but a valid proof only guarantees a degree *at most* equal to it.
     /// FRI bounds the degree of the DEEP quotients `(f(X) - f(z)) / (X - z)` rather than that of
     /// the committed polynomials `f(X)`, and each quotient has one degree less than its polynomial.
     /// This slack is common to DEEP-FRI implementations (cfr. the description of the "knowledge
@@ -494,14 +638,22 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
     /// equals one of lower degree plus a multiple of `X^degree_bound - 1`, which vanishes on `H`.
     /// Protocols whose soundness depends on the exact degree bound, such as univariate sumcheck,
     /// must take the slack into account.
+    ///
+    /// NOTE: the proof proves the evaluations at whatever points it contains, so callers must check
+    /// that the [opened points](`Self::points`) are the ones they expect.
     pub fn verify(&self, commitment: &Commitment<F, H>) -> Result<()> {
-        check_points_off_domain(self.points.keys().copied(), self.extended_domain_size())?;
+        check_points_off_domain(
+            self.points.keys().copied(),
+            self.options.extended_domain_size(),
+        )?;
 
-        if commitment.inner.len() != self.degree_bound.trailing_zeros() as usize + 1 {
+        if self.fri_commitment.len() != self.options.num_rounds() {
             return Err(anyhow!(
-                "the degree bound {} doesn't match the {} FRI roots of the commitment",
-                self.degree_bound,
-                commitment.inner.len()
+                "the options (degree bound {}, fold rate {}, max rounds {}) don't match the {} FRI roots",
+                self.options.degree_bound,
+                self.options.fold_rate,
+                self.options.max_rounds,
+                self.fri_commitment.len()
             ));
         }
 
@@ -526,41 +678,43 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
             }
         }
 
-        let indices = commitment.get_query_indices(self.degree_bound, self.blowup_log2);
-        if self.openings.len() != indices.len() {
+        // The number of queries must be checked before deriving the query indices, so that the work
+        // of deriving them is bounded by the size of the proof even if its security level is huge.
+        let num_queries = self.options.num_queries();
+        if self.openings.len() != num_queries {
             return Err(anyhow!(
                 "incorrect number of openings (got {}, want {})",
                 self.openings.len(),
-                indices.len()
+                num_queries
             ));
         }
-        if self.queries.len() != indices.len() {
+        if self.queries.len() != num_queries {
             return Err(anyhow!(
                 "incorrect number of queries (got {}, want {})",
                 self.queries.len(),
-                indices.len()
+                num_queries
             ));
         }
 
-        let alpha = H::challenge(
-            *RLC_DST,
-            std::iter::once(encode_usize(commitment.tree_roots().len()))
-                .chain(commitment.tree_roots().iter().copied())
-                .chain(std::iter::once(encode_usize(self.num_polys)))
-                .chain(std::iter::once(encode_usize(self.points.len())))
-                .chain(self.points.iter().flat_map(|(z, values)| {
-                    std::iter::once(z)
-                        .chain(values.iter())
-                        .map(|&value| H256::from_slice(&value.to_be_bytes()))
-                }))
-                .collect::<Vec<H256>>()
-                .as_slice(),
+        let seed = query_seed::<F, H>(
+            commitment.tree_roots(),
+            self.num_polys,
+            &self.points,
+            &self.fri_commitment,
         );
+        let pow = proof_of_work::<F, H>(seed, self.nonce);
+        if !check_proof_of_work(pow, self.options.grinding_bits) {
+            return Err(anyhow!("insufficient proof of work"));
+        }
+        let indices = get_query_indices::<F, H>(pow, &self.options);
+
+        let (alpha, beta) =
+            deep_challenges::<F, H>(commitment.tree_roots(), self.num_polys, &self.points);
 
         for ((query, openings), &expected_index) in
             (self.queries.iter().zip(self.openings.iter())).zip(indices.iter())
         {
-            let (index, _) = query.indices();
+            let index = query.index();
             if index != expected_index {
                 return Err(anyhow!(
                     "wrong query index (got {index}, want {expected_index})",
@@ -580,7 +734,7 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
                 .zip(commitment.batch_sizes())
                 .zip(openings.iter())
             {
-                if 1usize << opening.len() != self.extended_domain_size() {
+                if 1usize << opening.len() != self.options.extended_domain_size() {
                     return Err(anyhow!("invalid opening for index {index}"));
                 }
                 if opening.leaf().len() != batch_size {
@@ -593,10 +747,9 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
                 opening.verify(index, root_hash)?;
             }
 
-            if 1usize << (query.len() - 1) != self.degree_bound {
+            if query.len() != self.options.num_rounds() {
                 return Err(anyhow!("invalid low-degree proof for index {index}"));
             }
-            query.verify(&commitment.inner)?;
 
             let combined = rlc(
                 openings
@@ -605,22 +758,15 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
                 alpha,
             );
 
-            let (quotients, _) = query.values();
-            if quotients.len() != self.points.len() {
-                return Err(anyhow!(
-                    "the number of evaluation claims doesn't match the number of FRI quotients (got {}, want {})",
-                    quotients.len(),
-                    self.points.len()
-                ));
-            }
-
             let x = query.x();
-            for ((&z, values), &quotient) in self.points.iter().zip(quotients.iter()) {
-                let v = rlc(values.iter().copied(), alpha);
-                if quotient * (x - z) != combined - v {
-                    return Err(anyhow!("algebraic check failed at query index {index}"));
-                }
-            }
+            let quotient = rlc(
+                self.points.iter().map(|(&z, values)| {
+                    let v = rlc(values.iter().copied(), alpha);
+                    (combined - v) * (x - z).invert_vartime().unwrap()
+                }),
+                beta,
+            );
+            query.verify(&self.fri_commitment, quotient)?;
         }
 
         Ok(())
@@ -630,8 +776,13 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
     pub fn to_proto(&self) -> proto::Proof {
         proto::Proof {
             hash_backend: Some(Any::from_msg(&H::ProtoTag::default()).unwrap()),
-            degree_bound: self.degree_bound as u64,
-            blowup_log2: self.blowup_log2 as u32,
+            degree_bound: self.options.degree_bound as u64,
+            security_bits: self.options.security_bits as u32,
+            blowup_log2: self.options.blowup_log2 as u32,
+            fold_rate: self.options.fold_rate as u32,
+            max_rounds: self.options.max_rounds as u64,
+            grinding_bits: self.options.grinding_bits as u32,
+            nonce: self.nonce,
             num_polys: self.num_polys as u64,
             points: self
                 .points
@@ -643,6 +794,19 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
                         .map(|value| value.to_le_bytes().to_vec())
                         .collect(),
                 })
+                .collect(),
+            fri_roots: self
+                .fri_commitment
+                .roots()
+                .iter()
+                .map(|&hash| hash.as_bytes().to_vec())
+                .collect(),
+            folded_quotient: self
+                .fri_commitment
+                .folded_polynomial()
+                .coefficients()
+                .iter()
+                .map(|coefficient| coefficient.to_le_bytes().to_vec())
                 .collect(),
             openings: self
                 .openings
@@ -662,31 +826,19 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
     pub fn from_proto(proto: &proto::Proof) -> Result<Self> {
         check_hash_backend::<H::ProtoTag>(&proto.hash_backend)?;
 
-        let degree_bound = proto.degree_bound as usize;
-        let blowup_log2 = proto.blowup_log2 as usize;
-
-        if !degree_bound.is_power_of_two() {
-            return Err(anyhow!(
-                "invalid degree bound {} (not a power of two)",
-                degree_bound
-            ));
-        }
-        if blowup_log2 == 0 {
-            return Err(anyhow!("invalid blowup factor 2^0"));
-        }
-        let degree_bound_log2 = degree_bound.trailing_zeros() as usize;
-        if degree_bound_log2 + blowup_log2 > F::BaseField::S {
-            return Err(anyhow!(
-                "invalid extended domain size 2^{{{}+{}}} (exceeds the 2-adicity of the field, {})",
-                degree_bound_log2,
-                blowup_log2,
-                F::BaseField::S
-            ));
-        }
+        let options = Options {
+            degree_bound: proto.degree_bound as usize,
+            security_bits: proto.security_bits as usize,
+            blowup_log2: proto.blowup_log2 as usize,
+            fold_rate: proto.fold_rate as usize,
+            max_rounds: proto.max_rounds as usize,
+            grinding_bits: proto.grinding_bits as usize,
+        };
+        options.validate::<F>()?;
 
         Ok(Self {
-            degree_bound,
-            blowup_log2,
+            options,
+            nonce: proto.nonce,
             num_polys: proto.num_polys as usize,
             points: proto
                 .points
@@ -702,6 +854,20 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
                     ))
                 })
                 .collect::<Result<_>>()?,
+            fri_commitment: fri::Commitment::new(
+                proto
+                    .fri_roots
+                    .iter()
+                    .map(|bytes| H::load_hash(bytes.as_slice()))
+                    .collect::<Result<_>>()?,
+                Polynomial::with_coefficients(
+                    proto
+                        .folded_quotient
+                        .iter()
+                        .map(|coefficient| utils::load_scalar(coefficient.as_slice()))
+                        .collect::<Result<_>>()?,
+                ),
+            ),
             openings: proto
                 .openings
                 .iter()
@@ -716,7 +882,15 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
             queries: proto
                 .queries
                 .iter()
-                .map(|query| fri::Query::from_proto(degree_bound, blowup_log2, query))
+                .map(|query| {
+                    fri::Query::from_proto(
+                        options.degree_bound,
+                        options.blowup_log2,
+                        options.fold_rate,
+                        options.max_rounds,
+                        query,
+                    )
+                })
                 .collect::<Result<_>>()?,
         })
     }
@@ -727,31 +901,18 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
 /// [`Prover`]s are constructed by [`Committer::commit()`]; see that method for details.
 #[derive(Debug, Clone)]
 pub struct Prover<F: Field256, H: Hasher<F>> {
-    /// The degree bound to prove.
-    degree_bound: usize,
-    /// The base-2 logarithm of the blowup factor.
-    blowup_log2: usize,
+    /// The protocol parameters.
+    options: Options,
+    /// The committed polynomials.
+    polynomials: Vec<Polynomial<F>>,
     /// Raw Merkle trees for the committed polynomials, one for each batch.
     trees: Vec<Tree<F, H>>,
-    /// The opened points.
-    ///
-    /// The keys of the map are the (off-domain) X-coordinates of the points, while values are lists
-    /// of polynomial evaluations at that point (one for every committed polynomial).
-    points: BTreeMap<F, Vec<F>>,
-    /// The underlying FRI prover for the DEEP quotients. There's one quotient for every opened
-    /// point, and all quotients are batched into the same FRI folding argument.
-    inner_prover: fri::Prover<F, H>,
 }
 
 impl<F: Field256, H: Hasher<F>> Prover<F, H> {
-    /// Returns the proven degree bound.
-    pub fn degree_bound(&self) -> usize {
-        self.degree_bound
-    }
-
-    /// Returns the size of the extended evaluation domain.
-    pub fn extended_domain_size(&self) -> usize {
-        self.degree_bound << self.blowup_log2
+    /// Returns the protocol parameters.
+    pub fn options(&self) -> &Options {
+        &self.options
     }
 
     /// Returns the number of committed polynomials.
@@ -772,29 +933,106 @@ impl<F: Field256, H: Hasher<F>> Prover<F, H> {
         self.trees[index].root_hash()
     }
 
-    /// Returns a reference to the opened points. Keys are (off-domain) X-coordinates, values are
-    /// the corresponding evaluations (one for every committed polynomial).
-    pub fn points(&self) -> &BTreeMap<F, Vec<F>> {
-        &self.points
+    /// Carries out an exhaustive search for a valid nonce, stopping when one is found.
+    ///
+    /// This is our proof-of-work algorithm.
+    fn grind_nonce(&self, seed: H256) -> (u64, H256) {
+        for nonce in 0..=u64::MAX {
+            let pow = proof_of_work::<F, H>(seed, nonce);
+            if check_proof_of_work(pow, self.options.grinding_bits) {
+                return (nonce, pow);
+            }
+        }
+        panic!("no valid proof-of-work nonce found");
     }
 
-    /// Makes a DEEP-FRI proof opening the committed polynomials at the points specified at
-    /// commitment time (see [`Committer::commit()`]).
-    pub fn prove(&self, commitment: &Commitment<F, H>) -> Proof<F, H> {
-        let indices = commitment.get_query_indices(self.degree_bound, self.blowup_log2);
+    /// Makes a DEEP-FRI proof opening the committed polynomials at the given points.
+    ///
+    /// `points` contains (off-domain) X-coordinates; the corresponding Y-coordinates are computed
+    /// automatically for every committed polynomial. The DEEP quotients of all opened points are
+    /// combined into a single polynomial with a random linear combination, so the FRI folding
+    /// argument always works on one polynomial regardless of the number of points.
+    ///
+    /// This method can be called several times, so that the same [`Commitment`] can be opened at
+    /// different points by different proofs. However, every proof reveals more information about
+    /// the committed polynomials (the opened evaluations as well as the evaluations at the queried
+    /// positions of the extended domain), so a commitment that must be zero-knowledge must be
+    /// opened only once.
+    ///
+    /// This includes grinding a proof-of-work nonce, which takes
+    /// 2^[`grinding_bits`](`Options::grinding_bits`) hash evaluations on average.
+    ///
+    /// Panics if any of the points lies inside the evaluation domain.
+    pub fn prove(&self, points: BTreeSet<F>) -> Proof<F, H> {
+        check_points_off_domain(points.iter().copied(), self.options.extended_domain_size())
+            .unwrap();
+
+        let points: BTreeMap<F, Vec<F>> = points
+            .into_iter()
+            .map(|z| {
+                (
+                    z,
+                    self.polynomials
+                        .iter()
+                        .map(|polynomial| polynomial.evaluate(z))
+                        .collect(),
+                )
+            })
+            .collect();
+
+        let tree_roots: Vec<H256> = self.trees.iter().map(Tree::root_hash).collect();
+        let num_polys = self.polynomials.len();
+        let (alpha, beta) = deep_challenges::<F, H>(tree_roots.as_slice(), num_polys, &points);
+
+        let combined = {
+            let mut combined = Polynomial::default();
+            let mut pow = F::ONE;
+            for polynomial in &self.polynomials {
+                combined += polynomial.clone() * pow;
+                pow *= alpha;
+            }
+            combined
+        };
+
+        let quotient = {
+            let mut quotient = Polynomial::default();
+            let mut pow = F::ONE;
+            for (&z, values) in &points {
+                let value = rlc(values.iter().copied(), alpha);
+                let (point_quotient, remainder) = (combined.clone() - value).horner(z);
+                assert_eq!(remainder, F::ZERO);
+                quotient += point_quotient * pow;
+                pow *= beta;
+            }
+            quotient
+        };
+
+        let fri_prover = fri::Prover::<F, H>::new(
+            quotient,
+            self.options.degree_bound,
+            self.options.blowup_log2,
+            self.options.fold_rate,
+            self.options.max_rounds,
+        );
+        let fri_commitment = fri_prover.commit();
+
+        let seed = query_seed::<F, H>(tree_roots.as_slice(), num_polys, &points, &fri_commitment);
+        let (nonce, pow) = self.grind_nonce(seed);
+        let indices = get_query_indices::<F, H>(pow, &self.options);
         let openings = indices
             .iter()
             .map(|&index| self.trees.iter().map(|tree| tree.query(index)).collect())
             .collect();
         let queries = indices
             .iter()
-            .map(|&index| self.inner_prover.query(index))
+            .map(|&index| fri_prover.query(index))
             .collect();
         Proof {
-            degree_bound: self.degree_bound,
-            blowup_log2: self.blowup_log2,
-            num_polys: self.num_polys(),
-            points: self.points.clone(),
+            options: self.options,
+            nonce,
+            num_polys,
+            points,
+            fri_commitment,
             openings,
             queries,
         }
@@ -814,241 +1052,1197 @@ mod tests {
         s.parse().unwrap()
     }
 
+    /// Builds a polynomial from its coefficients.
+    fn make_polynomial<F: Field256>(coefficients: &[u64]) -> Polynomial<F> {
+        Polynomial::with_coefficients(coefficients.iter().copied().map(F::from).collect())
+    }
+
+    /// Builds a batch of polynomials, each one from its coefficients.
+    fn make_batch<F: Field256>(batch: &[&[u64]]) -> Vec<Polynomial<F>> {
+        batch
+            .iter()
+            .map(|coefficients| make_polynomial(coefficients))
+            .collect()
+    }
+
+    /// Converts small integers into a set of points to open.
+    fn make_points<F: Field256>(points: &[u64]) -> BTreeSet<F> {
+        points.iter().copied().map(F::from).collect()
+    }
+
+    /// Builds a committer for the given batches of polynomials, adding them in order.
+    fn make_committer<F: Field256, H: Hasher<F>>(
+        options: Options,
+        batches: &[&[&[u64]]],
+    ) -> Committer<F, H> {
+        let mut committer = Committer::new(options, make_batch(batches[0]));
+        for batch in &batches[1..] {
+            committer.add_batch(make_batch(batch));
+        }
+        committer
+    }
+
+    /// The protocol parameters used in most tests.
+    const OPTIONS: Options = Options {
+        degree_bound: 4,
+        security_bits: 128,
+        blowup_log2: 2,
+        fold_rate: 1,
+        max_rounds: usize::MAX,
+        grinding_bits: 0,
+    };
+
+    /// Same as [`OPTIONS`] but with grinding.
+    const GROUND_OPTIONS: Options = Options {
+        grinding_bits: 8,
+        ..OPTIONS
+    };
+
+    /// Two batches of polynomials of degree 3, the first with two polynomials and the second with
+    /// one.
+    const SAMPLE_BATCHES: [&[&[u64]]; 2] = [
+        &[&[12, 34, 56, 78], &[42, 43, 44, 45]],
+        &[&[90, 78, 56, 34]],
+    ];
+
+    /// The points opened in most tests.
+    const SAMPLE_POINTS: [u64; 2] = [123, 456];
+
+    /// Commits to [`SAMPLE_BATCHES`] with the given options and proves their evaluations at
+    /// [`SAMPLE_POINTS`].
+    fn sample_proof(options: Options) -> (Commitment<BS, Sha2Hash<BS>>, Proof<BS, Sha2Hash<BS>>) {
+        let committer = make_committer(options, &SAMPLE_BATCHES);
+        let (commitment, prover) = committer.commit();
+        let proof = prover.prove(make_points(&SAMPLE_POINTS));
+        (commitment, proof)
+    }
+
+    /// Returns the smallest nonce greater than `proof.nonce` that satisfies (`valid == true`) or
+    /// fails (`valid == false`) the proof of work of `proof` against `commitment`.
+    fn find_nonce(
+        commitment: &Commitment<BS, Sha2Hash<BS>>,
+        proof: &Proof<BS, Sha2Hash<BS>>,
+        valid: bool,
+    ) -> u64 {
+        let seed = query_seed::<BS, Sha2Hash<BS>>(
+            commitment.tree_roots(),
+            proof.num_polys,
+            &proof.points,
+            &proof.fri_commitment,
+        );
+        ((proof.nonce + 1)..)
+            .find(|&nonce| {
+                let hash = proof_of_work::<BS, Sha2Hash<BS>>(seed, nonce);
+                check_proof_of_work(hash, proof.options.grinding_bits) == valid
+            })
+            .unwrap()
+    }
+
     #[test]
-    fn test_dsts() {
+    fn test_transcript_dst() {
         assert_eq!(
             *TRANSCRIPT_DST,
             parse("0x09f36235476a658841de9bcdd34e1ac31ec792e41def5de31aecb4eb3bb1816b")
         );
+    }
+
+    #[test]
+    fn test_query_dst0() {
         assert_eq!(
             *QUERY_DST0,
             parse("0xbbec7289b9fc3aade75412c031b62a769b205d1d73b29c9a06dbb91943e046bc")
         );
+    }
+
+    #[test]
+    fn test_query_dst1() {
         assert_eq!(
             *QUERY_DST1,
             parse("0x88209086b178c9f2fb9c2f813cd229e1a2528cb4f5e6cd618710dc9869f14ac5")
         );
+    }
+
+    #[test]
+    fn test_rlc_dst() {
         assert_eq!(
             *RLC_DST,
             parse("0x688ae37e5f05871810e7c6777e1c16c55ef4b14f072357586d7a298cefc11368")
         );
     }
 
-    fn test_prover_impl<F: Field256, H: Hasher<F>>(
-        mut polynomial_batches: Vec<Vec<Polynomial<F>>>,
-        points: &[u16],
-        degree_bound: usize,
-        blowup_log2: usize,
-    ) {
-        let num_batches = polynomial_batches.len();
-        let num_polys = polynomial_batches.iter().map(|batch| batch.len()).sum();
-        let points = BTreeMap::from_iter(points.iter().cloned().map(|z| {
-            (
-                F::from(z),
-                polynomial_batches
-                    .iter()
-                    .flatten()
-                    .map(|polynomial| polynomial.evaluate(z.into()))
-                    .collect::<Vec<F>>(),
-            )
-        }));
-        let first_batch = polynomial_batches.remove(0);
-        let mut committer = Committer::<F, H>::new(degree_bound, blowup_log2, first_batch);
-        let transcript_hashes: Vec<H256> = std::iter::once(committer.transcript_hash())
-            .chain(polynomial_batches.into_iter().map(|batch| {
-                committer.add_batch(batch);
-                committer.transcript_hash()
-            }))
-            .collect();
-        let (commitment, prover) = committer.commit(points.iter().map(|(&z, _)| z).collect());
-        assert_eq!(commitment.degree_bound(), degree_bound);
+    #[test]
+    fn test_quotient_dst() {
         assert_eq!(
-            (0..num_batches)
-                .map(|i| commitment.transcript_hash(i + 1))
-                .collect::<Vec<H256>>(),
-            transcript_hashes
+            *QUOTIENT_DST,
+            parse("0xa7f91ddaa061a34288a9146bf5afc157211da6ec200650dd93daa9cb4c5b4808")
         );
-        assert_eq!(prover.degree_bound(), degree_bound);
-        assert_eq!(prover.extended_domain_size(), degree_bound << blowup_log2);
-        assert_eq!(prover.num_polys(), num_polys);
-        assert_eq!(prover.num_trees(), num_batches);
-        assert_eq!(*prover.points(), points);
-        let proof = prover.prove(&commitment);
-        assert_eq!(proof.degree_bound(), degree_bound);
-        assert_eq!(proof.blowup_log2(), blowup_log2);
-        assert_eq!(proof.extended_domain_size(), degree_bound << blowup_log2);
-        assert_eq!(proof.num_polys(), num_polys);
-        assert!(proof.verify(&commitment).is_ok());
-        assert_eq!(*proof.points(), points);
     }
 
-    fn test_prover(polynomial_batches: Vec<Vec<Vec<u16>>>, points: &[u16], degree_bound: usize) {
-        let bluesky_polynomial_batches: Vec<Vec<Polynomial<BS>>> = polynomial_batches
-            .iter()
-            .map(|batch| {
-                batch
-                    .iter()
-                    .map(|coefficients| {
-                        Polynomial::with_coefficients(
-                            coefficients.iter().copied().map(BS::from).collect(),
-                        )
-                    })
-                    .collect()
-            })
-            .collect();
-        let goldilocks_polynomial_batches: Vec<Vec<Polynomial<GL4>>> = polynomial_batches
-            .iter()
-            .map(|batch| {
-                batch
-                    .iter()
-                    .map(|coefficients| {
-                        Polynomial::with_coefficients(
-                            coefficients.iter().copied().map(GL4::from).collect(),
-                        )
-                    })
-                    .collect()
-            })
-            .collect();
-        test_prover_impl::<BS, Sha2Hash<BS>>(
-            bluesky_polynomial_batches.clone(),
-            points,
-            degree_bound,
-            1,
+    #[test]
+    fn test_pow_dst() {
+        assert_eq!(
+            *POW_DST,
+            parse("0xd659450ee50ebd3de60604eff7a514c5873b63b66073b1164b1cb61b7b113a51")
         );
-        test_prover_impl::<GL4, Sha2Hash<GL4>>(
-            goldilocks_polynomial_batches.clone(),
-            points,
+    }
+
+    fn test_num_queries_impl(
+        security_bits: usize,
+        blowup_log2: usize,
+        grinding_bits: usize,
+        expected: usize,
+    ) {
+        let result = num_queries(security_bits, blowup_log2, grinding_bits);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_num_queries_without_grinding() {
+        test_num_queries_impl(128, 1, 0, 128);
+        test_num_queries_impl(128, 4, 0, 32);
+        test_num_queries_impl(128, 6, 0, 22);
+    }
+
+    #[test]
+    fn test_num_queries_with_grinding() {
+        test_num_queries_impl(128, 4, 1, 32);
+        test_num_queries_impl(128, 4, 4, 31);
+        test_num_queries_impl(128, 4, 20, 27);
+        test_num_queries_impl(128, 6, 20, 18);
+    }
+
+    #[test]
+    fn test_num_queries_with_full_grinding() {
+        test_num_queries_impl(128, 4, 128, 1);
+        test_num_queries_impl(128, 4, 256, 1);
+        test_num_queries_impl(128, 4, 257, 1);
+        test_num_queries_impl(128, 4, usize::MAX, 1);
+    }
+
+    #[test]
+    fn test_num_queries_with_different_security_levels() {
+        test_num_queries_impl(0, 4, 0, 1);
+        test_num_queries_impl(1, 4, 0, 1);
+        test_num_queries_impl(64, 4, 0, 16);
+        test_num_queries_impl(96, 1, 26, 70);
+        test_num_queries_impl(100, 3, 0, 34);
+        test_num_queries_impl(256, 4, 0, 64);
+        test_num_queries_impl(256, 4, 20, 59);
+        test_num_queries_impl(256, 8, 20, 30);
+        test_num_queries_impl(256, 4, 250, 2);
+        test_num_queries_impl(256, 4, 256, 1);
+    }
+
+    #[test]
+    fn test_options_extended_domain_size() {
+        let options = Options {
+            degree_bound: 4096,
+            security_bits: 128,
+            blowup_log2: 6,
+            fold_rate: 1,
+            max_rounds: usize::MAX,
+            grinding_bits: 20,
+        };
+        assert_eq!(options.extended_domain_size(), 1 << 18);
+    }
+
+    #[test]
+    fn test_options_num_queries_without_grinding() {
+        let options = Options {
+            degree_bound: 4096,
+            security_bits: 128,
+            blowup_log2: 6,
+            fold_rate: 1,
+            max_rounds: usize::MAX,
+            grinding_bits: 0,
+        };
+        assert_eq!(options.num_queries(), 22);
+    }
+
+    #[test]
+    fn test_options_num_queries_with_grinding() {
+        let options = Options {
+            degree_bound: 4096,
+            security_bits: 128,
+            blowup_log2: 6,
+            fold_rate: 1,
+            max_rounds: usize::MAX,
+            grinding_bits: 20,
+        };
+        assert_eq!(options.num_queries(), 18);
+    }
+
+    fn test_options_num_queries_impl(security_bits: usize, grinding_bits: usize, expected: usize) {
+        let options = Options {
+            degree_bound: 4096,
+            security_bits,
+            blowup_log2: 6,
+            fold_rate: 1,
+            max_rounds: usize::MAX,
+            grinding_bits,
+        };
+        assert_eq!(options.num_queries(), expected);
+    }
+
+    #[test]
+    fn test_options_num_queries_with_different_security_levels() {
+        test_options_num_queries_impl(64, 0, 11);
+        test_options_num_queries_impl(64, 20, 8);
+        test_options_num_queries_impl(256, 0, 43);
+        test_options_num_queries_impl(256, 20, 40);
+    }
+
+    fn test_options_num_rounds_impl(
+        degree_bound: usize,
+        fold_rate: usize,
+        max_rounds: usize,
+        expected: usize,
+    ) {
+        let options = Options {
             degree_bound,
-            1,
+            security_bits: 128,
+            blowup_log2: 6,
+            fold_rate,
+            max_rounds,
+            grinding_bits: 20,
+        };
+        assert_eq!(options.num_rounds(), expected);
+    }
+
+    #[test]
+    fn test_options_num_rounds() {
+        test_options_num_rounds_impl(1, 3, usize::MAX, 0);
+        test_options_num_rounds_impl(4096, 1, usize::MAX, 12);
+        test_options_num_rounds_impl(4096, 3, usize::MAX, 4);
+        test_options_num_rounds_impl(4096, 5, usize::MAX, 2);
+        test_options_num_rounds_impl(4096, 12, usize::MAX, 1);
+        test_options_num_rounds_impl(4096, 20, usize::MAX, 0);
+    }
+
+    #[test]
+    fn test_options_num_rounds_with_limit() {
+        test_options_num_rounds_impl(4096, 1, 0, 0);
+        test_options_num_rounds_impl(4096, 3, 2, 2);
+        test_options_num_rounds_impl(16384, 3, 2, 2);
+        test_options_num_rounds_impl(16384, 3, 9, 4);
+    }
+
+    fn test_valid_options_impl<F: Field>(
+        degree_bound: usize,
+        blowup_log2: usize,
+        fold_rate: usize,
+        grinding_bits: usize,
+    ) {
+        let options = Options {
+            degree_bound,
+            security_bits: 128,
+            blowup_log2,
+            fold_rate,
+            max_rounds: usize::MAX,
+            grinding_bits,
+        };
+        let result = options.validate::<F>();
+        assert!(result.is_ok());
+    }
+
+    fn test_invalid_options_impl<F: Field>(
+        degree_bound: usize,
+        blowup_log2: usize,
+        fold_rate: usize,
+        grinding_bits: usize,
+    ) {
+        let options = Options {
+            degree_bound,
+            security_bits: 128,
+            blowup_log2,
+            fold_rate,
+            max_rounds: usize::MAX,
+            grinding_bits,
+        };
+        let result = options.validate::<F>();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_valid_options() {
+        test_valid_options_impl::<BS>(4, 2, 1, 8);
+        test_valid_options_impl::<GL4>(4, 2, 1, 8);
+    }
+
+    #[test]
+    fn test_options_with_largest_domain() {
+        test_valid_options_impl::<BS>(1 << 59, 3, 1, 0);
+        test_valid_options_impl::<GL4>(1 << 29, 3, 1, 0);
+    }
+
+    #[test]
+    fn test_options_with_full_grinding() {
+        test_valid_options_impl::<BS>(4, 2, 1, 128);
+        test_valid_options_impl::<BS>(4, 2, 1, 256);
+        test_valid_options_impl::<GL4>(4, 2, 1, 128);
+        test_valid_options_impl::<GL4>(4, 2, 1, 256);
+    }
+
+    #[test]
+    fn test_options_with_zero_degree_bound() {
+        test_invalid_options_impl::<BS>(0, 2, 1, 0);
+        test_invalid_options_impl::<GL4>(0, 2, 1, 0);
+    }
+
+    #[test]
+    fn test_options_with_degree_bound_not_power_of_two() {
+        test_invalid_options_impl::<BS>(6, 2, 1, 0);
+        test_invalid_options_impl::<GL4>(6, 2, 1, 0);
+    }
+
+    #[test]
+    fn test_options_with_zero_blowup_log2() {
+        test_invalid_options_impl::<BS>(4, 0, 1, 0);
+        test_invalid_options_impl::<GL4>(4, 0, 1, 0);
+    }
+
+    #[test]
+    fn test_options_with_oversized_domain() {
+        test_invalid_options_impl::<BS>(1 << 60, 3, 1, 0);
+        test_invalid_options_impl::<GL4>(1 << 30, 3, 1, 0);
+    }
+
+    #[test]
+    fn test_options_with_large_fold_rate() {
+        test_valid_options_impl::<BS>(4, 2, 10, 0);
+        test_valid_options_impl::<GL4>(4, 2, 10, 0);
+    }
+
+    #[test]
+    fn test_options_with_zero_fold_rate() {
+        test_invalid_options_impl::<BS>(4, 2, 0, 0);
+        test_invalid_options_impl::<GL4>(4, 2, 0, 0);
+    }
+
+    #[test]
+    fn test_options_with_unsatisfiable_grinding() {
+        test_invalid_options_impl::<BS>(4, 2, 1, 257);
+        test_invalid_options_impl::<BS>(4, 2, 1, usize::MAX);
+        test_invalid_options_impl::<GL4>(4, 2, 1, 257);
+        test_invalid_options_impl::<GL4>(4, 2, 1, usize::MAX);
+    }
+
+    /// The protocol parameters expected by the verifier in the `Options::satisfies` tests.
+    const EXPECTED_OPTIONS: Options = Options {
+        degree_bound: 4096,
+        security_bits: 128,
+        blowup_log2: 6,
+        fold_rate: 3,
+        max_rounds: 2,
+        grinding_bits: 20,
+    };
+
+    #[test]
+    fn test_equal_options_satisfy() {
+        assert!(EXPECTED_OPTIONS.satisfies(&EXPECTED_OPTIONS));
+    }
+
+    #[test]
+    fn test_options_with_more_grinding_bits_satisfy() {
+        let options = Options {
+            grinding_bits: 21,
+            ..EXPECTED_OPTIONS
+        };
+        assert!(options.satisfies(&EXPECTED_OPTIONS));
+    }
+
+    #[test]
+    fn test_options_with_full_grinding_satisfy() {
+        let options = Options {
+            grinding_bits: PROOF_OF_WORK_BITS,
+            ..EXPECTED_OPTIONS
+        };
+        assert!(options.satisfies(&EXPECTED_OPTIONS));
+    }
+
+    #[test]
+    fn test_options_with_fewer_grinding_bits_dont_satisfy() {
+        let options = Options {
+            grinding_bits: 19,
+            ..EXPECTED_OPTIONS
+        };
+        assert!(!options.satisfies(&EXPECTED_OPTIONS));
+    }
+
+    #[test]
+    fn test_options_without_grinding_dont_satisfy() {
+        let options = Options {
+            grinding_bits: 0,
+            ..EXPECTED_OPTIONS
+        };
+        assert!(!options.satisfies(&EXPECTED_OPTIONS));
+    }
+
+    #[test]
+    fn test_options_with_higher_security_level_satisfy() {
+        let options = Options {
+            security_bits: 256,
+            ..EXPECTED_OPTIONS
+        };
+        assert!(options.satisfies(&EXPECTED_OPTIONS));
+    }
+
+    #[test]
+    fn test_options_with_lower_security_level_dont_satisfy() {
+        let options = Options {
+            security_bits: 127,
+            ..EXPECTED_OPTIONS
+        };
+        assert!(!options.satisfies(&EXPECTED_OPTIONS));
+    }
+
+    #[test]
+    fn test_options_with_higher_security_level_and_fewer_grinding_bits_dont_satisfy() {
+        let options = Options {
+            security_bits: 256,
+            grinding_bits: 19,
+            ..EXPECTED_OPTIONS
+        };
+        assert!(!options.satisfies(&EXPECTED_OPTIONS));
+    }
+
+    fn test_options_dont_satisfy_impl(options: Options) {
+        assert!(!options.satisfies(&EXPECTED_OPTIONS));
+        assert!(
+            !Options {
+                grinding_bits: 21,
+                ..options
+            }
+            .satisfies(&EXPECTED_OPTIONS)
         );
-        test_prover_impl::<BS, Sha2Hash<BS>>(
-            bluesky_polynomial_batches.clone(),
-            points,
-            degree_bound,
-            2,
+        assert!(
+            !Options {
+                security_bits: 256,
+                ..options
+            }
+            .satisfies(&EXPECTED_OPTIONS)
         );
-        test_prover_impl::<GL4, Sha2Hash<GL4>>(
-            goldilocks_polynomial_batches.clone(),
-            points,
-            degree_bound,
-            2,
+    }
+
+    #[test]
+    fn test_options_with_different_degree_bound_dont_satisfy() {
+        test_options_dont_satisfy_impl(Options {
+            degree_bound: 2048,
+            ..EXPECTED_OPTIONS
+        });
+        test_options_dont_satisfy_impl(Options {
+            degree_bound: 8192,
+            ..EXPECTED_OPTIONS
+        });
+    }
+
+    #[test]
+    fn test_options_with_different_blowup_dont_satisfy() {
+        test_options_dont_satisfy_impl(Options {
+            blowup_log2: 5,
+            ..EXPECTED_OPTIONS
+        });
+        test_options_dont_satisfy_impl(Options {
+            blowup_log2: 7,
+            ..EXPECTED_OPTIONS
+        });
+    }
+
+    #[test]
+    fn test_options_with_different_fold_rate_dont_satisfy() {
+        test_options_dont_satisfy_impl(Options {
+            fold_rate: 2,
+            ..EXPECTED_OPTIONS
+        });
+        test_options_dont_satisfy_impl(Options {
+            fold_rate: 4,
+            ..EXPECTED_OPTIONS
+        });
+    }
+
+    #[test]
+    fn test_options_with_different_max_rounds_dont_satisfy() {
+        test_options_dont_satisfy_impl(Options {
+            max_rounds: 1,
+            ..EXPECTED_OPTIONS
+        });
+        test_options_dont_satisfy_impl(Options {
+            max_rounds: 3,
+            ..EXPECTED_OPTIONS
+        });
+    }
+
+    #[test]
+    fn test_proof_of_work_sha2() {
+        let hash = proof_of_work::<BS, Sha2Hash<BS>>(H256::repeat_byte(0x12), 34);
+        assert_eq!(
+            hash,
+            parse("0x751c67edba4c1538ab9e01f62307319cbc97f2bd598d3a55686031fb84e96de6")
         );
-        test_prover_impl::<BS, Sha2Hash<BS>>(
-            bluesky_polynomial_batches.clone(),
-            points,
-            degree_bound,
+    }
+
+    #[test]
+    fn test_proof_of_work_keccak256() {
+        let hash = proof_of_work::<BS, Keccak256Hash<BS>>(H256::repeat_byte(0x12), 34);
+        assert_eq!(
+            hash,
+            parse("0x4bd47978101f127ba6b5f99dff54c6110e351615a65e4f8a9fbfc9003ceaa5ec")
+        );
+    }
+
+    fn test_check_proof_of_work_impl(hash: H256, grinding_bits: usize, expected: bool) {
+        let result = check_proof_of_work(hash, grinding_bits);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_check_proof_of_work_without_leading_zeros() {
+        let hash = H256::repeat_byte(0xFF);
+        test_check_proof_of_work_impl(hash, 0, true);
+        test_check_proof_of_work_impl(hash, 1, false);
+    }
+
+    #[test]
+    fn test_check_proof_of_work_with_19_leading_zeros() {
+        let hash = parse("0x00001fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        test_check_proof_of_work_impl(hash, 19, true);
+        test_check_proof_of_work_impl(hash, 20, false);
+    }
+
+    #[test]
+    fn test_check_proof_of_work_with_255_leading_zeros() {
+        let hash = H256::from_low_u64_be(1);
+        test_check_proof_of_work_impl(hash, 255, true);
+        test_check_proof_of_work_impl(hash, 256, false);
+    }
+
+    #[test]
+    fn test_check_zero_proof_of_work() {
+        let hash = H256::zero();
+        test_check_proof_of_work_impl(hash, 256, true);
+        test_check_proof_of_work_impl(hash, 257, false);
+        test_check_proof_of_work_impl(hash, usize::MAX, false);
+    }
+
+    #[test]
+    fn test_query_indices() {
+        let options = Options {
+            degree_bound: 4,
+            security_bits: 128,
+            blowup_log2: 4,
+            fold_rate: 1,
+            max_rounds: usize::MAX,
+            grinding_bits: 104,
+        };
+        let indices = get_query_indices::<BS, Sha2Hash<BS>>(H256::repeat_byte(0x34), &options);
+        assert_eq!(indices, [27, 59, 7, 21, 14, 33]);
+    }
+
+    #[test]
+    fn test_points_off_domain() {
+        let points = make_points::<BS>(&SAMPLE_POINTS);
+        let result = check_points_off_domain(points, 16);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_point_on_domain() {
+        let points = [BS::from_const(123), Polynomial::<BS>::coset_element2(3, 16)];
+        let result = check_points_off_domain(points, 16);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_rlc() {
+        let values = [BS::from_const(1), BS::from_const(2), BS::from_const(3)];
+        let result = rlc(values, BS::from_const(10));
+        assert_eq!(result, BS::from_const(321));
+    }
+
+    #[test]
+    fn test_rlc_of_no_values() {
+        let result = rlc([], BS::from_const(10));
+        assert_eq!(result, BS::ZERO);
+    }
+
+    /// The Merkle roots of the committed polynomials used to test the Fiat-Shamir transcript.
+    fn transcript_tree_roots() -> [H256; 2] {
+        [H256::repeat_byte(0x56), H256::repeat_byte(0x78)]
+    }
+
+    /// The opened points and evaluations (of three polynomials) used to test the Fiat-Shamir
+    /// transcript.
+    fn transcript_points() -> BTreeMap<BS, Vec<BS>> {
+        BTreeMap::from([
+            (
+                BS::from_const(123),
+                vec![BS::from_const(1), BS::from_const(2), BS::from_const(3)],
+            ),
+            (
+                BS::from_const(456),
+                vec![BS::from_const(4), BS::from_const(5), BS::from_const(6)],
+            ),
+        ])
+    }
+
+    /// A FRI commitment with two roots and a folded quotient of two coefficients, used to test the
+    /// Fiat-Shamir transcript.
+    fn transcript_fri_commitment() -> fri::Commitment<BS> {
+        fri::Commitment::new(
+            vec![H256::repeat_byte(0x9a), H256::repeat_byte(0xbc)],
+            Polynomial::with_coefficients(vec![BS::from_const(7), BS::from_const(8)]),
+        )
+    }
+
+    #[test]
+    fn test_deep_challenges() {
+        let (alpha, beta) =
+            deep_challenges::<BS, Sha2Hash<BS>>(&transcript_tree_roots(), 3, &transcript_points());
+        assert_eq!(
+            alpha,
+            parse("0x097f51584f3018cfb58caa2989196f63076af96bff20325da17bf923ef269335")
+        );
+        assert_eq!(
+            beta,
+            parse("0x152a37a010a775d0c161debac79b64a26f915125a5e1fff14b875fc51d9301f7")
+        );
+    }
+
+    #[test]
+    fn test_query_seed() {
+        let seed = query_seed::<BS, Sha2Hash<BS>>(
+            &transcript_tree_roots(),
             3,
+            &transcript_points(),
+            &transcript_fri_commitment(),
         );
-        test_prover_impl::<GL4, Sha2Hash<GL4>>(
-            goldilocks_polynomial_batches.clone(),
-            points,
-            degree_bound,
-            3,
+        assert_eq!(
+            seed,
+            parse("0xc3749a4732349eda6ce66d199ac4fa709842b54fa6e99c88ed80fb2d75f411c5")
         );
-        test_prover_impl::<BS, Keccak256Hash<BS>>(
-            bluesky_polynomial_batches.clone(),
-            points,
-            degree_bound,
-            2,
+    }
+
+    #[test]
+    fn test_query_seed_binds_points() {
+        let tree_roots = transcript_tree_roots();
+        let points = transcript_points();
+        let mut other_points = points.clone();
+        let values = other_points.remove(&BS::from_const(456)).unwrap();
+        other_points.insert(BS::from_const(789), values);
+        let fri_commitment = transcript_fri_commitment();
+        let seed = query_seed::<BS, Sha2Hash<BS>>(&tree_roots, 3, &points, &fri_commitment);
+        let other_seed =
+            query_seed::<BS, Sha2Hash<BS>>(&tree_roots, 3, &other_points, &fri_commitment);
+        assert_ne!(seed, other_seed);
+    }
+
+    #[test]
+    fn test_query_seed_binds_evaluations() {
+        let tree_roots = transcript_tree_roots();
+        let points = transcript_points();
+        let mut other_points = points.clone();
+        other_points.get_mut(&BS::from_const(456)).unwrap()[2] += BS::ONE;
+        let fri_commitment = transcript_fri_commitment();
+        let seed = query_seed::<BS, Sha2Hash<BS>>(&tree_roots, 3, &points, &fri_commitment);
+        let other_seed =
+            query_seed::<BS, Sha2Hash<BS>>(&tree_roots, 3, &other_points, &fri_commitment);
+        assert_ne!(seed, other_seed);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_committer_with_invalid_options() {
+        Committer::<BS, Sha2Hash<BS>>::new(
+            Options {
+                degree_bound: 6,
+                security_bits: 128,
+                blowup_log2: 2,
+                fold_rate: 1,
+                max_rounds: usize::MAX,
+                grinding_bits: 0,
+            },
+            make_batch(&[&[12, 34]]),
         );
-        test_prover_impl::<GL4, Keccak256Hash<GL4>>(
-            goldilocks_polynomial_batches.clone(),
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_committer_without_polynomials() {
+        Committer::<BS, Sha2Hash<BS>>::new(OPTIONS, vec![]);
+    }
+
+    #[test]
+    fn test_committer_options() {
+        let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
+        assert_eq!(*committer.options(), OPTIONS);
+    }
+
+    #[test]
+    fn test_committer_num_trees() {
+        let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
+        assert_eq!(committer.num_trees(), 2);
+    }
+
+    #[test]
+    fn test_committer_root_hashes() {
+        let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
+        assert_eq!(
+            committer.root_hash(0),
+            parse("0x8a560267cca9607a73ad5186d575443499a19685f460be07ff3928387dcb5a48")
+        );
+        assert_eq!(
+            committer.root_hash(1),
+            parse("0x917d1c95f6c177b6a0ff720557fa391335d0e6710f0029c60bbef44234a03b85")
+        );
+    }
+
+    #[test]
+    fn test_committer_transcript_hash_after_first_batch() {
+        let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES[0..1]);
+        let hash = committer.transcript_hash();
+        assert_eq!(
+            hash,
+            parse("0x608c3f1c8a1354d04f2b596ff716e064e3d98d59ff9523bb2e8ecd1061c81816")
+        );
+    }
+
+    #[test]
+    fn test_committer_transcript_hash_after_second_batch() {
+        let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
+        let hash = committer.transcript_hash();
+        assert_eq!(
+            hash,
+            parse("0xabc67f0c49806951ed936b32229b6fac2095f57a4524231fde67f63932692719")
+        );
+    }
+
+    #[test]
+    fn test_add_batch() {
+        let mut committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
+        let index = committer.add_batch(make_batch(&[&[12, 34]]));
+        assert_eq!(index, 2);
+        assert_eq!(committer.num_trees(), 3);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_add_empty_batch() {
+        let mut committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
+        committer.add_batch(vec![]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_add_batch_exceeding_degree_bound() {
+        let mut committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
+        committer.add_batch(make_batch(&[&[12, 34, 56, 78, 90]]));
+    }
+
+    #[test]
+    fn test_commitment_tree_roots() {
+        let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
+        let (commitment, _) = committer.commit();
+        assert_eq!(
+            commitment.tree_roots(),
+            [
+                parse::<H256>("0x8a560267cca9607a73ad5186d575443499a19685f460be07ff3928387dcb5a48"),
+                parse("0x917d1c95f6c177b6a0ff720557fa391335d0e6710f0029c60bbef44234a03b85")
+            ]
+        );
+    }
+
+    #[test]
+    fn test_commitment_batch_sizes() {
+        let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
+        let (commitment, _) = committer.commit();
+        assert_eq!(commitment.batch_sizes(), [2, 1]);
+    }
+
+    #[test]
+    fn test_commitment_transcript_hash_of_first_batch() {
+        let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
+        let (commitment, _) = committer.commit();
+        let hash = commitment.transcript_hash(1);
+        assert_eq!(
+            hash,
+            parse("0x608c3f1c8a1354d04f2b596ff716e064e3d98d59ff9523bb2e8ecd1061c81816")
+        );
+    }
+
+    #[test]
+    fn test_commitment_transcript_hash_of_all_batches() {
+        let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
+        let (commitment, _) = committer.commit();
+        let hash = commitment.transcript_hash(2);
+        assert_eq!(
+            hash,
+            parse("0xabc67f0c49806951ed936b32229b6fac2095f57a4524231fde67f63932692719")
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_commitment_transcript_hash_of_no_batches() {
+        let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
+        let (commitment, _) = committer.commit();
+        commitment.transcript_hash(0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_commitment_transcript_hash_of_too_many_batches() {
+        let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
+        let (commitment, _) = committer.commit();
+        commitment.transcript_hash(3);
+    }
+
+    #[test]
+    fn test_commitment_to_proto() {
+        let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
+        let (commitment, _) = committer.commit();
+        let proto = commitment.to_proto();
+        assert_eq!(
+            proto.batches,
+            [
+                proto::commitment::Batch {
+                    root: commitment.tree_roots[0].as_bytes().to_vec(),
+                    num_polys: 2,
+                },
+                proto::commitment::Batch {
+                    root: commitment.tree_roots[1].as_bytes().to_vec(),
+                    num_polys: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_commitment_from_proto() {
+        let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
+        let (commitment, _) = committer.commit();
+        let proto = commitment.to_proto();
+        let decoded = Commitment::<BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
+        assert_eq!(decoded, commitment);
+    }
+
+    #[test]
+    fn test_reject_commitment_without_batches() {
+        let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
+        let (commitment, _) = committer.commit();
+        let mut proto = commitment.to_proto();
+        proto.batches.clear();
+        let result = Commitment::<BS, Sha2Hash<BS>>::from_proto(&proto);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_commitment_with_short_root() {
+        let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
+        let (commitment, _) = committer.commit();
+        let mut proto = commitment.to_proto();
+        proto.batches[1].root.pop();
+        let result = Commitment::<BS, Sha2Hash<BS>>::from_proto(&proto);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_commitment_without_hash_backend() {
+        let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
+        let (commitment, _) = committer.commit();
+        let mut proto = commitment.to_proto();
+        proto.hash_backend = None;
+        let result = Commitment::<BS, Sha2Hash<BS>>::from_proto(&proto);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_commitment_with_wrong_hash_backend() {
+        let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
+        let (commitment, _) = committer.commit();
+        let proto = commitment.to_proto();
+        let result = Commitment::<BS, Keccak256Hash<BS>>::from_proto(&proto);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_prover_options() {
+        let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
+        let (_, prover) = committer.commit();
+        assert_eq!(*prover.options(), OPTIONS);
+    }
+
+    #[test]
+    fn test_prover_num_polys() {
+        let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
+        let (_, prover) = committer.commit();
+        assert_eq!(prover.num_polys(), 3);
+    }
+
+    #[test]
+    fn test_prover_num_trees() {
+        let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
+        let (_, prover) = committer.commit();
+        assert_eq!(prover.num_trees(), 2);
+    }
+
+    #[test]
+    fn test_prover_root_hashes() {
+        let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
+        let (_, prover) = committer.commit();
+        assert_eq!(
+            prover.root_hash(0),
+            parse("0x8a560267cca9607a73ad5186d575443499a19685f460be07ff3928387dcb5a48")
+        );
+        assert_eq!(
+            prover.root_hash(1),
+            parse("0x917d1c95f6c177b6a0ff720557fa391335d0e6710f0029c60bbef44234a03b85")
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_prove_point_on_domain() {
+        let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
+        let (_, prover) = committer.commit();
+        let z = Polynomial::<BS>::coset_element2(3, OPTIONS.extended_domain_size());
+        prover.prove(BTreeSet::from([z]));
+    }
+
+    #[test]
+    fn test_proof_points() {
+        let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
+        let (_, prover) = committer.commit();
+        let proof = prover.prove(make_points(&SAMPLE_POINTS));
+        assert_eq!(
+            *proof.points(),
+            BTreeMap::from([
+                (
+                    BS::from_const(123),
+                    vec![
+                        BS::from_const(145999044),
+                        BS::from_const(84410022),
+                        BS::from_const(64126386),
+                    ]
+                ),
+                (
+                    BS::from_const(456),
+                    vec![
+                        BS::from_const(7407527580),
+                        BS::from_const(4276015554),
+                        BS::from_const(3235519818),
+                    ]
+                ),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_proof_options() {
+        let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
+        let (_, prover) = committer.commit();
+        let proof = prover.prove(make_points(&SAMPLE_POINTS));
+        assert_eq!(*proof.options(), OPTIONS);
+    }
+
+    #[test]
+    fn test_proof_num_polys() {
+        let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
+        let (_, prover) = committer.commit();
+        let proof = prover.prove(make_points(&SAMPLE_POINTS));
+        assert_eq!(proof.num_polys(), 3);
+    }
+
+    #[test]
+    fn test_proof_fri_roots() {
+        let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
+        let (_, prover) = committer.commit();
+        let proof = prover.prove(make_points(&SAMPLE_POINTS));
+        assert_eq!(
+            proof.fri_commitment.roots(),
+            [
+                parse::<H256>("0x1cfc697bb66e15c8357f7a749010a210ae829f520944e21e4df00cfa7212ec8c"),
+                parse("0xc61b2df672d90a4aef984d6b7d485f673cec75f1868d39e6ba659a4ec3883f6f"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_proof_folded_quotient() {
+        let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
+        let (_, prover) = committer.commit();
+        let proof = prover.prove(make_points(&SAMPLE_POINTS));
+        assert_eq!(
+            proof.fri_commitment.folded_polynomial().coefficients(),
+            [parse::<BS>(
+                "0x0e9f1ad4b8e8061af017e701db60283baf50808a86959003141baed02ddbf544"
+            )]
+        );
+    }
+
+    #[test]
+    fn test_proof_nonce_without_grinding() {
+        let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
+        let (_, prover) = committer.commit();
+        let proof = prover.prove(make_points(&SAMPLE_POINTS));
+        assert_eq!(proof.nonce(), 0);
+    }
+
+    #[test]
+    fn test_proof_nonce_with_grinding() {
+        let committer = make_committer::<BS, Sha2Hash<BS>>(GROUND_OPTIONS, &SAMPLE_BATCHES);
+        let (_, prover) = committer.commit();
+        let proof = prover.prove(make_points(&SAMPLE_POINTS));
+        assert_eq!(proof.nonce(), 204);
+    }
+
+    #[test]
+    fn test_proof_size_without_grinding() {
+        let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
+        let (_, prover) = committer.commit();
+        let proof = prover.prove(make_points(&SAMPLE_POINTS));
+        assert_eq!(proof.openings.len(), 64);
+        assert_eq!(proof.queries.len(), 64);
+    }
+
+    #[test]
+    fn test_proof_size_with_grinding() {
+        let committer = make_committer::<BS, Sha2Hash<BS>>(GROUND_OPTIONS, &SAMPLE_BATCHES);
+        let (_, prover) = committer.commit();
+        let proof = prover.prove(make_points(&SAMPLE_POINTS));
+        assert_eq!(proof.openings.len(), 60);
+        assert_eq!(proof.queries.len(), 60);
+    }
+
+    fn test_proof_num_queries_impl(security_bits: usize, grinding_bits: usize, expected: usize) {
+        let options = Options {
+            security_bits,
+            grinding_bits,
+            ..OPTIONS
+        };
+        let (commitment, proof) = sample_proof(options);
+        let result = proof.verify(&commitment);
+        assert_eq!(proof.options().security_bits, security_bits);
+        assert_eq!(proof.openings.len(), expected);
+        assert_eq!(proof.queries.len(), expected);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_proof_num_queries_with_different_security_levels() {
+        test_proof_num_queries_impl(0, 0, 1);
+        test_proof_num_queries_impl(3, 0, 2);
+        test_proof_num_queries_impl(64, 0, 32);
+        test_proof_num_queries_impl(128, 0, 64);
+        test_proof_num_queries_impl(256, 0, 128);
+        test_proof_num_queries_impl(8, 8, 1);
+        test_proof_num_queries_impl(128, 8, 60);
+        test_proof_num_queries_impl(256, 8, 124);
+    }
+
+    fn test_honest_proof_impl<F: Field256, H: Hasher<F>>(
+        batches: &[&[&[u64]]],
+        points: &[u64],
+        options: Options,
+    ) {
+        let committer = make_committer::<F, H>(options, batches);
+        let (commitment, prover) = committer.commit();
+        let proof = prover.prove(make_points(points));
+        let result = proof.verify(&commitment);
+        assert!(result.is_ok());
+    }
+
+    fn test_honest_proof_with_options(batches: &[&[&[u64]]], points: &[u64], options: Options) {
+        test_honest_proof_impl::<BS, Sha2Hash<BS>>(batches, points, options);
+        test_honest_proof_impl::<BS, Keccak256Hash<BS>>(batches, points, options);
+        test_honest_proof_impl::<GL4, Sha2Hash<GL4>>(batches, points, options);
+        test_honest_proof_impl::<GL4, Keccak256Hash<GL4>>(batches, points, options);
+    }
+
+    fn test_honest_proof(batches: &[&[&[u64]]], points: &[u64], degree_bound: usize) {
+        test_honest_proof_with_options(
+            batches,
             points,
-            degree_bound,
-            2,
+            Options {
+                degree_bound,
+                ..OPTIONS
+            },
         );
     }
 
     #[test]
     fn test_one_constant_polynomial_one_point_1() {
-        test_prover(vec![vec![vec![12]]], &[123], 1);
+        test_honest_proof(&[&[&[12]]], &[123], 1);
     }
 
     #[test]
     fn test_one_constant_polynomial_one_point_2() {
-        test_prover(vec![vec![vec![12]]], &[321], 1);
+        test_honest_proof(&[&[&[12]]], &[321], 1);
     }
 
     #[test]
     fn test_one_constant_polynomial_one_point_3() {
-        test_prover(vec![vec![vec![34]]], &[123], 1);
+        test_honest_proof(&[&[&[34]]], &[123], 1);
     }
 
     #[test]
     fn test_one_constant_polynomial_two_points() {
-        test_prover(vec![vec![vec![12]]], &[123, 456], 1);
+        test_honest_proof(&[&[&[12]]], &[123, 456], 1);
     }
 
     #[test]
     fn test_one_constant_polynomial_three_points() {
-        test_prover(vec![vec![vec![12]]], &[789, 456, 123], 1);
+        test_honest_proof(&[&[&[12]]], &[789, 456, 123], 1);
     }
 
     #[test]
     fn test_one_polynomial_degree_one_one_point_1() {
-        test_prover(vec![vec![vec![12, 34]]], &[123], 2);
+        test_honest_proof(&[&[&[12, 34]]], &[123], 2);
     }
 
     #[test]
     fn test_one_polynomial_degree_one_one_point_2() {
-        test_prover(vec![vec![vec![12, 34]]], &[321], 2);
+        test_honest_proof(&[&[&[12, 34]]], &[321], 2);
     }
 
     #[test]
     fn test_one_polynomial_degree_one_one_point_3() {
-        test_prover(vec![vec![vec![34, 56]]], &[123], 2);
+        test_honest_proof(&[&[&[34, 56]]], &[123], 2);
     }
 
     #[test]
     fn test_one_polynomial_degree_one_two_points() {
-        test_prover(vec![vec![vec![12, 34]]], &[123, 456], 2);
+        test_honest_proof(&[&[&[12, 34]]], &[123, 456], 2);
     }
 
     #[test]
     fn test_one_polynomial_degree_one_three_points() {
-        test_prover(vec![vec![vec![12, 34]]], &[789, 456, 123], 2);
+        test_honest_proof(&[&[&[12, 34]]], &[789, 456, 123], 2);
     }
 
     #[test]
     fn test_two_polynomials_degree_three_one_point_1() {
-        test_prover(
-            vec![vec![vec![12, 34, 56, 78], vec![42, 43, 44, 45]]],
-            &[123],
-            4,
-        );
+        test_honest_proof(&[&[&[12, 34, 56, 78], &[42, 43, 44, 45]]], &[123], 4);
     }
 
     #[test]
     fn test_two_polynomials_degree_three_one_point_2() {
-        test_prover(
-            vec![vec![vec![12, 34, 56, 78], vec![42, 43, 44, 45]]],
-            &[321],
-            4,
-        );
+        test_honest_proof(&[&[&[12, 34, 56, 78], &[42, 43, 44, 45]]], &[321], 4);
     }
 
     #[test]
     fn test_two_polynomials_degree_three_one_point_3() {
-        test_prover(
-            vec![vec![vec![45, 44, 43, 42], vec![78, 56, 34, 12]]],
-            &[123],
-            4,
-        );
+        test_honest_proof(&[&[&[45, 44, 43, 42], &[78, 56, 34, 12]]], &[123], 4);
     }
 
     #[test]
     fn test_two_polynomials_degree_three_two_points() {
-        test_prover(
-            vec![vec![vec![12, 34, 56, 78], vec![42, 43, 44, 45]]],
-            &[123, 456],
-            4,
-        );
+        test_honest_proof(&[&[&[12, 34, 56, 78], &[42, 43, 44, 45]]], &[123, 456], 4);
     }
 
     #[test]
     fn test_two_polynomials_degree_three_three_points() {
-        test_prover(
-            vec![vec![vec![12, 34, 56, 78], vec![42, 43, 44, 45]]],
+        test_honest_proof(
+            &[&[&[12, 34, 56, 78], &[42, 43, 44, 45]]],
             &[789, 456, 123],
             4,
         );
@@ -1056,8 +2250,8 @@ mod tests {
 
     #[test]
     fn test_two_batches_one_and_one() {
-        test_prover(
-            vec![vec![vec![12, 34, 56, 78]], vec![vec![42, 43, 44, 45]]],
+        test_honest_proof(
+            &[&[&[12, 34, 56, 78]], &[&[42, 43, 44, 45]]],
             &[123, 456],
             4,
         );
@@ -1065,10 +2259,10 @@ mod tests {
 
     #[test]
     fn test_two_batches_two_and_one() {
-        test_prover(
-            vec![
-                vec![vec![12, 34, 56, 78], vec![90, 78, 56, 34]],
-                vec![vec![42, 43, 44, 45]],
+        test_honest_proof(
+            &[
+                &[&[12, 34, 56, 78], &[90, 78, 56, 34]],
+                &[&[42, 43, 44, 45]],
             ],
             &[456, 789],
             4,
@@ -1077,346 +2271,692 @@ mod tests {
 
     #[test]
     fn test_two_batches_one_and_two() {
-        test_prover(
-            vec![
-                vec![vec![90, 78, 56, 34]],
-                vec![vec![12, 34, 56, 78], vec![42, 43, 44, 45]],
+        test_honest_proof(
+            &[
+                &[&[90, 78, 56, 34]],
+                &[&[12, 34, 56, 78], &[42, 43, 44, 45]],
             ],
             &[456, 789],
             4,
         );
     }
 
-    const ADVERSARIAL_DEGREE_BOUND: usize = 4;
-    const ADVERSARIAL_BLOWUP_LOG2: usize = 2;
-
-    fn polynomial(coefficients: &[u16]) -> Polynomial<BS> {
-        Polynomial::with_coefficients(coefficients.iter().copied().map(BS::from).collect())
+    #[test]
+    fn test_polynomial_below_degree_bound() {
+        test_honest_proof(&[&[&[12, 34]]], &[123, 456], 8);
     }
 
-    fn adversarial_setup() -> (Commitment<BS, Sha2Hash<BS>>, Proof<BS, Sha2Hash<BS>>) {
-        let mut committer = Committer::<BS, Sha2Hash<BS>>::new(
-            ADVERSARIAL_DEGREE_BOUND,
-            ADVERSARIAL_BLOWUP_LOG2,
-            vec![polynomial(&[12, 34, 56, 78]), polynomial(&[42, 43, 44, 45])],
+    #[test]
+    fn test_honest_proof_blowup_2() {
+        test_honest_proof_with_options(
+            &[&[&[12]]],
+            &[123],
+            Options {
+                degree_bound: 1,
+                security_bits: 128,
+                blowup_log2: 1,
+                fold_rate: 1,
+                max_rounds: usize::MAX,
+                grinding_bits: 0,
+            },
         );
-        committer.add_batch(vec![polynomial(&[90, 78, 56, 34])]);
-        let (commitment, prover) =
-            committer.commit(BTreeSet::from([BS::from(123u16), BS::from(456u16)]));
-        let proof = prover.prove(&commitment);
-        (commitment, proof)
+        test_honest_proof_with_options(
+            &SAMPLE_BATCHES,
+            &SAMPLE_POINTS,
+            Options {
+                blowup_log2: 1,
+                ..OPTIONS
+            },
+        );
     }
 
-    fn assert_rejected(result: Result<()>, expected: &str) {
-        let error = result
-            .expect_err("the tampered proof was accepted")
-            .to_string();
-        assert!(error.contains(expected), "unexpected error: {error}");
+    #[test]
+    fn test_honest_proof_blowup_8() {
+        test_honest_proof_with_options(
+            &[&[&[12]]],
+            &[123],
+            Options {
+                degree_bound: 1,
+                security_bits: 128,
+                blowup_log2: 3,
+                fold_rate: 1,
+                max_rounds: usize::MAX,
+                grinding_bits: 0,
+            },
+        );
+        test_honest_proof_with_options(
+            &SAMPLE_BATCHES,
+            &SAMPLE_POINTS,
+            Options {
+                blowup_log2: 3,
+                ..OPTIONS
+            },
+        );
+    }
+
+    #[test]
+    fn test_honest_proof_with_grinding() {
+        test_honest_proof_with_options(
+            &[&[&[12]]],
+            &[123],
+            Options {
+                degree_bound: 1,
+                ..GROUND_OPTIONS
+            },
+        );
+        test_honest_proof_with_options(&SAMPLE_BATCHES, &SAMPLE_POINTS, GROUND_OPTIONS);
+    }
+
+    #[test]
+    fn test_several_proofs_for_the_same_commitment() {
+        let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
+        let (commitment, prover) = committer.commit();
+        let proof1 = prover.prove(make_points(&SAMPLE_POINTS));
+        let proof2 = prover.prove(make_points(&[789]));
+        assert!(proof1.verify(&commitment).is_ok());
+        assert!(proof2.verify(&commitment).is_ok());
     }
 
     #[test]
     fn test_accept_untampered_proof() {
-        let (commitment, proof) = adversarial_setup();
-        assert!(proof.verify(&commitment).is_ok());
+        let (commitment, proof) = sample_proof(OPTIONS);
+        let result = proof.verify(&commitment);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_accept_untampered_ground_proof() {
+        let (commitment, proof) = sample_proof(GROUND_OPTIONS);
+        let result = proof.verify(&commitment);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_honest_proof_with_fold_rate_2() {
+        test_honest_proof_with_options(
+            &SAMPLE_BATCHES,
+            &SAMPLE_POINTS,
+            Options {
+                fold_rate: 2,
+                ..OPTIONS
+            },
+        );
+        test_honest_proof_with_options(
+            &[&[&[12, 34, 56, 78, 90, 12, 34, 56]]],
+            &[123, 456],
+            Options {
+                degree_bound: 8,
+                fold_rate: 2,
+                ..OPTIONS
+            },
+        );
+    }
+
+    #[test]
+    fn test_honest_proof_with_fold_rate_3() {
+        test_honest_proof_with_options(
+            &[&[&[12, 34, 56, 78, 90, 12, 34, 56]]],
+            &[123, 456],
+            Options {
+                degree_bound: 8,
+                fold_rate: 3,
+                ..OPTIONS
+            },
+        );
+        test_honest_proof_with_options(
+            &[
+                &[&[12, 34, 56, 78, 90, 12, 34, 56], &[42, 43]],
+                &[&[1, 2, 3, 4]],
+            ],
+            &[123, 456],
+            Options {
+                degree_bound: 16,
+                fold_rate: 3,
+                ..GROUND_OPTIONS
+            },
+        );
+    }
+
+    #[test]
+    fn test_honest_proof_without_rounds() {
+        test_honest_proof_with_options(
+            &SAMPLE_BATCHES,
+            &SAMPLE_POINTS,
+            Options {
+                max_rounds: 0,
+                ..OPTIONS
+            },
+        );
+        test_honest_proof_with_options(
+            &SAMPLE_BATCHES,
+            &SAMPLE_POINTS,
+            Options {
+                max_rounds: 0,
+                ..GROUND_OPTIONS
+            },
+        );
+    }
+
+    #[test]
+    fn test_honest_proof_with_early_stop() {
+        test_honest_proof_with_options(
+            &[&[&[12, 34, 56, 78, 90, 12, 34, 56]]],
+            &[123, 456],
+            Options {
+                degree_bound: 8,
+                max_rounds: 1,
+                ..OPTIONS
+            },
+        );
+        test_honest_proof_with_options(
+            &[
+                &[&[12, 34, 56, 78, 90, 12, 34, 56], &[42, 43]],
+                &[&[1, 2, 3, 4]],
+            ],
+            &[123, 456],
+            Options {
+                degree_bound: 16,
+                fold_rate: 2,
+                max_rounds: 1,
+                ..GROUND_OPTIONS
+            },
+        );
+    }
+
+    #[test]
+    fn test_reject_mismatched_max_rounds() {
+        let (commitment, mut proof) = sample_proof(OPTIONS);
+        proof.options.max_rounds = 1;
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_tampered_folded_quotient_without_rounds() {
+        let (commitment, mut proof) = sample_proof(Options {
+            max_rounds: 0,
+            ..OPTIONS
+        });
+        let mut coefficients = proof
+            .fri_commitment
+            .folded_polynomial()
+            .coefficients()
+            .to_vec();
+        coefficients[1] += BS::ONE;
+        proof.fri_commitment =
+            fri::Commitment::new(vec![], Polynomial::with_coefficients(coefficients));
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_tampered_fri_root() {
+        let (commitment, mut proof) = sample_proof(OPTIONS);
+        let mut roots = proof.fri_commitment.roots().to_vec();
+        roots[1] = H256::repeat_byte(0x42);
+        proof.fri_commitment =
+            fri::Commitment::new(roots, proof.fri_commitment.folded_polynomial().clone());
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_mismatched_fold_rate() {
+        let (commitment, mut proof) = sample_proof(OPTIONS);
+        proof.options.fold_rate = 2;
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_reject_mismatched_degree_bound() {
-        let (commitment, mut proof) = adversarial_setup();
-        proof.degree_bound *= 2;
-        assert_rejected(proof.verify(&commitment), "FRI roots of the commitment");
-    }
-
-    #[test]
-    fn test_reject_zero_degree_bound() {
-        let (_, proof) = adversarial_setup();
-        let mut proto = proof.to_proto();
-        proto.degree_bound = 0;
-        assert_rejected(
-            Proof::<BS, Sha2Hash<BS>>::from_proto(&proto).map(|_| ()),
-            "not a power of two",
-        );
-    }
-
-    #[test]
-    fn test_reject_zero_blowup_factor() {
-        let (_, proof) = adversarial_setup();
-        let mut proto = proof.to_proto();
-        proto.blowup_log2 = 0;
-        assert_rejected(
-            Proof::<BS, Sha2Hash<BS>>::from_proto(&proto).map(|_| ()),
-            "invalid blowup factor",
-        );
-    }
-
-    #[test]
-    fn test_reject_oversized_domain() {
-        let (_, proof) = adversarial_setup();
-        let mut proto = proof.to_proto();
-        proto.blowup_log2 = 64;
-        assert_rejected(
-            Proof::<BS, Sha2Hash<BS>>::from_proto(&proto).map(|_| ()),
-            "invalid extended domain size",
-        );
+        let (commitment, mut proof) = sample_proof(OPTIONS);
+        proof.options.degree_bound *= 2;
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_reject_on_domain_point() {
-        let (commitment, mut proof) = adversarial_setup();
-        let values = proof.points.values().next().unwrap().clone();
-        let on_domain = Polynomial::<BS>::coset_element2(0, proof.extended_domain_size());
-        proof.points = BTreeMap::from([(on_domain, values)]);
-        assert_rejected(proof.verify(&commitment), "is inside the evaluation domain");
+        let (commitment, mut proof) = sample_proof(OPTIONS);
+        let values = proof.points[&BS::from_const(123)].clone();
+        let z = Polynomial::<BS>::coset_element2(0, OPTIONS.extended_domain_size());
+        proof.points = BTreeMap::from([(z, values)]);
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_reject_tampered_evaluation() {
-        let (commitment, mut proof) = adversarial_setup();
-        let z = *proof.points.keys().next().unwrap();
-        proof.points.get_mut(&z).unwrap()[0] += BS::ONE;
-        assert_rejected(proof.verify(&commitment), "algebraic check failed");
+        let (commitment, mut proof) = sample_proof(OPTIONS);
+        proof.points.get_mut(&BS::from_const(123)).unwrap()[0] += BS::ONE;
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_reject_no_points() {
-        let (commitment, mut proof) = adversarial_setup();
+        let (commitment, mut proof) = sample_proof(OPTIONS);
         proof.points.clear();
-        assert_rejected(
-            proof.verify(&commitment),
-            "the proof doesn't open any points",
-        );
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_reject_missing_evaluation() {
-        let (commitment, mut proof) = adversarial_setup();
-        let z = *proof.points.keys().next().unwrap();
-        proof.points.get_mut(&z).unwrap().pop();
-        assert_rejected(proof.verify(&commitment), "incorrect number of evaluations");
+        let (commitment, mut proof) = sample_proof(OPTIONS);
+        proof.points.get_mut(&BS::from_const(123)).unwrap().pop();
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_reject_extra_evaluation() {
-        let (commitment, mut proof) = adversarial_setup();
-        let z = *proof.points.keys().next().unwrap();
-        proof.points.get_mut(&z).unwrap().push(BS::ZERO);
-        assert_rejected(proof.verify(&commitment), "incorrect number of evaluations");
-    }
-
-    #[test]
-    fn test_reject_foreign_commitment() {
-        let (_, proof) = adversarial_setup();
-        let mut committer = Committer::<BS, Sha2Hash<BS>>::new(
-            ADVERSARIAL_DEGREE_BOUND,
-            ADVERSARIAL_BLOWUP_LOG2,
-            vec![polynomial(&[99, 98, 97, 96]), polynomial(&[95, 94, 93, 92])],
-        );
-        committer.add_batch(vec![polynomial(&[91, 90, 89, 88])]);
-        let (foreign, _) = committer.commit(BTreeSet::from([BS::from(123u16)]));
-        assert_rejected(proof.verify(&foreign), "wrong query index");
-    }
-
-    #[test]
-    fn test_reject_missing_query() {
-        let (commitment, mut proof) = adversarial_setup();
-        proof.queries.pop();
-        assert_rejected(proof.verify(&commitment), "incorrect number of queries");
-    }
-
-    #[test]
-    fn test_reject_missing_openings() {
-        let (commitment, mut proof) = adversarial_setup();
-        proof.openings.pop();
-        assert_rejected(proof.verify(&commitment), "incorrect number of openings");
-    }
-
-    #[test]
-    fn test_reject_missing_opening_within_query() {
-        let (commitment, mut proof) = adversarial_setup();
-        proof.openings[0].pop();
-        assert_rejected(
-            proof.verify(&commitment),
-            "incorrect number of openings for index",
-        );
-    }
-
-    #[test]
-    fn test_reject_swapped_openings() {
-        let (commitment, mut proof) = adversarial_setup();
-        proof.openings.swap(0, 1);
-        assert_rejected(proof.verify(&commitment), "root hash mismatch");
+        let (commitment, mut proof) = sample_proof(OPTIONS);
+        proof
+            .points
+            .get_mut(&BS::from_const(123))
+            .unwrap()
+            .push(BS::ZERO);
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_reject_extra_point() {
-        let (commitment, mut proof) = adversarial_setup();
-        let values = proof.points.values().next().unwrap().clone();
-        proof.points.insert(BS::from(789u16), values);
-        assert_rejected(
-            proof.verify(&commitment),
-            "doesn't match the number of FRI quotients",
-        );
+        let (commitment, mut proof) = sample_proof(OPTIONS);
+        let values = proof.points[&BS::from_const(123)].clone();
+        proof.points.insert(BS::from_const(789), values);
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
     }
 
     #[test]
-    fn test_reject_opening_from_wrong_domain() {
-        let (commitment, mut proof) = adversarial_setup();
-        let committer = Committer::<BS, Sha2Hash<BS>>::new(
-            ADVERSARIAL_DEGREE_BOUND * 2,
-            ADVERSARIAL_BLOWUP_LOG2,
-            vec![polynomial(&[11, 22, 33, 44])],
+    fn test_reject_swapped_evaluations() {
+        let (commitment, mut proof) = sample_proof(OPTIONS);
+        let values = proof.points[&BS::from_const(123)].clone();
+        let other_values = proof.points.insert(BS::from_const(456), values).unwrap();
+        proof.points.insert(BS::from_const(123), other_values);
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_foreign_commitment() {
+        let (_, proof) = sample_proof(OPTIONS);
+        let committer = make_committer::<BS, Sha2Hash<BS>>(
+            OPTIONS,
+            &[
+                &[&[99, 98, 97, 96], &[95, 94, 93, 92]],
+                &[&[91, 90, 89, 88]],
+            ],
         );
-        let (other_commitment, other_prover) = committer.commit(BTreeSet::from([BS::from(123u16)]));
-        let mut other_proof = other_prover.prove(&other_commitment);
-        proof.openings[0][0] = other_proof.openings[0].remove(0);
-        assert_rejected(proof.verify(&commitment), "invalid opening for index");
+        let (foreign, _) = committer.commit();
+        let result = proof.verify(&foreign);
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_reject_misreported_batch_sizes() {
-        let (mut commitment, proof) = adversarial_setup();
+        let (mut commitment, proof) = sample_proof(OPTIONS);
         commitment.batch_sizes = vec![1, 2];
-        assert_rejected(proof.verify(&commitment), "incorrect batch size");
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_reject_wrong_number_of_polynomials() {
-        let (commitment, mut proof) = adversarial_setup();
+        let (commitment, mut proof) = sample_proof(OPTIONS);
         proof.num_polys += 1;
-        assert_rejected(proof.verify(&commitment), "incorrect number of polynomials");
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
     }
 
     #[test]
-    fn test_reject_commitment_without_batches() {
-        let (commitment, _) = adversarial_setup();
-        let mut proto = commitment.to_proto();
-        proto.batches.clear();
-        assert_rejected(
-            Commitment::<BS, Sha2Hash<BS>>::from_proto(&proto).map(|_| ()),
-            "the commitment has no polynomial batches",
+    fn test_reject_missing_query() {
+        let (commitment, mut proof) = sample_proof(OPTIONS);
+        proof.queries.pop();
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_missing_openings() {
+        let (commitment, mut proof) = sample_proof(OPTIONS);
+        proof.openings.pop();
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_missing_opening_within_query() {
+        let (commitment, mut proof) = sample_proof(OPTIONS);
+        proof.openings[0].pop();
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_swapped_openings() {
+        let (commitment, mut proof) = sample_proof(OPTIONS);
+        proof.openings.swap(0, 1);
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_opening_from_wrong_domain() {
+        let (commitment, mut proof) = sample_proof(OPTIONS);
+        let committer = make_committer::<BS, Sha2Hash<BS>>(
+            Options {
+                degree_bound: 8,
+                ..OPTIONS
+            },
+            &[&[&[11, 22, 33, 44]]],
+        );
+        let (_, other_prover) = committer.commit();
+        let mut other_proof = other_prover.prove(make_points(&[123]));
+        proof.openings[0][0] = other_proof.openings[0].remove(0);
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_invalid_nonce() {
+        let (commitment, mut proof) = sample_proof(GROUND_OPTIONS);
+        proof.nonce = find_nonce(&commitment, &proof, false);
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_other_valid_nonce() {
+        let (commitment, mut proof) = sample_proof(GROUND_OPTIONS);
+        proof.nonce = find_nonce(&commitment, &proof, true);
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_overstated_grinding() {
+        let (commitment, mut proof) = sample_proof(GROUND_OPTIONS);
+        proof.options.grinding_bits = 128;
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_overstated_security_level() {
+        let (commitment, mut proof) = sample_proof(OPTIONS);
+        proof.options.security_bits = 130;
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_understated_security_level() {
+        let (commitment, mut proof) = sample_proof(OPTIONS);
+        proof.options.security_bits = 126;
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
+    }
+
+    /// Deriving the query indices before checking the number of queries would try to derive 2^63
+    /// indices here.
+    #[test]
+    fn test_reject_huge_security_level() {
+        let (commitment, mut proof) = sample_proof(OPTIONS);
+        proof.options.security_bits = usize::MAX;
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_unsatisfiable_grinding() {
+        let (commitment, mut proof) = sample_proof(GROUND_OPTIONS);
+        proof.options.grinding_bits = 257;
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_maximum_grinding() {
+        let (commitment, mut proof) = sample_proof(GROUND_OPTIONS);
+        proof.options.grinding_bits = usize::MAX;
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_committer_with_unsatisfiable_grinding() {
+        make_committer::<BS, Sha2Hash<BS>>(
+            Options {
+                grinding_bits: 257,
+                ..OPTIONS
+            },
+            &SAMPLE_BATCHES,
         );
     }
 
     #[test]
-    fn test_reject_commitment_without_fri_roots() {
-        let (commitment, _) = adversarial_setup();
-        let mut proto = commitment.to_proto();
-        proto.fri_roots.clear();
-        assert_rejected(
-            Commitment::<BS, Sha2Hash<BS>>::from_proto(&proto).map(|_| ()),
-            "the commitment has no FRI roots",
-        );
+    fn test_reject_understated_grinding() {
+        let (commitment, mut proof) = sample_proof(GROUND_OPTIONS);
+        proof.options.grinding_bits = 0;
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
     }
 
     #[test]
-    fn test_reject_commitment_without_hash_backend() {
-        let (commitment, _) = adversarial_setup();
-        let mut proto = commitment.to_proto();
-        proto.hash_backend = None;
-        assert_rejected(
-            Commitment::<BS, Sha2Hash<BS>>::from_proto(&proto).map(|_| ()),
-            "hash backend not specified",
+    fn test_proof_to_proto() {
+        let (_, proof) = sample_proof(GROUND_OPTIONS);
+        let proto = proof.to_proto();
+        assert_eq!(proto.degree_bound, 4);
+        assert_eq!(proto.security_bits, 128);
+        assert_eq!(proto.blowup_log2, 2);
+        assert_eq!(proto.fold_rate, 1);
+        assert_eq!(proto.max_rounds, u64::MAX);
+        assert_eq!(proto.grinding_bits, 8);
+        assert_eq!(proto.nonce, 204);
+        assert_eq!(proto.num_polys, 3);
+        assert_eq!(
+            proto.points,
+            [
+                proto::proof::Point {
+                    z: BS::from_const(123).to_le_bytes().to_vec(),
+                    v: vec![
+                        BS::from_const(145999044).to_le_bytes().to_vec(),
+                        BS::from_const(84410022).to_le_bytes().to_vec(),
+                        BS::from_const(64126386).to_le_bytes().to_vec(),
+                    ],
+                },
+                proto::proof::Point {
+                    z: BS::from_const(456).to_le_bytes().to_vec(),
+                    v: vec![
+                        BS::from_const(7407527580).to_le_bytes().to_vec(),
+                        BS::from_const(4276015554).to_le_bytes().to_vec(),
+                        BS::from_const(3235519818).to_le_bytes().to_vec(),
+                    ],
+                },
+            ]
         );
+        assert_eq!(
+            proto.fri_roots,
+            [
+                proof.fri_commitment.roots()[0].as_bytes().to_vec(),
+                proof.fri_commitment.roots()[1].as_bytes().to_vec(),
+            ]
+        );
+        assert_eq!(
+            proto.folded_quotient,
+            [proof.fri_commitment.folded_polynomial().coefficients()[0]
+                .to_le_bytes()
+                .to_vec()]
+        );
+        assert_eq!(proto.openings.len(), 60);
+        assert_eq!(proto.queries.len(), 60);
     }
 
     #[test]
-    fn test_reject_proof_without_hash_backend() {
-        let (_, proof) = adversarial_setup();
+    fn test_proof_from_proto() {
+        let (_, proof) = sample_proof(GROUND_OPTIONS);
+        let proto = proof.to_proto();
+        let decoded = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
+        assert_eq!(decoded.to_proto(), proto);
+    }
+
+    #[test]
+    fn test_proof_security_level_from_proto() {
+        let (_, proof) = sample_proof(OPTIONS);
         let mut proto = proof.to_proto();
-        proto.hash_backend = None;
-        assert_rejected(
-            Proof::<BS, Sha2Hash<BS>>::from_proto(&proto).map(|_| ()),
-            "hash backend not specified",
-        );
+        proto.security_bits = 256;
+        let decoded = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
+        assert_eq!(decoded.options().security_bits, 256);
     }
 
     #[test]
-    fn test_reject_commitment_with_wrong_hash_backend() {
-        let (commitment, _) = adversarial_setup();
-        assert_rejected(
-            Commitment::<BS, Keccak256Hash<BS>>::from_proto(&commitment.to_proto()).map(|_| ()),
-            "incorrect hash backend",
-        );
-    }
-
-    #[test]
-    fn test_reject_proof_with_wrong_hash_backend() {
-        let (_, proof) = adversarial_setup();
-        assert_rejected(
-            Proof::<BS, Keccak256Hash<BS>>::from_proto(&proof.to_proto()).map(|_| ()),
-            "incorrect hash backend",
-        );
-    }
-
-    #[test]
-    fn test_commitment_serialization() {
-        let mut committer = Committer::<BS, Sha2Hash<BS>>::new(
-            4,
-            1,
-            vec![polynomial(&[12, 34, 56, 78]), polynomial(&[42, 43, 44, 45])],
-        );
-        committer.add_batch(vec![polynomial(&[90, 78, 56, 34])]);
-        let (commitment, _) =
-            committer.commit(BTreeSet::from([BS::from(123u16), BS::from(456u16)]));
-        assert_eq!(
-            commitment.tree_roots(),
-            [
-                parse("0xc47ed760edd5fc63ecb5c86240553f7e2fdabd0003ca62ab40d79e230ead9eb1"),
-                parse("0x13880d0002db3411382d144a40f86201f3b84b55c317bcb0b583f166100e8b37"),
-            ]
-        );
-        assert_eq!(commitment.batch_sizes(), [2, 1]);
-        assert_eq!(
-            commitment.transcript_hash(1),
-            parse("0x8e58a20287b9d5f4743c73d0d57b2b1dcb5846f4b658d5463a393b0b44dafcfc")
-        );
-        assert_eq!(
-            commitment.transcript_hash(2),
-            parse("0x60d1b1e6e174c834b3ea7412cf09cdb5f3949f7b63f0c8f3f841b1cedc58c56a")
-        );
-        let proto = commitment.to_proto();
-        let commitment = Commitment::<BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
-        assert_eq!(commitment.degree_bound(), 4);
-        assert_eq!(
-            commitment.tree_roots(),
-            [
-                parse("0xc47ed760edd5fc63ecb5c86240553f7e2fdabd0003ca62ab40d79e230ead9eb1"),
-                parse("0x13880d0002db3411382d144a40f86201f3b84b55c317bcb0b583f166100e8b37"),
-            ]
-        );
-        assert_eq!(commitment.batch_sizes(), [2, 1]);
-        assert_eq!(
-            commitment.transcript_hash(1),
-            parse("0x8e58a20287b9d5f4743c73d0d57b2b1dcb5846f4b658d5463a393b0b44dafcfc")
-        );
-        assert_eq!(
-            commitment.transcript_hash(2),
-            parse("0x60d1b1e6e174c834b3ea7412cf09cdb5f3949f7b63f0c8f3f841b1cedc58c56a")
-        );
-    }
-
-    #[test]
-    fn test_proof_serialization() {
-        let mut committer = Committer::<BS, Sha2Hash<BS>>::new(
-            4,
-            3,
-            vec![polynomial(&[12, 34, 56, 78]), polynomial(&[42, 43, 44, 45])],
-        );
-        committer.add_batch(vec![polynomial(&[90, 78, 56, 34])]);
-        let (commitment, prover) =
-            committer.commit(BTreeSet::from([BS::from(123u16), BS::from(456u16)]));
-        let proof = prover.prove(&commitment);
+    fn test_accept_decoded_proof() {
+        let (commitment, proof) = sample_proof(GROUND_OPTIONS);
         let commitment_proto = commitment.to_proto();
         let proof_proto = proof.to_proto();
         let commitment = Commitment::<BS, Sha2Hash<BS>>::from_proto(&commitment_proto).unwrap();
         let proof = Proof::<BS, Sha2Hash<BS>>::from_proto(&proof_proto).unwrap();
-        assert_eq!(proof.degree_bound(), 4);
-        assert_eq!(proof.blowup_log2(), 3);
-        assert_eq!(proof.num_polys(), 3);
-        assert_eq!(
-            proof.points().keys().copied().collect::<BTreeSet<BS>>(),
-            BTreeSet::from([BS::from(123u16), BS::from(456u16)])
-        );
-        assert!(proof.verify(&commitment).is_ok());
+        let result = proof.verify(&commitment);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_reject_zero_degree_bound() {
+        let (_, proof) = sample_proof(OPTIONS);
+        let mut proto = proof.to_proto();
+        proto.degree_bound = 0;
+        let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_accept_decoded_proof_with_fold_rate_2() {
+        let (commitment, proof) = sample_proof(Options {
+            fold_rate: 2,
+            ..GROUND_OPTIONS
+        });
+        let commitment_proto = commitment.to_proto();
+        let proof_proto = proof.to_proto();
+        let commitment = Commitment::<BS, Sha2Hash<BS>>::from_proto(&commitment_proto).unwrap();
+        let proof = Proof::<BS, Sha2Hash<BS>>::from_proto(&proof_proto).unwrap();
+        let result = proof.verify(&commitment);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_reject_zero_fold_rate() {
+        let (_, proof) = sample_proof(OPTIONS);
+        let mut proto = proof.to_proto();
+        proto.fold_rate = 0;
+        let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_zero_blowup_log2() {
+        let (_, proof) = sample_proof(OPTIONS);
+        let mut proto = proof.to_proto();
+        proto.blowup_log2 = 0;
+        let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_oversized_domain() {
+        let (_, proof) = sample_proof(OPTIONS);
+        let mut proto = proof.to_proto();
+        proto.blowup_log2 = 64;
+        let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_unsatisfiable_grinding_in_proto() {
+        let (_, proof) = sample_proof(GROUND_OPTIONS);
+        let mut proto = proof.to_proto();
+        proto.grinding_bits = 257;
+        let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_maximum_grinding_in_proto() {
+        let (_, proof) = sample_proof(GROUND_OPTIONS);
+        let mut proto = proof.to_proto();
+        proto.grinding_bits = u32::MAX;
+        let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_non_canonical_point() {
+        let (_, proof) = sample_proof(OPTIONS);
+        let mut proto = proof.to_proto();
+        let modulus: U256 = BS::MODULUS.parse().unwrap();
+        proto.points[0].z = modulus.to_little_endian().to_vec();
+        let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_non_canonical_evaluation() {
+        let (_, proof) = sample_proof(OPTIONS);
+        let mut proto = proof.to_proto();
+        let modulus: U256 = BS::MODULUS.parse().unwrap();
+        proto.points[1].v[2] = modulus.to_little_endian().to_vec();
+        let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_proof_without_fri_roots() {
+        // The number of FRI roots is only checked by `verify`.
+        let (commitment, proof) = sample_proof(OPTIONS);
+        let mut proto = proof.to_proto();
+        proto.fri_roots.clear();
+        let proof = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_short_fri_root() {
+        let (_, proof) = sample_proof(OPTIONS);
+        let mut proto = proof.to_proto();
+        proto.fri_roots[1].pop();
+        let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_non_canonical_folded_quotient() {
+        let (_, proof) = sample_proof(OPTIONS);
+        let mut proto = proof.to_proto();
+        let modulus: U256 = BS::MODULUS.parse().unwrap();
+        proto.folded_quotient[0] = modulus.to_little_endian().to_vec();
+        let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_proof_without_hash_backend() {
+        let (_, proof) = sample_proof(OPTIONS);
+        let mut proto = proof.to_proto();
+        proto.hash_backend = None;
+        let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_proof_with_wrong_hash_backend() {
+        let (_, proof) = sample_proof(OPTIONS);
+        let proto = proof.to_proto();
+        let result = Proof::<BS, Keccak256Hash<BS>>::from_proto(&proto);
+        assert!(result.is_err());
     }
 }
