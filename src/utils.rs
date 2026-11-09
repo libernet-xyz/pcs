@@ -78,6 +78,11 @@ pub(crate) fn encode_usize(value: usize) -> H256 {
     encode_u64(value as u64)
 }
 
+/// Deserializes a field element from the little-endian byte representation of its canonical integer
+/// value.
+///
+/// `bytes` can have at most [`Field::LEN`] bytes. Shorter sequences are accepted and padded with
+/// zeros.
 pub(crate) fn load_scalar<F: Field>(bytes: &[u8]) -> Result<F> {
     if bytes.len() > F::LEN {
         return Err(anyhow!(
@@ -88,12 +93,49 @@ pub(crate) fn load_scalar<F: Field>(bytes: &[u8]) -> Result<F> {
     }
     let mut padded_bytes = [0u8; 32];
     padded_bytes[0..bytes.len()].copy_from_slice(bytes);
-    F::try_from_le_bytes(&padded_bytes)
+    F::try_from_le_bytes(&padded_bytes[0..F::LEN])
         .into_option()
         .context(format!(
             "invalid scalar (exceeds the [0, {}) range)",
             F::MODULUS
         ))
+}
+
+/// Serializes a field element to the little-endian byte representation of its canonical integer
+/// value, using exactly [`Field::LEN`] bytes (e.g. 32 for BlueSky, 31 for KoalaBear^8, 8 for
+/// Goldilocks).
+///
+/// The result can be deserialized with [`load_scalar`].
+pub(crate) fn store_scalar<F: Field>(value: F) -> Vec<u8> {
+    value.to_u256().to_little_endian()[0..F::LEN].to_vec()
+}
+
+/// Flattens a list of field elements into their coordinates over the base field, i.e. the
+/// [`Field::EXTENSION_DEGREE`] coordinates of the first element (see
+/// [`Field::to_base_coordinates`]), then those of the second element, and so on.
+///
+/// Elements of a prime field are their own single coordinate, so this is a no-op for them.
+pub(crate) fn flatten<F: Field>(values: &[F]) -> Vec<F::BaseField> {
+    let mut coordinates = vec![F::BaseField::ZERO; values.len() * F::EXTENSION_DEGREE];
+    for (value, chunk) in values
+        .iter()
+        .zip(coordinates.chunks_mut(F::EXTENSION_DEGREE))
+    {
+        value.to_base_coordinates(chunk);
+    }
+    coordinates
+}
+
+/// Inverse of [`flatten`]: rebuilds a list of field elements from their coordinates over the base
+/// field.
+///
+/// REQUIRES: the number of coordinates must be a multiple of [`Field::EXTENSION_DEGREE`].
+pub(crate) fn unflatten<F: Field>(coordinates: &[F::BaseField]) -> Vec<F> {
+    assert!(coordinates.len().is_multiple_of(F::EXTENSION_DEGREE));
+    coordinates
+        .chunks(F::EXTENSION_DEGREE)
+        .map(F::from_base_coordinates)
+        .collect()
 }
 
 #[cfg(test)]
@@ -206,6 +248,58 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_load_goldilocks_scalar() {
+        assert_eq!(
+            load_scalar::<starkom_goldilocks::GL>(&[8, 7, 6, 5, 4, 3, 2, 1]).unwrap(),
+            starkom_goldilocks::GL::try_from(0x0102030405060708u64).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_load_truncated_goldilocks_scalar() {
+        assert_eq!(
+            load_scalar::<starkom_goldilocks::GL>(&[8, 7]).unwrap(),
+            starkom_goldilocks::GL::try_from(0x0708u64).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_load_long_goldilocks_scalar() {
+        assert!(load_scalar::<starkom_goldilocks::GL>(&[8, 7, 6, 5, 4, 3, 2, 1, 0]).is_err());
+    }
+
+    #[test]
+    fn test_load_non_canonical_goldilocks_scalar() {
+        assert!(
+            load_scalar::<starkom_goldilocks::GL>(&[1, 0, 0, 0, 0xff, 0xff, 0xff, 0xff]).is_err()
+        );
+    }
+
+    #[test]
+    fn test_load_koalabear_scalar() {
+        assert_eq!(
+            load_scalar::<starkom_koalabear::KB>(&[4, 3, 2, 1]).unwrap(),
+            starkom_koalabear::KB::try_from(0x01020304u32).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_load_koalabear_extension_scalar() {
+        let mut bytes = vec![0u8; 31];
+        bytes[0] = 2;
+        bytes[1] = 1;
+        assert_eq!(
+            load_scalar::<starkom_koalabear::KB8>(&bytes).unwrap(),
+            starkom_koalabear::KB8::from(0x0102u32)
+        );
+    }
+
+    #[test]
+    fn test_load_long_koalabear_extension_scalar() {
+        assert!(load_scalar::<starkom_koalabear::KB8>(&[0u8; 32]).is_err());
+    }
+
     fn test_load_truncated_scalar_impl(value: Scalar) {
         let bytes = value.to_le_bytes();
         let length = bytes
@@ -242,5 +336,34 @@ mod tests {
                 .parse()
                 .unwrap(),
         );
+    }
+
+    #[test]
+    fn test_store_scalar() {
+        let value: Scalar = "0x1fcc49bb3722a3a6ac41aa0aac6ed68f218a7240ca2a9befd4e3243251f7ecaf"
+            .parse()
+            .unwrap();
+        assert_eq!(store_scalar(value), value.to_le_bytes());
+    }
+
+    #[test]
+    fn test_store_goldilocks_scalar() {
+        let value = starkom_goldilocks::GL::try_from(0x0102030405060708u64).unwrap();
+        assert_eq!(store_scalar(value), [8, 7, 6, 5, 4, 3, 2, 1]);
+    }
+
+    #[test]
+    fn test_store_koalabear_scalar() {
+        let value = starkom_koalabear::KB::try_from(0x01020304u32).unwrap();
+        assert_eq!(store_scalar(value), [4, 3, 2, 1]);
+    }
+
+    #[test]
+    fn test_store_koalabear_extension_scalar() {
+        let value = starkom_koalabear::KB8::from(0x0102u32);
+        let mut expected = vec![0u8; 31];
+        expected[0] = 2;
+        expected[1] = 1;
+        assert_eq!(store_scalar(value), expected);
     }
 }

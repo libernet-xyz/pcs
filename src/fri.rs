@@ -1,6 +1,6 @@
 use crate::hash::Hasher;
 use crate::merkle;
-use crate::starkom::proto::pcs::v9 as proto;
+use crate::starkom::proto::pcs::v10 as proto;
 use crate::utils;
 use anyhow::{Result, anyhow};
 use primitive_types::H256;
@@ -99,7 +99,7 @@ impl<F: Field256, H: Hasher<F>> LeafProof<F, H> {
             coset_values: self
                 .coset
                 .iter()
-                .map(|value| value.to_le_bytes().to_vec())
+                .map(|&value| utils::store_scalar(value))
                 .collect(),
             merkle_path: self
                 .path
