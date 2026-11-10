@@ -41,15 +41,12 @@ message Commitment {
   // Commitment data for a batch of polynomials whose evaluations are stored in the same Merkle
   // tree.
   message Batch {
-    // Root hash of the Merkle tree, stored as a 32 byte sequence.
-    bytes root = 1;
-
     // Whether the polynomials of the batch are over the base field rather than the extension field.
     //
     // The leaves of the two kinds of batch are hashed with different domain separation tags, so
     // the root of the Merkle tree also determines this flag: a commitment with the wrong flag fails
     // verification.
-    bool base_field = 2;
+    bool base_field = 1;
 
     // Number of polynomials in the batch.
     //
@@ -57,7 +54,10 @@ message Commitment {
     // extension degree of G over F (eg. 4 for Goldilocks^4). Every leaf of the Merkle tree has
     // exactly `num_polys` values if the polynomials are over F, and `T * num_polys` values if
     // they're over G (see `MerkleProof`).
-    uint64 num_polys = 3;
+    uint64 num_polys = 2;
+
+    // Root hash of the Merkle tree, stored as a 32 byte sequence.
+    bytes root = 3;
   }
 
   // The polynomial batches, in commitment order. There must be at least one batch.
