@@ -410,29 +410,37 @@ impl<F: Field256, H: Hasher<F>> Batch<F, H> {
         }
     }
 
-    /// Adds all polynomials of the batch to `combined`, multiplied by consecutive powers of `alpha`
-    /// starting from `*pow`. On return `*pow` is the power to use for the next polynomial.
-    fn combine(&self, alpha: F, pow: &mut F, combined: &mut Polynomial<F>) {
-        match &self.polynomials {
-            BatchPolynomials::Base(polynomials) => {
-                for polynomial in polynomials {
-                    *combined += Polynomial::with_coefficients(
-                        polynomial
-                            .coefficients()
-                            .iter()
-                            .map(|&coefficient| *pow * coefficient)
-                            .collect(),
-                    );
-                    *pow *= alpha;
+    /// Computes the random linear combination of all polynomials of all `batches`, in order: the
+    /// i-th polynomial is multiplied by `alpha^i`.
+    fn combine<'a>(batches: impl IntoIterator<Item = &'a Self>, alpha: F) -> Polynomial<F>
+    where
+        Self: 'a,
+    {
+        let mut combined = Polynomial::<F>::default();
+        let mut pow = F::ONE;
+        for batch in batches {
+            match &batch.polynomials {
+                BatchPolynomials::Base(polynomials) => {
+                    for polynomial in polynomials {
+                        combined += Polynomial::with_coefficients(
+                            polynomial
+                                .coefficients()
+                                .iter()
+                                .map(|&coefficient| pow * coefficient)
+                                .collect(),
+                        );
+                        pow *= alpha;
+                    }
                 }
-            }
-            BatchPolynomials::Extension(polynomials) => {
-                for polynomial in polynomials {
-                    *combined += polynomial.clone() * *pow;
-                    *pow *= alpha;
+                BatchPolynomials::Extension(polynomials) => {
+                    for polynomial in polynomials {
+                        combined += polynomial.clone() * pow;
+                        pow *= alpha;
+                    }
                 }
             }
         }
+        combined
     }
 }
 
@@ -1122,14 +1130,7 @@ impl<F: Field256, H: Hasher<F>> Prover<F, H> {
         let tree_roots: Vec<H256> = self.batches.iter().map(Batch::root_hash).collect();
         let (alpha, beta) = deep_challenges::<F, H>(tree_roots.as_slice(), num_polys, &points);
 
-        let combined = {
-            let mut combined = Polynomial::default();
-            let mut pow = F::ONE;
-            for batch in &self.batches {
-                batch.combine(alpha, &mut pow, &mut combined);
-            }
-            combined
-        };
+        let combined = Batch::combine(&self.batches, alpha);
 
         let quotient = {
             let mut quotient = Polynomial::default();
