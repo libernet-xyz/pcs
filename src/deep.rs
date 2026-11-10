@@ -562,6 +562,9 @@ impl<F: Field256, H: Hasher<F>> Commitment<F, H> {
     }
 
     /// Deserializes a commitment from a [`Commitment`](`proto::Commitment`) protobuf.
+    ///
+    /// Returns an error if the total number of polynomials, or the number of values of the leaves
+    /// of any batch, doesn't fit in a `usize`.
     pub fn from_proto(proto: &proto::Commitment) -> Result<Self> {
         check_hash_backend::<H::ProtoTag>(&proto.hash_backend)?;
 
@@ -569,18 +572,34 @@ impl<F: Field256, H: Hasher<F>> Commitment<F, H> {
             return Err(anyhow!("the commitment has no polynomial batches"));
         }
 
-        Ok(Self {
-            batches: proto
-                .batches
-                .iter()
-                .map(|batch| {
-                    Ok(BatchCommitment {
-                        base_field: batch.base_field,
-                        num_polys: usize::try_from(batch.num_polys)?,
-                        root: H::load_hash(batch.root.as_slice())?,
-                    })
+        let batches: Vec<BatchCommitment> = proto
+            .batches
+            .iter()
+            .map(|batch| {
+                let num_polys = usize::try_from(batch.num_polys)?;
+                if !batch.base_field && num_polys.checked_mul(F::EXTENSION_DEGREE).is_none() {
+                    return Err(anyhow!(
+                        "the leaves of a batch of {num_polys} polynomials are too large"
+                    ));
+                }
+                Ok(BatchCommitment {
+                    base_field: batch.base_field,
+                    num_polys,
+                    root: H::load_hash(batch.root.as_slice())?,
                 })
-                .collect::<Result<_>>()?,
+            })
+            .collect::<Result<_>>()?;
+
+        if batches
+            .iter()
+            .try_fold(0usize, |total, batch| total.checked_add(batch.num_polys))
+            .is_none()
+        {
+            return Err(anyhow!("the commitment has too many polynomials"));
+        }
+
+        Ok(Self {
+            batches,
             _data: PhantomData,
         })
     }
@@ -634,14 +653,14 @@ impl<F: Field256, H: Hasher<F>> Committer<F, H> {
         &self.options
     }
 
-    /// Returns the number of Merkle trees constructed so far, corresponding to the number of
-    /// polynomial batches.
-    pub fn num_trees(&self) -> usize {
+    /// Returns the number of polynomial batches added so far, which is also the number of Merkle
+    /// trees.
+    pub fn num_batches(&self) -> usize {
         self.batches.len()
     }
 
-    /// Returns the root hash of the i-th Merkle tree. `index` must be less than
-    /// [`Self::num_trees()`].
+    /// Returns the Merkle root of the i-th batch. `index` must be less than
+    /// [`Self::num_batches()`].
     ///
     /// This value can be used to derive Fiat-Shamir challenges.
     pub fn root_hash(&self, index: usize) -> H256 {
@@ -901,7 +920,8 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
             }
             let mut values = Vec::with_capacity(num_polys);
             for (batch, opening) in commitment.batches().iter().zip(openings.iter()) {
-                if 1usize << opening.len() != self.options.extended_domain_size() {
+                let height = self.options.extended_domain_size().trailing_zeros() as usize;
+                if opening.len() != height {
                     return Err(anyhow!("invalid opening for index {index}"));
                 }
                 let leaf_size = if batch.base_field {
@@ -1088,13 +1108,13 @@ impl<F: Field256, H: Hasher<F>> Prover<F, H> {
         self.batches.iter().map(Batch::num_polys).sum()
     }
 
-    /// Returns the number of Merkle trees, corresponding to the number of polynomial batches.
-    pub fn num_trees(&self) -> usize {
+    /// Returns the number of polynomial batches, which is also the number of Merkle trees.
+    pub fn num_batches(&self) -> usize {
         self.batches.len()
     }
 
-    /// Returns the root hash of the i-th Merkle tree. `index` must be less than
-    /// [`Self::num_trees()`].
+    /// Returns the root hash of the Merkle tree of the i-th batch. `index` must be less than
+    /// [`Self::num_batches()`].
     ///
     /// This value can be used to derive Fiat-Shamir challenges.
     pub fn root_hash(&self, index: usize) -> H256 {
@@ -1975,9 +1995,9 @@ mod tests {
     }
 
     #[test]
-    fn test_committer_num_trees() {
+    fn test_committer_num_batches() {
         let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
-        assert_eq!(committer.num_trees(), 2);
+        assert_eq!(committer.num_batches(), 2);
     }
 
     #[test]
@@ -2018,7 +2038,7 @@ mod tests {
         let mut committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
         let index = committer.add_batch(make_batch(&[&[12, 34]]));
         assert_eq!(index, 2);
-        assert_eq!(committer.num_trees(), 3);
+        assert_eq!(committer.num_batches(), 3);
     }
 
     #[test]
@@ -2040,7 +2060,7 @@ mod tests {
         let mut committer = make_committer::<GL4, Sha2Hash<GL4>>(OPTIONS, &SAMPLE_BATCHES);
         let index = committer.add_base_batch(make_batch(&[&[12, 34]]));
         assert_eq!(index, 2);
-        assert_eq!(committer.num_trees(), 3);
+        assert_eq!(committer.num_batches(), 3);
     }
 
     #[test]
@@ -2283,6 +2303,46 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// The leaves of the batch over Goldilocks^4 have 4 values per polynomial.
+    #[test]
+    fn test_commitment_with_largest_leaves_from_proto() {
+        let (commitment, _) = sample_mixed_proof();
+        let mut proto = commitment.to_proto();
+        proto.batches[1].num_polys = (usize::MAX / 4) as u64;
+        let decoded = Commitment::<GL4, Sha2Hash<GL4>>::from_proto(&proto).unwrap();
+        assert_eq!(decoded.batches()[1].num_polys(), usize::MAX / 4);
+    }
+
+    /// The leaves of the batch over Goldilocks^4 would have more than `usize::MAX` values.
+    #[test]
+    fn test_reject_commitment_with_oversized_leaves() {
+        let (commitment, _) = sample_mixed_proof();
+        let mut proto = commitment.to_proto();
+        proto.batches[1].num_polys = (usize::MAX / 4 + 1) as u64;
+        let result = Commitment::<GL4, Sha2Hash<GL4>>::from_proto(&proto);
+        assert!(result.is_err());
+    }
+
+    /// The leaves of the base-field batch have one value per polynomial, so only the total number
+    /// of polynomials limits its size.
+    #[test]
+    fn test_commitment_with_largest_base_batch_from_proto() {
+        let (commitment, _) = sample_mixed_proof();
+        let mut proto = commitment.to_proto();
+        proto.batches[0].num_polys = (usize::MAX - 1) as u64;
+        let decoded = Commitment::<GL4, Sha2Hash<GL4>>::from_proto(&proto).unwrap();
+        assert_eq!(decoded.num_polys(), usize::MAX);
+    }
+
+    #[test]
+    fn test_reject_commitment_with_too_many_polynomials() {
+        let (commitment, _) = sample_mixed_proof();
+        let mut proto = commitment.to_proto();
+        proto.batches[0].num_polys = usize::MAX as u64;
+        let result = Commitment::<GL4, Sha2Hash<GL4>>::from_proto(&proto);
+        assert!(result.is_err());
+    }
+
     #[test]
     fn test_prover_options() {
         let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
@@ -2298,10 +2358,10 @@ mod tests {
     }
 
     #[test]
-    fn test_prover_num_trees() {
+    fn test_prover_num_batches() {
         let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
         let (_, prover) = committer.commit();
-        assert_eq!(prover.num_trees(), 2);
+        assert_eq!(prover.num_batches(), 2);
     }
 
     #[test]
@@ -3117,6 +3177,20 @@ mod tests {
         let (_, other_prover) = committer.commit();
         let mut other_proof = other_prover.prove(make_points(&[123]));
         proof.openings[0][0] = other_proof.openings[0].remove(0);
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
+    }
+
+    /// The Merkle path has 64 more hashes than the height of the tree, so `1 << path.len()` would
+    /// wrap around to the domain size.
+    #[test]
+    fn test_reject_oversized_opening_path() {
+        let (commitment, proof) = sample_proof(OPTIONS);
+        let mut proto = proof.to_proto();
+        proto.openings[0].proofs[0]
+            .merkle_path
+            .extend(vec![vec![0; 32]; 64]);
+        let proof = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
         let result = proof.verify(&commitment);
         assert!(result.is_err());
     }
