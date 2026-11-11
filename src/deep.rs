@@ -1,7 +1,7 @@
 use crate::fri;
 use crate::hash::Hasher;
 use crate::merkle::{Proof as LeafProof, Tree};
-use crate::starkom::proto::pcs::v9 as proto;
+use crate::starkom::proto::pcs::v10 as proto;
 use crate::utils;
 use anyhow::{Result, anyhow};
 use primitive_types::{H256, U256};
@@ -345,52 +345,201 @@ fn check_hash_backend<T: prost::Name + Default>(
     }
 }
 
+/// Evaluates a polynomial over the base field at a point of the extension field.
+fn evaluate_base_polynomial<F: Field256>(polynomial: &Polynomial<F::BaseField>, z: F) -> F {
+    polynomial
+        .coefficients()
+        .iter()
+        .rev()
+        .fold(F::ZERO, |value, &coefficient| value * z + coefficient)
+}
+
+/// The polynomials of a committed batch, which are either all over the base field or all over the
+/// ~256-bit field.
+#[derive(Debug, Clone)]
+enum BatchPolynomials<F: Field256> {
+    Base(Vec<Polynomial<F::BaseField>>),
+    Extension(Vec<Polynomial<F>>),
+}
+
+/// A committed batch: its polynomials and the Merkle tree of their evaluations.
+#[derive(Debug, Clone)]
+struct Batch<F: Field256, H: Hasher<F>> {
+    polynomials: BatchPolynomials<F>,
+    tree: Tree<F, H>,
+}
+
+impl<F: Field256, H: Hasher<F>> Batch<F, H> {
+    /// Returns the commitment to the batch.
+    fn commitment(&self) -> BatchCommitment {
+        BatchCommitment {
+            base_field: matches!(self.polynomials, BatchPolynomials::Base(_)),
+            num_polys: self.num_polys(),
+            root: self.tree.root_hash(),
+        }
+    }
+
+    /// Returns the number of polynomials in the batch.
+    fn num_polys(&self) -> usize {
+        match &self.polynomials {
+            BatchPolynomials::Base(polynomials) => polynomials.len(),
+            BatchPolynomials::Extension(polynomials) => polynomials.len(),
+        }
+    }
+
+    /// Returns the root hash of the Merkle tree of the batch.
+    fn root_hash(&self) -> H256 {
+        self.tree.root_hash()
+    }
+
+    /// Returns a Merkle proof for the leaf at `index`.
+    fn query(&self, index: usize) -> LeafProof<F, H> {
+        self.tree.query(index)
+    }
+
+    /// Evaluates all polynomials of the batch at `z`.
+    fn evaluate(&self, z: F) -> Vec<F> {
+        match &self.polynomials {
+            BatchPolynomials::Base(polynomials) => polynomials
+                .iter()
+                .map(|polynomial| evaluate_base_polynomial(polynomial, z))
+                .collect(),
+            BatchPolynomials::Extension(polynomials) => polynomials
+                .iter()
+                .map(|polynomial| polynomial.evaluate(z))
+                .collect(),
+        }
+    }
+
+    /// Computes the random linear combination of all polynomials of all `batches`, in order: the
+    /// i-th polynomial is multiplied by `alpha^i`.
+    fn combine<'a>(batches: impl IntoIterator<Item = &'a Self>, alpha: F) -> Polynomial<F>
+    where
+        Self: 'a,
+    {
+        let mut combined = Polynomial::<F>::default();
+        let mut pow = F::ONE;
+        for batch in batches {
+            match &batch.polynomials {
+                BatchPolynomials::Base(polynomials) => {
+                    for polynomial in polynomials {
+                        combined += Polynomial::with_coefficients(
+                            polynomial
+                                .coefficients()
+                                .iter()
+                                .map(|&coefficient| pow * coefficient)
+                                .collect(),
+                        );
+                        pow *= alpha;
+                    }
+                }
+                BatchPolynomials::Extension(polynomials) => {
+                    for polynomial in polynomials {
+                        combined += polynomial.clone() * pow;
+                        pow *= alpha;
+                    }
+                }
+            }
+        }
+        combined
+    }
+}
+
+/// The commitment to a single batch of polynomials (see [`Commitment`]).
+///
+/// The Merkle root also determines the other fields, so a proof never verifies against a commitment
+/// with the wrong ones. However, callers must still check the expected shape (number of polynomials
+/// and whether they're defined over the base field or the extension field).
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct BatchCommitment {
+    /// Whether the polynomials of the batch are over the base field.
+    base_field: bool,
+    /// Number of polynomials in the batch.
+    num_polys: usize,
+    /// Root hash of the Merkle tree where the evaluations of the polynomials are stored.
+    root: H256,
+}
+
+impl BatchCommitment {
+    /// Returns whether the polynomials of the batch are over the base field `F::BaseField` (see
+    /// [`Committer::add_base_batch`]) rather than over the ~256-bit field `F` (see
+    /// [`Committer::add_batch`]).
+    pub fn base_field(&self) -> bool {
+        self.base_field
+    }
+
+    /// Returns the number of polynomials in the batch.
+    ///
+    /// Every polynomial over `F` is committed as its `T` coordinate polynomials over
+    /// `F::BaseField` where `T` is [`F::EXTENSION_DEGREE`](`Field::EXTENSION_DEGREE`), so every
+    /// leaf of the Merkle tree of the batch has `num_polys` values for a base-field batch and
+    /// `T * num_polys` values for a batch over `F`.
+    pub fn num_polys(&self) -> usize {
+        self.num_polys
+    }
+
+    /// Returns the root hash of the Merkle tree where the evaluations of the polynomials of the
+    /// batch are stored.
+    pub fn root(&self) -> H256 {
+        self.root
+    }
+}
+
 /// A batched DEEP-FRI polynomial commitment (see [`Committer`] for details).
 ///
 /// The commitment only depends on the committed polynomials, not on the points opened by a
 /// [`Proof`], so the points can be chosen after committing (see [`Prover::prove`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Commitment<F: Field256, H: Hasher<F>> {
-    /// The root hashes of the Merkle trees where the evaluations of all batched polynomials are
-    /// stored. There is one root hash per polynomial batch.
-    tree_roots: Vec<H256>,
-    /// The number of polynomials in each batch, which is also the number of evaluations stored in
-    /// each leaf of the corresponding Merkle tree. There is one entry per polynomial batch.
-    batch_sizes: Vec<usize>,
+    /// The commitments to the polynomial batches, in commitment order.
+    batches: Vec<BatchCommitment>,
     _data: PhantomData<(F, H)>,
 }
 
 impl<F: Field256, H: Hasher<F>> Commitment<F, H> {
-    /// Returns the root hashes of the Merkle trees where all batched polynomials are stored.
-    pub fn tree_roots(&self) -> &[H256] {
-        self.tree_roots.as_slice()
+    /// Returns the commitments to the polynomial batches, in commitment order.
+    pub fn batches(&self) -> &[BatchCommitment] {
+        self.batches.as_slice()
     }
 
-    /// Returns the number of polynomials in each batch, which is also the number of evaluations
-    /// stored in each leaf of the corresponding Merkle tree.
-    ///
-    /// The returned slice has one element for every [tree root](`Self::tree_roots`).
-    pub fn batch_sizes(&self) -> &[usize] {
-        self.batch_sizes.as_slice()
+    /// Returns the number of polynomial batches, which is also the number of Merkle trees.
+    pub fn num_batches(&self) -> usize {
+        self.batches.len()
     }
 
-    /// Hashes the first `batch_count` [tree roots](`Self::tree_roots`).
+    /// Returns the total number of committed polynomials, i.e. the sum of the `num_polys` of all
+    /// [batches](`Self::batches`), which is also the number of evaluations that a [`Proof`] opens
+    /// at every point.
+    pub fn num_polys(&self) -> usize {
+        self.batches.iter().map(|batch| batch.num_polys).sum()
+    }
+
+    /// Returns the root hashes of the Merkle trees of all batches, in commitment order.
+    fn tree_roots(&self) -> Vec<H256> {
+        self.batches.iter().map(BatchCommitment::root).collect()
+    }
+
+    /// Hashes the Merkle roots of the first `batch_count` [batches](`Self::batches`).
     ///
     /// The returned hash is cryptographically bound to the full transcript up to the given
     /// polynomial batch, and can be used by a verifier to recover Fiat-Shamir challenges.
     ///
     /// REQUIRES: `batch_count` must be strictly greater than 0 and less than or equal to the number
-    /// of tree roots.
+    /// of batches.
     ///
     /// The hashes returned by this method are compatible with [`Committer::transcript_hash`], which
     /// can be used on the prover side.
     pub fn transcript_hash(&self, batch_count: usize) -> H256 {
         assert!(batch_count > 0);
-        assert!(batch_count <= self.tree_roots.len());
+        assert!(batch_count <= self.num_batches());
         H::hash_transcript(
             *TRANSCRIPT_DST,
             std::iter::once(utils::encode_usize(batch_count))
-                .chain(self.tree_roots[..batch_count].iter().copied())
+                .chain(
+                    self.batches[..batch_count]
+                        .iter()
+                        .map(BatchCommitment::root),
+                )
                 .collect::<Vec<H256>>()
                 .as_slice(),
         )
@@ -401,18 +550,21 @@ impl<F: Field256, H: Hasher<F>> Commitment<F, H> {
         proto::Commitment {
             hash_backend: Some(Any::from_msg(&H::ProtoTag::default()).unwrap()),
             batches: self
-                .tree_roots
+                .batches
                 .iter()
-                .zip(self.batch_sizes.iter())
-                .map(|(root, &num_polys)| proto::commitment::Batch {
-                    root: root.as_bytes().to_vec(),
-                    num_polys: num_polys as u64,
+                .map(|batch| proto::commitment::Batch {
+                    base_field: batch.base_field,
+                    num_polys: batch.num_polys as u64,
+                    root: batch.root.as_bytes().to_vec(),
                 })
                 .collect(),
         }
     }
 
     /// Deserializes a commitment from a [`Commitment`](`proto::Commitment`) protobuf.
+    ///
+    /// Returns an error if the total number of polynomials, or the number of values of the leaves
+    /// of any batch, doesn't fit in a `usize`.
     pub fn from_proto(proto: &proto::Commitment) -> Result<Self> {
         check_hash_backend::<H::ProtoTag>(&proto.hash_backend)?;
 
@@ -420,17 +572,34 @@ impl<F: Field256, H: Hasher<F>> Commitment<F, H> {
             return Err(anyhow!("the commitment has no polynomial batches"));
         }
 
+        let batches: Vec<BatchCommitment> = proto
+            .batches
+            .iter()
+            .map(|batch| {
+                let num_polys = usize::try_from(batch.num_polys)?;
+                if !batch.base_field && num_polys.checked_mul(F::EXTENSION_DEGREE).is_none() {
+                    return Err(anyhow!(
+                        "the leaves of a batch of {num_polys} polynomials are too large"
+                    ));
+                }
+                Ok(BatchCommitment {
+                    base_field: batch.base_field,
+                    num_polys,
+                    root: H::load_hash(batch.root.as_slice())?,
+                })
+            })
+            .collect::<Result<_>>()?;
+
+        if batches
+            .iter()
+            .try_fold(0usize, |total, batch| total.checked_add(batch.num_polys))
+            .is_none()
+        {
+            return Err(anyhow!("the commitment has too many polynomials"));
+        }
+
         Ok(Self {
-            tree_roots: proto
-                .batches
-                .iter()
-                .map(|batch| H::load_hash(batch.root.as_slice()))
-                .collect::<Result<_>>()?,
-            batch_sizes: proto
-                .batches
-                .iter()
-                .map(|batch| Ok(usize::try_from(batch.num_polys)?))
-                .collect::<Result<_>>()?,
+            batches,
             _data: PhantomData,
         })
     }
@@ -442,6 +611,14 @@ impl<F: Field256, H: Hasher<F>> Commitment<F, H> {
 /// eventually handing everything over to a newly constructed [`Prover`] (see the [`Self::commit`]
 /// method).
 ///
+/// All Fiat-Shamir challenges and opened points are elements of the ~256-bit field `F`, but every
+/// batch of committed polynomials can be defined either over `F` (see [`Self::add_batch`]) or over
+/// its base field `F::BaseField`, e.g. Goldilocks^4 and Goldilocks (see [`Self::add_base_batch`]).
+/// Committing polynomials over the base field costs less, because their Merkle leaves are `T` times
+/// smaller (`T` being the extension degree of `F`), and proves that they're over the base field.
+/// When `F` is a prime field (e.g. BlueSky) `F::BaseField` and `F` coincide, and so do the two
+/// kinds of batch.
+///
 /// This two-stage Committer-Prover architecture allows getting Merkle roots for the proven
 /// polynomials before batching all of them, so that Fiat-Shamir challenges can be derived between
 /// batches (see [`Self::transcript_hash`]). The opened points don't need to be known at commitment
@@ -451,31 +628,24 @@ pub struct Committer<F: Field256, H: Hasher<F>> {
     /// The protocol parameters. The degree of all batched polynomials must be less than the degree
     /// bound.
     options: Options,
-    /// All polynomials batched so far.
-    polynomials: Vec<Polynomial<F>>,
-    /// The Merkle trees built so far.
-    ///
-    /// The sum of all `num_polys` of all trees must match the number of `polynomials`.
-    trees: Vec<Tree<F, H>>,
+    /// All polynomial batches added so far, along with their Merkle trees.
+    batches: Vec<Batch<F, H>>,
 }
 
 impl<F: Field256, H: Hasher<F>> Committer<F, H> {
-    /// Constructs a [`Committer`] with the given options and first batch of polynomials.
+    /// Constructs a [`Committer`] with the given options and no polynomials.
     ///
-    /// We require specifying the first batch because our DEEP-FRI protocol requires at least one
-    /// committed polynomial to work.
+    /// Our DEEP-FRI protocol requires at least one committed polynomial to work, so at least one
+    /// batch must be added (see [`Self::add_batch`] and [`Self::add_base_batch`]) before calling
+    /// [`Self::commit`].
     ///
     /// Panics if the options are [invalid](`Options::validate`).
-    pub fn new(options: Options, polynomials: Vec<Polynomial<F>>) -> Self {
+    pub fn new(options: Options) -> Self {
         options.validate::<F>().expect("invalid DEEP-FRI options");
-        assert!(!polynomials.is_empty());
-        let mut committer = Self {
+        Self {
             options,
-            polynomials: vec![],
-            trees: vec![],
-        };
-        committer.add_batch(polynomials);
-        committer
+            batches: vec![],
+        }
     }
 
     /// Returns the protocol parameters.
@@ -483,18 +653,18 @@ impl<F: Field256, H: Hasher<F>> Committer<F, H> {
         &self.options
     }
 
-    /// Returns the number of Merkle trees constructed so far, corresponding to the number of
-    /// polynomial batches.
-    pub fn num_trees(&self) -> usize {
-        self.trees.len()
+    /// Returns the number of polynomial batches added so far, which is also the number of Merkle
+    /// trees.
+    pub fn num_batches(&self) -> usize {
+        self.batches.len()
     }
 
-    /// Returns the root hash of the i-th Merkle tree. `index` must be less than
-    /// [`Self::num_trees()`].
+    /// Returns the Merkle root of the i-th batch. `index` must be less than
+    /// [`Self::num_batches()`].
     ///
     /// This value can be used to derive Fiat-Shamir challenges.
     pub fn root_hash(&self, index: usize) -> H256 {
-        self.trees[index].root_hash()
+        self.batches[index].root_hash()
     }
 
     /// Hashes the Merkle roots of all polynomial batches accumulated so far.
@@ -507,42 +677,75 @@ impl<F: Field256, H: Hasher<F>> Committer<F, H> {
     pub fn transcript_hash(&self) -> H256 {
         H::hash_transcript(
             *TRANSCRIPT_DST,
-            std::iter::once(utils::encode_usize(self.trees.len()))
-                .chain(self.trees.iter().map(Tree::root_hash))
+            std::iter::once(utils::encode_usize(self.batches.len()))
+                .chain(self.batches.iter().map(Batch::root_hash))
                 .collect::<Vec<H256>>()
                 .as_slice(),
         )
     }
 
-    /// Adds a batch of polynomials, returning the index of the newly created batch.
+    /// Adds a batch of polynomials over `F`, returning the index of the newly created batch.
     ///
     /// The returned index can be used with the [`Self::root_hash`] method to get the Merkle root
     /// for the batch.
     ///
-    /// REQUIRES: the degree of all specified polynomials must be strictly less than
-    /// the [`degree_bound`](`Options::degree_bound`).
+    /// REQUIRES: the batch must not be empty, and the degree of all specified polynomials must be
+    /// strictly less than the [`degree_bound`](`Options::degree_bound`).
     pub fn add_batch(&mut self, polynomials: Vec<Polynomial<F>>) -> usize {
-        assert!(!polynomials.is_empty());
-
-        let degree_bound = polynomials
-            .iter()
-            .map(|polynomial| polynomial.degree_bound())
-            .max()
-            .unwrap()
-            .next_power_of_two();
-        assert!(degree_bound <= self.options.degree_bound);
-        let n = self.options.extended_domain_size();
-
+        let n = self.check_batch(polynomials.iter().map(Polynomial::degree_bound));
         let evaluations = polynomials
             .iter()
             .map(|polynomial| polynomial.clone().shift_domain().lde2(n))
-            .collect::<Vec<Vec<F>>>();
+            .collect();
+        self.push_batch(Batch {
+            polynomials: BatchPolynomials::Extension(polynomials),
+            tree: Tree::new(evaluations),
+        })
+    }
 
-        let index = self.trees.len();
+    /// Adds a batch of polynomials over the base field `F::BaseField`, returning the index of the
+    /// newly created batch.
+    ///
+    /// The leaves of the Merkle tree of a base-field batch are elements of `F::BaseField` by
+    /// construction, and so are the coefficients of the polynomials that a successful verification
+    /// binds them to: a polynomial whose degree is less than the number of points of the
+    /// (base-field) evaluation domain where it agrees with `F::BaseField`-valued evaluations is the
+    /// interpolant of those evaluations, so its coefficients are in `F::BaseField`.
+    ///
+    /// The returned index can be used with the [`Self::root_hash`] method to get the Merkle root
+    /// for the batch.
+    ///
+    /// REQUIRES: the batch must not be empty, and the degree of all specified polynomials must be
+    /// strictly less than the [`degree_bound`](`Options::degree_bound`).
+    pub fn add_base_batch(&mut self, polynomials: Vec<Polynomial<F::BaseField>>) -> usize {
+        let n = self.check_batch(polynomials.iter().map(Polynomial::degree_bound));
+        let evaluations = polynomials
+            .iter()
+            .map(|polynomial| polynomial.clone().shift_domain().lde2(n))
+            .collect();
+        self.push_batch(Batch {
+            polynomials: BatchPolynomials::Base(polynomials),
+            tree: Tree::new_from_base(evaluations),
+        })
+    }
 
-        self.polynomials.extend(polynomials);
-        self.trees.push(Tree::new(evaluations));
+    /// Checks the degree bounds of the polynomials of a new batch, returning the size of the
+    /// extended evaluation domain.
+    ///
+    /// Panics if the batch is empty or if any polynomial exceeds the degree bound.
+    fn check_batch(&self, degree_bounds: impl Iterator<Item = usize>) -> usize {
+        let degree_bound = degree_bounds
+            .max()
+            .expect("empty polynomial batch")
+            .next_power_of_two();
+        assert!(degree_bound <= self.options.degree_bound);
+        self.options.extended_domain_size()
+    }
 
+    /// Records a new batch, returning its index.
+    fn push_batch(&mut self, batch: Batch<F, H>) -> usize {
+        let index = self.batches.len();
+        self.batches.push(batch);
         index
     }
 
@@ -552,16 +755,17 @@ impl<F: Field256, H: Hasher<F>> Committer<F, H> {
     /// The commitment only depends on the committed polynomials, so the points to open can be
     /// chosen afterwards, for example by deriving them from the commitment via Fiat-Shamir or by
     /// letting an interactive verifier request them (see [`Prover::prove`]).
+    ///
+    /// Panics if no batches have been added.
     pub fn commit(self) -> (Commitment<F, H>, Prover<F, H>) {
+        assert!(!self.batches.is_empty(), "no polynomial batches");
         let commitment = Commitment {
-            tree_roots: self.trees.iter().map(Tree::root_hash).collect(),
-            batch_sizes: self.trees.iter().map(Tree::num_polys).collect(),
+            batches: self.batches.iter().map(Batch::commitment).collect(),
             _data: PhantomData,
         };
         let prover = Prover {
             options: self.options,
-            polynomials: self.polynomials,
-            trees: self.trees,
+            batches: self.batches,
         };
         (commitment, prover)
     }
@@ -574,8 +778,6 @@ pub struct Proof<F: Field256, H: Hasher<F>> {
     options: Options,
     /// The proof-of-work nonce found by the prover.
     nonce: u64,
-    /// Number of committed polynomials.
-    num_polys: usize,
     /// The opened points. Keys are (off-domain) X-coordinates, values are the corresponding
     /// evaluations (one for every committed polynomial).
     points: BTreeMap<F, Vec<F>>,
@@ -610,11 +812,6 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
         self.nonce
     }
 
-    /// Returns the number of committed polynomials.
-    pub fn num_polys(&self) -> usize {
-        self.num_polys
-    }
-
     /// Returns a reference to the opened points. Keys are (off-domain) X-coordinates, values are
     /// the corresponding evaluations (one for every committed polynomial).
     pub fn points(&self) -> &BTreeMap<F, Vec<F>> {
@@ -624,8 +821,9 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
     /// Verifies this proof against the given commitment.
     ///
     /// If verification succeeds, the committed polynomials have degree *at most*
-    /// [`Options::degree_bound`] and their evaluations at the [opened points](`Self::points`) are
-    /// the ones claimed by the proof.
+    /// [`Options::degree_bound`], the ones of the base-field batches are over the base field (see
+    /// [`Committer::add_base_batch`]), and their evaluations at the [opened points](`Self::points`)
+    /// are the ones claimed by the proof.
     ///
     /// WARNING: honest provers commit polynomials of degree *strictly less* than
     /// [`Options::degree_bound`], but a valid proof only guarantees a degree *at most* equal to it.
@@ -657,23 +855,15 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
             ));
         }
 
-        let num_polys = commitment.batch_sizes().iter().copied().sum();
-        if self.num_polys != num_polys {
-            return Err(anyhow!(
-                "incorrect number of polynomials (got {}, want {})",
-                self.num_polys,
-                num_polys
-            ));
-        }
+        let num_polys = commitment.num_polys();
         if self.points.is_empty() {
             return Err(anyhow!("the proof doesn't open any points"));
         }
         for (&z, values) in &self.points {
-            if values.len() != self.num_polys {
+            if values.len() != num_polys {
                 return Err(anyhow!(
-                    "incorrect number of evaluations at {z} (got {}, want {})",
-                    values.len(),
-                    self.num_polys
+                    "incorrect number of evaluations at {z} (got {}, want {num_polys})",
+                    values.len()
                 ));
             }
         }
@@ -696,9 +886,10 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
             ));
         }
 
+        let tree_roots = commitment.tree_roots();
         let seed = query_seed::<F, H>(
-            commitment.tree_roots(),
-            self.num_polys,
+            tree_roots.as_slice(),
+            num_polys,
             &self.points,
             &self.fri_commitment,
         );
@@ -708,8 +899,7 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
         }
         let indices = get_query_indices::<F, H>(pow, &self.options);
 
-        let (alpha, beta) =
-            deep_challenges::<F, H>(commitment.tree_roots(), self.num_polys, &self.points);
+        let (alpha, beta) = deep_challenges::<F, H>(tree_roots.as_slice(), num_polys, &self.points);
 
         for ((query, openings), &expected_index) in
             (self.queries.iter().zip(self.openings.iter())).zip(indices.iter())
@@ -721,42 +911,44 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
                 ));
             }
 
-            if openings.len() != commitment.tree_roots().len() {
+            if openings.len() != commitment.num_batches() {
                 return Err(anyhow!(
                     "incorrect number of openings for index {index} (got {}, want {})",
                     openings.len(),
-                    commitment.tree_roots().len()
+                    commitment.num_batches()
                 ));
             }
-            for ((&root_hash, &batch_size), opening) in commitment
-                .tree_roots()
-                .iter()
-                .zip(commitment.batch_sizes())
-                .zip(openings.iter())
-            {
-                if 1usize << opening.len() != self.options.extended_domain_size() {
+            let mut values = Vec::with_capacity(num_polys);
+            for (batch, opening) in commitment.batches().iter().zip(openings.iter()) {
+                let height = self.options.extended_domain_size().trailing_zeros() as usize;
+                if opening.len() != height {
                     return Err(anyhow!("invalid opening for index {index}"));
                 }
-                if opening.leaf().len() != batch_size {
+                let leaf_size = if batch.base_field {
+                    batch.num_polys
+                } else {
+                    batch.num_polys * F::EXTENSION_DEGREE
+                };
+                if opening.leaf().len() != leaf_size {
                     return Err(anyhow!(
-                        "incorrect batch size at index {index} (got {}, want {})",
-                        opening.leaf().len(),
-                        batch_size
+                        "incorrect leaf size at index {index} (got {}, want {leaf_size})",
+                        opening.leaf().len()
                     ));
                 }
-                opening.verify(index, root_hash)?;
+                if batch.base_field {
+                    opening.verify_base(index, batch.root)?;
+                    values.extend(opening.leaf().iter().map(|&value| F::from(value)));
+                } else {
+                    opening.verify(index, batch.root)?;
+                    values.extend(utils::unflatten::<F>(opening.leaf()));
+                }
             }
 
             if query.len() != self.options.num_rounds() {
                 return Err(anyhow!("invalid low-degree proof for index {index}"));
             }
 
-            let combined = rlc(
-                openings
-                    .iter()
-                    .flat_map(|proof| proof.leaf().iter().copied()),
-                alpha,
-            );
+            let combined = rlc(values, alpha);
 
             let x = query.x();
             let quotient = rlc(
@@ -783,15 +975,14 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
             max_rounds: self.options.max_rounds as u64,
             grinding_bits: self.options.grinding_bits as u32,
             nonce: self.nonce,
-            num_polys: self.num_polys as u64,
             points: self
                 .points
                 .iter()
                 .map(|(&z, values)| proto::proof::Point {
-                    z: z.to_le_bytes().to_vec(),
+                    z: utils::store_scalar(z),
                     v: values
                         .iter()
-                        .map(|value| value.to_le_bytes().to_vec())
+                        .map(|&value| utils::store_scalar(value))
                         .collect(),
                 })
                 .collect(),
@@ -806,7 +997,7 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
                 .folded_polynomial()
                 .coefficients()
                 .iter()
-                .map(|coefficient| coefficient.to_le_bytes().to_vec())
+                .map(|&coefficient| utils::store_scalar(coefficient))
                 .collect(),
             openings: self
                 .openings
@@ -839,7 +1030,6 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
         Ok(Self {
             options,
             nonce: proto.nonce,
-            num_polys: proto.num_polys as usize,
             points: proto
                 .points
                 .iter()
@@ -903,10 +1093,8 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
 pub struct Prover<F: Field256, H: Hasher<F>> {
     /// The protocol parameters.
     options: Options,
-    /// The committed polynomials.
-    polynomials: Vec<Polynomial<F>>,
-    /// Raw Merkle trees for the committed polynomials, one for each batch.
-    trees: Vec<Tree<F, H>>,
+    /// The committed polynomial batches, along with their Merkle trees.
+    batches: Vec<Batch<F, H>>,
 }
 
 impl<F: Field256, H: Hasher<F>> Prover<F, H> {
@@ -917,20 +1105,20 @@ impl<F: Field256, H: Hasher<F>> Prover<F, H> {
 
     /// Returns the number of committed polynomials.
     pub fn num_polys(&self) -> usize {
-        self.trees.iter().map(|tree| tree.num_polys()).sum()
+        self.batches.iter().map(Batch::num_polys).sum()
     }
 
-    /// Returns the number of Merkle trees, corresponding to the number of polynomial batches.
-    pub fn num_trees(&self) -> usize {
-        self.trees.len()
+    /// Returns the number of polynomial batches, which is also the number of Merkle trees.
+    pub fn num_batches(&self) -> usize {
+        self.batches.len()
     }
 
-    /// Returns the root hash of the i-th Merkle tree. `index` must be less than
-    /// [`Self::num_trees()`].
+    /// Returns the root hash of the Merkle tree of the i-th batch. `index` must be less than
+    /// [`Self::num_batches()`].
     ///
     /// This value can be used to derive Fiat-Shamir challenges.
     pub fn root_hash(&self, index: usize) -> H256 {
-        self.trees[index].root_hash()
+        self.batches[index].root_hash()
     }
 
     /// Carries out an exhaustive search for a valid nonce, stopping when one is found.
@@ -967,32 +1155,22 @@ impl<F: Field256, H: Hasher<F>> Prover<F, H> {
         check_points_off_domain(points.iter().copied(), self.options.extended_domain_size())
             .unwrap();
 
+        let num_polys = self.num_polys();
         let points: BTreeMap<F, Vec<F>> = points
             .into_iter()
             .map(|z| {
-                (
-                    z,
-                    self.polynomials
-                        .iter()
-                        .map(|polynomial| polynomial.evaluate(z))
-                        .collect(),
-                )
+                let mut values = Vec::with_capacity(num_polys);
+                for batch in &self.batches {
+                    values.append(&mut batch.evaluate(z));
+                }
+                (z, values)
             })
             .collect();
 
-        let tree_roots: Vec<H256> = self.trees.iter().map(Tree::root_hash).collect();
-        let num_polys = self.polynomials.len();
+        let tree_roots: Vec<H256> = self.batches.iter().map(Batch::root_hash).collect();
         let (alpha, beta) = deep_challenges::<F, H>(tree_roots.as_slice(), num_polys, &points);
 
-        let combined = {
-            let mut combined = Polynomial::default();
-            let mut pow = F::ONE;
-            for polynomial in &self.polynomials {
-                combined += polynomial.clone() * pow;
-                pow *= alpha;
-            }
-            combined
-        };
+        let combined = Batch::combine(&self.batches, alpha);
 
         let quotient = {
             let mut quotient = Polynomial::default();
@@ -1021,7 +1199,12 @@ impl<F: Field256, H: Hasher<F>> Prover<F, H> {
         let indices = get_query_indices::<F, H>(pow, &self.options);
         let openings = indices
             .iter()
-            .map(|&index| self.trees.iter().map(|tree| tree.query(index)).collect())
+            .map(|&index| {
+                self.batches
+                    .iter()
+                    .map(|batch| batch.query(index))
+                    .collect()
+            })
             .collect();
         let queries = indices
             .iter()
@@ -1030,7 +1213,6 @@ impl<F: Field256, H: Hasher<F>> Prover<F, H> {
         Proof {
             options: self.options,
             nonce,
-            num_polys,
             points,
             fri_commitment,
             openings,
@@ -1044,7 +1226,8 @@ mod tests {
     use super::*;
     use crate::hash::{Keccak256Hash, Sha2Hash};
     use starkom_bluesky::Scalar as BS;
-    use starkom_goldilocks::GL4;
+    use starkom_goldilocks::{GL, GL4};
+    use starkom_koalabear::KB8;
     use std::fmt::Debug;
     use std::str::FromStr;
 
@@ -1053,12 +1236,17 @@ mod tests {
     }
 
     /// Builds a polynomial from its coefficients.
-    fn make_polynomial<F: Field256>(coefficients: &[u64]) -> Polynomial<F> {
-        Polynomial::with_coefficients(coefficients.iter().copied().map(F::from).collect())
+    fn make_polynomial<F: Field>(coefficients: &[u64]) -> Polynomial<F> {
+        Polynomial::with_coefficients(
+            coefficients
+                .iter()
+                .map(|&coefficient| F::try_from(coefficient as usize).unwrap())
+                .collect(),
+        )
     }
 
     /// Builds a batch of polynomials, each one from its coefficients.
-    fn make_batch<F: Field256>(batch: &[&[u64]]) -> Vec<Polynomial<F>> {
+    fn make_batch<F: Field>(batch: &[&[u64]]) -> Vec<Polynomial<F>> {
         batch
             .iter()
             .map(|coefficients| make_polynomial(coefficients))
@@ -1070,16 +1258,32 @@ mod tests {
         points.iter().copied().map(F::from).collect()
     }
 
-    /// Builds a committer for the given batches of polynomials, adding them in order.
+    /// Builds a committer for the given batches of polynomials, adding them in order. Every batch
+    /// is over the base field iff the corresponding flag in `base_fields` is set.
+    fn make_mixed_committer<F: Field256, H: Hasher<F>>(
+        options: Options,
+        batches: &[&[&[u64]]],
+        base_fields: &[bool],
+    ) -> Committer<F, H> {
+        assert_eq!(batches.len(), base_fields.len());
+        let mut committer = Committer::new(options);
+        for (batch, &base_field) in batches.iter().zip(base_fields) {
+            if base_field {
+                committer.add_base_batch(make_batch(batch));
+            } else {
+                committer.add_batch(make_batch(batch));
+            }
+        }
+        committer
+    }
+
+    /// Builds a committer for the given batches of polynomials over `F` (rather than over its base
+    /// field), adding them in order.
     fn make_committer<F: Field256, H: Hasher<F>>(
         options: Options,
         batches: &[&[&[u64]]],
     ) -> Committer<F, H> {
-        let mut committer = Committer::new(options, make_batch(batches[0]));
-        for batch in &batches[1..] {
-            committer.add_batch(make_batch(batch));
-        }
-        committer
+        make_mixed_committer(options, batches, &vec![false; batches.len()])
     }
 
     /// The protocol parameters used in most tests.
@@ -1108,10 +1312,26 @@ mod tests {
     /// The points opened in most tests.
     const SAMPLE_POINTS: [u64; 2] = [123, 456];
 
+    /// A commitment and a proof using the SHA2 backend.
+    type SampleProof<F> = (Commitment<F, Sha2Hash<F>>, Proof<F, Sha2Hash<F>>);
+
     /// Commits to [`SAMPLE_BATCHES`] with the given options and proves their evaluations at
     /// [`SAMPLE_POINTS`].
-    fn sample_proof(options: Options) -> (Commitment<BS, Sha2Hash<BS>>, Proof<BS, Sha2Hash<BS>>) {
+    fn sample_proof(options: Options) -> SampleProof<BS> {
         let committer = make_committer(options, &SAMPLE_BATCHES);
+        let (commitment, prover) = committer.commit();
+        let proof = prover.prove(make_points(&SAMPLE_POINTS));
+        (commitment, proof)
+    }
+
+    /// The `base_field` flags of [`SAMPLE_BATCHES`] in the tests with mixed batches.
+    const MIXED_BASE_FIELDS: [bool; 2] = [true, false];
+
+    /// Commits to [`SAMPLE_BATCHES`] over Goldilocks^4, the first batch over the base field and the
+    /// second one over the extension field (see [`MIXED_BASE_FIELDS`]), and proves their
+    /// evaluations at [`SAMPLE_POINTS`].
+    fn sample_mixed_proof() -> SampleProof<GL4> {
+        let committer = make_mixed_committer(OPTIONS, &SAMPLE_BATCHES, &MIXED_BASE_FIELDS);
         let (commitment, prover) = committer.commit();
         let proof = prover.prove(make_points(&SAMPLE_POINTS));
         (commitment, proof)
@@ -1125,8 +1345,8 @@ mod tests {
         valid: bool,
     ) -> u64 {
         let seed = query_seed::<BS, Sha2Hash<BS>>(
-            commitment.tree_roots(),
-            proof.num_polys,
+            commitment.tree_roots().as_slice(),
+            commitment.num_polys(),
             &proof.points,
             &proof.fri_commitment,
         );
@@ -1752,23 +1972,20 @@ mod tests {
     #[test]
     #[should_panic]
     fn test_committer_with_invalid_options() {
-        Committer::<BS, Sha2Hash<BS>>::new(
-            Options {
-                degree_bound: 6,
-                security_bits: 128,
-                blowup_log2: 2,
-                fold_rate: 1,
-                max_rounds: usize::MAX,
-                grinding_bits: 0,
-            },
-            make_batch(&[&[12, 34]]),
-        );
+        Committer::<BS, Sha2Hash<BS>>::new(Options {
+            degree_bound: 6,
+            security_bits: 128,
+            blowup_log2: 2,
+            fold_rate: 1,
+            max_rounds: usize::MAX,
+            grinding_bits: 0,
+        });
     }
 
     #[test]
     #[should_panic]
-    fn test_committer_without_polynomials() {
-        Committer::<BS, Sha2Hash<BS>>::new(OPTIONS, vec![]);
+    fn test_commit_without_batches() {
+        Committer::<BS, Sha2Hash<BS>>::new(OPTIONS).commit();
     }
 
     #[test]
@@ -1778,9 +1995,9 @@ mod tests {
     }
 
     #[test]
-    fn test_committer_num_trees() {
+    fn test_committer_num_batches() {
         let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
-        assert_eq!(committer.num_trees(), 2);
+        assert_eq!(committer.num_batches(), 2);
     }
 
     #[test]
@@ -1821,7 +2038,7 @@ mod tests {
         let mut committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
         let index = committer.add_batch(make_batch(&[&[12, 34]]));
         assert_eq!(index, 2);
-        assert_eq!(committer.num_trees(), 3);
+        assert_eq!(committer.num_batches(), 3);
     }
 
     #[test]
@@ -1839,23 +2056,143 @@ mod tests {
     }
 
     #[test]
-    fn test_commitment_tree_roots() {
+    fn test_add_base_batch() {
+        let mut committer = make_committer::<GL4, Sha2Hash<GL4>>(OPTIONS, &SAMPLE_BATCHES);
+        let index = committer.add_base_batch(make_batch(&[&[12, 34]]));
+        assert_eq!(index, 2);
+        assert_eq!(committer.num_batches(), 3);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_add_empty_base_batch() {
+        let mut committer = make_committer::<GL4, Sha2Hash<GL4>>(OPTIONS, &SAMPLE_BATCHES);
+        committer.add_base_batch(vec![]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_add_base_batch_exceeding_degree_bound() {
+        let mut committer = make_committer::<GL4, Sha2Hash<GL4>>(OPTIONS, &SAMPLE_BATCHES);
+        committer.add_base_batch(make_batch(&[&[12, 34, 56, 78, 90]]));
+    }
+
+    /// A batch of four polynomials over Goldilocks and a batch of one polynomial over Goldilocks^4
+    /// whose coordinates are those four polynomials have the same leaf values on the wire, but
+    /// different roots.
+    #[test]
+    fn test_reinterpreted_batch_has_different_root() {
+        let mut base_committer = Committer::<GL4, Sha2Hash<GL4>>::new(OPTIONS);
+        base_committer.add_base_batch(make_batch(&[&[12, 34], &[56, 78], &[90, 12], &[34, 56]]));
+        let mut extension_committer = Committer::<GL4, Sha2Hash<GL4>>::new(OPTIONS);
+        extension_committer.add_batch(vec![Polynomial::with_coefficients(vec![
+            GL4::from_base_coordinates(&[12u32, 56, 90, 34].map(GL::from)),
+            GL4::from_base_coordinates(&[34u32, 78, 12, 56].map(GL::from)),
+        ])]);
+        assert_eq!(
+            base_committer.batches[0].query(5).leaf(),
+            extension_committer.batches[0].query(5).leaf()
+        );
+        assert_ne!(
+            base_committer.root_hash(0),
+            extension_committer.root_hash(0)
+        );
+    }
+
+    #[test]
+    fn test_commitment_batches() {
         let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
         let (commitment, _) = committer.commit();
         assert_eq!(
-            commitment.tree_roots(),
+            commitment.batches(),
             [
-                parse::<H256>("0x8a560267cca9607a73ad5186d575443499a19685f460be07ff3928387dcb5a48"),
-                parse("0x917d1c95f6c177b6a0ff720557fa391335d0e6710f0029c60bbef44234a03b85")
+                BatchCommitment {
+                    base_field: false,
+                    num_polys: 2,
+                    root: parse(
+                        "0x8a560267cca9607a73ad5186d575443499a19685f460be07ff3928387dcb5a48"
+                    ),
+                },
+                BatchCommitment {
+                    base_field: false,
+                    num_polys: 1,
+                    root: parse(
+                        "0x917d1c95f6c177b6a0ff720557fa391335d0e6710f0029c60bbef44234a03b85"
+                    ),
+                },
             ]
         );
     }
 
     #[test]
-    fn test_commitment_batch_sizes() {
+    fn test_commitment_num_batches() {
         let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
         let (commitment, _) = committer.commit();
-        assert_eq!(commitment.batch_sizes(), [2, 1]);
+        assert_eq!(commitment.num_batches(), 2);
+    }
+
+    #[test]
+    fn test_commitment_batches_with_base_batch() {
+        let committer = make_mixed_committer::<GL4, Sha2Hash<GL4>>(
+            OPTIONS,
+            &SAMPLE_BATCHES,
+            &MIXED_BASE_FIELDS,
+        );
+        let roots = [committer.root_hash(0), committer.root_hash(1)];
+        let (commitment, _) = committer.commit();
+        assert_eq!(
+            commitment.batches(),
+            [
+                BatchCommitment {
+                    base_field: true,
+                    num_polys: 2,
+                    root: roots[0],
+                },
+                BatchCommitment {
+                    base_field: false,
+                    num_polys: 1,
+                    root: roots[1],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_batch_commitment_accessors() {
+        let (commitment, _) = sample_mixed_proof();
+        let batch = commitment.batches()[0];
+        assert!(batch.base_field());
+        assert_eq!(batch.num_polys(), 2);
+        assert_eq!(batch.root(), commitment.batches[0].root);
+    }
+
+    #[test]
+    fn test_commitment_with_base_batch_to_proto() {
+        let (commitment, _) = sample_mixed_proof();
+        let proto = commitment.to_proto();
+        assert_eq!(
+            proto.batches,
+            [
+                proto::commitment::Batch {
+                    root: commitment.batches[0].root.as_bytes().to_vec(),
+                    num_polys: 2,
+                    base_field: true,
+                },
+                proto::commitment::Batch {
+                    root: commitment.batches[1].root.as_bytes().to_vec(),
+                    num_polys: 1,
+                    base_field: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_commitment_with_base_batch_from_proto() {
+        let (commitment, _) = sample_mixed_proof();
+        let proto = commitment.to_proto();
+        let decoded = Commitment::<GL4, Sha2Hash<GL4>>::from_proto(&proto).unwrap();
+        assert_eq!(decoded, commitment);
     }
 
     #[test]
@@ -1905,12 +2242,14 @@ mod tests {
             proto.batches,
             [
                 proto::commitment::Batch {
-                    root: commitment.tree_roots[0].as_bytes().to_vec(),
+                    root: commitment.batches[0].root.as_bytes().to_vec(),
                     num_polys: 2,
+                    base_field: false,
                 },
                 proto::commitment::Batch {
-                    root: commitment.tree_roots[1].as_bytes().to_vec(),
+                    root: commitment.batches[1].root.as_bytes().to_vec(),
                     num_polys: 1,
+                    base_field: false,
                 },
             ]
         );
@@ -1964,6 +2303,46 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// The leaves of the batch over Goldilocks^4 have 4 values per polynomial.
+    #[test]
+    fn test_commitment_with_largest_leaves_from_proto() {
+        let (commitment, _) = sample_mixed_proof();
+        let mut proto = commitment.to_proto();
+        proto.batches[1].num_polys = (usize::MAX / 4) as u64;
+        let decoded = Commitment::<GL4, Sha2Hash<GL4>>::from_proto(&proto).unwrap();
+        assert_eq!(decoded.batches()[1].num_polys(), usize::MAX / 4);
+    }
+
+    /// The leaves of the batch over Goldilocks^4 would have more than `usize::MAX` values.
+    #[test]
+    fn test_reject_commitment_with_oversized_leaves() {
+        let (commitment, _) = sample_mixed_proof();
+        let mut proto = commitment.to_proto();
+        proto.batches[1].num_polys = (usize::MAX / 4 + 1) as u64;
+        let result = Commitment::<GL4, Sha2Hash<GL4>>::from_proto(&proto);
+        assert!(result.is_err());
+    }
+
+    /// The leaves of the base-field batch have one value per polynomial, so only the total number
+    /// of polynomials limits its size.
+    #[test]
+    fn test_commitment_with_largest_base_batch_from_proto() {
+        let (commitment, _) = sample_mixed_proof();
+        let mut proto = commitment.to_proto();
+        proto.batches[0].num_polys = (usize::MAX - 1) as u64;
+        let decoded = Commitment::<GL4, Sha2Hash<GL4>>::from_proto(&proto).unwrap();
+        assert_eq!(decoded.num_polys(), usize::MAX);
+    }
+
+    #[test]
+    fn test_reject_commitment_with_too_many_polynomials() {
+        let (commitment, _) = sample_mixed_proof();
+        let mut proto = commitment.to_proto();
+        proto.batches[0].num_polys = usize::MAX as u64;
+        let result = Commitment::<GL4, Sha2Hash<GL4>>::from_proto(&proto);
+        assert!(result.is_err());
+    }
+
     #[test]
     fn test_prover_options() {
         let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
@@ -1979,10 +2358,10 @@ mod tests {
     }
 
     #[test]
-    fn test_prover_num_trees() {
+    fn test_prover_num_batches() {
         let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
         let (_, prover) = committer.commit();
-        assert_eq!(prover.num_trees(), 2);
+        assert_eq!(prover.num_batches(), 2);
     }
 
     #[test]
@@ -2037,6 +2416,52 @@ mod tests {
     }
 
     #[test]
+    fn test_proof_points_of_base_batch() {
+        let (_, proof) = sample_mixed_proof();
+        assert_eq!(
+            *proof.points(),
+            BTreeMap::from([
+                (
+                    GL4::from(123u64),
+                    vec![
+                        GL4::from(145999044u64),
+                        GL4::from(84410022u64),
+                        GL4::from(64126386u64),
+                    ]
+                ),
+                (
+                    GL4::from(456u64),
+                    vec![
+                        GL4::from(7407527580u64),
+                        GL4::from(4276015554u64),
+                        GL4::from(3235519818u64),
+                    ]
+                ),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_proof_points_of_base_batch_at_extension_point() {
+        let committer = make_mixed_committer::<GL4, Sha2Hash<GL4>>(
+            OPTIONS,
+            &SAMPLE_BATCHES,
+            &MIXED_BASE_FIELDS,
+        );
+        let (_, prover) = committer.commit();
+        let z = GL4::from_base_coordinates(&[1u32, 2, 3, 4].map(GL::from));
+        let proof = prover.prove(BTreeSet::from([z]));
+        assert_eq!(
+            proof.points()[&z],
+            [
+                make_polynomial::<GL4>(&[12, 34, 56, 78]).evaluate(z),
+                make_polynomial::<GL4>(&[42, 43, 44, 45]).evaluate(z),
+                make_polynomial::<GL4>(&[90, 78, 56, 34]).evaluate(z),
+            ]
+        );
+    }
+
+    #[test]
     fn test_proof_options() {
         let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
         let (_, prover) = committer.commit();
@@ -2045,11 +2470,16 @@ mod tests {
     }
 
     #[test]
-    fn test_proof_num_polys() {
+    fn test_commitment_num_polys() {
         let committer = make_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES);
-        let (_, prover) = committer.commit();
-        let proof = prover.prove(make_points(&SAMPLE_POINTS));
-        assert_eq!(proof.num_polys(), 3);
+        let (commitment, _) = committer.commit();
+        assert_eq!(commitment.num_polys(), 3);
+    }
+
+    #[test]
+    fn test_commitment_num_polys_with_base_batch() {
+        let (commitment, _) = sample_mixed_proof();
+        assert_eq!(commitment.num_polys(), 3);
     }
 
     #[test]
@@ -2141,21 +2571,37 @@ mod tests {
 
     fn test_honest_proof_impl<F: Field256, H: Hasher<F>>(
         batches: &[&[&[u64]]],
+        base_fields: &[bool],
         points: &[u64],
         options: Options,
     ) {
-        let committer = make_committer::<F, H>(options, batches);
+        let committer = make_mixed_committer::<F, H>(options, batches, base_fields);
         let (commitment, prover) = committer.commit();
         let proof = prover.prove(make_points(points));
         let result = proof.verify(&commitment);
         assert!(result.is_ok());
     }
 
+    fn test_honest_proof_with_fields(
+        batches: &[&[&[u64]]],
+        base_fields: &[bool],
+        points: &[u64],
+        options: Options,
+    ) {
+        test_honest_proof_impl::<BS, Sha2Hash<BS>>(batches, base_fields, points, options);
+        test_honest_proof_impl::<BS, Keccak256Hash<BS>>(batches, base_fields, points, options);
+        test_honest_proof_impl::<GL4, Sha2Hash<GL4>>(batches, base_fields, points, options);
+        test_honest_proof_impl::<GL4, Keccak256Hash<GL4>>(batches, base_fields, points, options);
+        test_honest_proof_impl::<KB8, Sha2Hash<KB8>>(batches, base_fields, points, options);
+        test_honest_proof_impl::<KB8, Keccak256Hash<KB8>>(batches, base_fields, points, options);
+    }
+
+    /// Tests the given proof with every field and hash backend, committing all batches over the
+    /// extension field and then all batches over the base field.
     fn test_honest_proof_with_options(batches: &[&[&[u64]]], points: &[u64], options: Options) {
-        test_honest_proof_impl::<BS, Sha2Hash<BS>>(batches, points, options);
-        test_honest_proof_impl::<BS, Keccak256Hash<BS>>(batches, points, options);
-        test_honest_proof_impl::<GL4, Sha2Hash<GL4>>(batches, points, options);
-        test_honest_proof_impl::<GL4, Keccak256Hash<GL4>>(batches, points, options);
+        let num_batches = batches.len();
+        test_honest_proof_with_fields(batches, &vec![false; num_batches], points, options);
+        test_honest_proof_with_fields(batches, &vec![true; num_batches], points, options);
     }
 
     fn test_honest_proof(batches: &[&[&[u64]]], points: &[u64], degree_bound: usize) {
@@ -2284,6 +2730,30 @@ mod tests {
     #[test]
     fn test_polynomial_below_degree_bound() {
         test_honest_proof(&[&[&[12, 34]]], &[123, 456], 8);
+    }
+
+    #[test]
+    fn test_base_and_extension_batches() {
+        test_honest_proof_with_fields(&SAMPLE_BATCHES, &MIXED_BASE_FIELDS, &SAMPLE_POINTS, OPTIONS);
+    }
+
+    #[test]
+    fn test_extension_and_base_batches() {
+        test_honest_proof_with_fields(&SAMPLE_BATCHES, &[false, true], &SAMPLE_POINTS, OPTIONS);
+    }
+
+    #[test]
+    fn test_three_mixed_batches() {
+        test_honest_proof_with_fields(
+            &[
+                &[&[12, 34, 56, 78], &[42, 43]],
+                &[&[90, 78, 56, 34]],
+                &[&[1, 2, 3, 4], &[5, 6, 7, 8], &[9]],
+            ],
+            &[true, false, true],
+            &[123, 456, 789],
+            GROUND_OPTIONS,
+        );
     }
 
     #[test]
@@ -2599,15 +3069,65 @@ mod tests {
     #[test]
     fn test_reject_misreported_batch_sizes() {
         let (mut commitment, proof) = sample_proof(OPTIONS);
-        commitment.batch_sizes = vec![1, 2];
+        commitment.batches[0].num_polys = 1;
+        commitment.batches[1].num_polys = 2;
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
+    }
+
+    /// The base-field batch of two polynomials is reported as a batch of two polynomials over
+    /// Goldilocks^4, whose leaves would have 8 values rather than 2.
+    #[test]
+    fn test_reject_base_batch_reported_as_extension() {
+        let (mut commitment, proof) = sample_mixed_proof();
+        commitment.batches[0].base_field = false;
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
+    }
+
+    /// The batch of one polynomial over Goldilocks^4 is reported as a base-field batch of one
+    /// polynomial, whose leaves would have 1 value rather than 4.
+    #[test]
+    fn test_reject_extension_batch_reported_as_base() {
+        let (mut commitment, proof) = sample_mixed_proof();
+        commitment.batches[1].base_field = true;
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
+    }
+
+    /// With BlueSky a base-field batch and a batch over the extension field have the same leaves,
+    /// so only the different leaf DSTs make the relabeled commitment fail.
+    #[test]
+    fn test_reject_relabeled_batches() {
+        let committer =
+            make_mixed_committer::<BS, Sha2Hash<BS>>(OPTIONS, &SAMPLE_BATCHES, &MIXED_BASE_FIELDS);
+        let (commitment, prover) = committer.commit();
+        let proof = prover.prove(make_points(&SAMPLE_POINTS));
+        let mut base_relabeled = commitment.clone();
+        base_relabeled.batches[0].base_field = false;
+        let mut extension_relabeled = commitment.clone();
+        extension_relabeled.batches[1].base_field = true;
+        assert!(proof.verify(&commitment).is_ok());
+        assert!(proof.verify(&base_relabeled).is_err());
+        assert!(proof.verify(&extension_relabeled).is_err());
+    }
+
+    #[test]
+    fn test_reject_tampered_base_leaf_value() {
+        let (commitment, proof) = sample_mixed_proof();
+        let mut proto = proof.to_proto();
+        proto.openings[3].proofs[0].leaf_values[1] = vec![42, 0, 0, 0, 0, 0, 0, 0];
+        let proof = Proof::<GL4, Sha2Hash<GL4>>::from_proto(&proto).unwrap();
         let result = proof.verify(&commitment);
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_reject_wrong_number_of_polynomials() {
-        let (commitment, mut proof) = sample_proof(OPTIONS);
-        proof.num_polys += 1;
+    fn test_reject_tampered_extension_leaf_coordinate() {
+        let (commitment, proof) = sample_mixed_proof();
+        let mut proto = proof.to_proto();
+        proto.openings[3].proofs[1].leaf_values[2] = vec![42, 0, 0, 0, 0, 0, 0, 0];
+        let proof = Proof::<GL4, Sha2Hash<GL4>>::from_proto(&proto).unwrap();
         let result = proof.verify(&commitment);
         assert!(result.is_err());
     }
@@ -2657,6 +3177,20 @@ mod tests {
         let (_, other_prover) = committer.commit();
         let mut other_proof = other_prover.prove(make_points(&[123]));
         proof.openings[0][0] = other_proof.openings[0].remove(0);
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
+    }
+
+    /// The Merkle path has 64 more hashes than the height of the tree, so `1 << path.len()` would
+    /// wrap around to the domain size.
+    #[test]
+    fn test_reject_oversized_opening_path() {
+        let (commitment, proof) = sample_proof(OPTIONS);
+        let mut proto = proof.to_proto();
+        proto.openings[0].proofs[0]
+            .merkle_path
+            .extend(vec![vec![0; 32]; 64]);
+        let proof = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
         let result = proof.verify(&commitment);
         assert!(result.is_err());
     }
@@ -2758,7 +3292,6 @@ mod tests {
         assert_eq!(proto.max_rounds, u64::MAX);
         assert_eq!(proto.grinding_bits, 8);
         assert_eq!(proto.nonce, 204);
-        assert_eq!(proto.num_polys, 3);
         assert_eq!(
             proto.points,
             [
@@ -2803,6 +3336,80 @@ mod tests {
         let proto = proof.to_proto();
         let decoded = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
         assert_eq!(decoded.to_proto(), proto);
+    }
+
+    #[test]
+    fn test_proof_with_base_batch_to_proto() {
+        let (_, proof) = sample_mixed_proof();
+        let proto = proof.to_proto();
+        let opening = &proto.openings[0];
+        assert_eq!(opening.proofs.len(), 2);
+        assert_eq!(opening.proofs[0].leaf_values.len(), 2);
+        assert_eq!(opening.proofs[1].leaf_values.len(), 4);
+        assert!(
+            opening
+                .proofs
+                .iter()
+                .all(|proof| proof.leaf_values.iter().all(|value| value.len() == 8))
+        );
+        assert_eq!(proto.points[0].z.len(), 32);
+        assert!(proto.points[0].v.iter().all(|value| value.len() == 32));
+    }
+
+    #[test]
+    fn test_accept_decoded_proof_with_base_batch() {
+        let (commitment, proof) = sample_mixed_proof();
+        let commitment_proto = commitment.to_proto();
+        let proof_proto = proof.to_proto();
+        let commitment = Commitment::<GL4, Sha2Hash<GL4>>::from_proto(&commitment_proto).unwrap();
+        let proof = Proof::<GL4, Sha2Hash<GL4>>::from_proto(&proof_proto).unwrap();
+        let result = proof.verify(&commitment);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_koalabear_proof_to_proto() {
+        let committer = make_mixed_committer::<KB8, Keccak256Hash<KB8>>(
+            OPTIONS,
+            &SAMPLE_BATCHES,
+            &MIXED_BASE_FIELDS,
+        );
+        let (_, prover) = committer.commit();
+        let proof = prover.prove(make_points(&SAMPLE_POINTS));
+        let proto = proof.to_proto();
+        assert_eq!(proto.points[0].z.len(), 31);
+        assert!(proto.points[0].v.iter().all(|value| value.len() == 31));
+        assert!(proto.folded_quotient.iter().all(|value| value.len() == 31));
+        assert!(
+            proto.openings[0]
+                .proofs
+                .iter()
+                .all(|proof| proof.leaf_values.iter().all(|value| value.len() == 4))
+        );
+        assert!(
+            proto.queries[0]
+                .folds
+                .iter()
+                .all(|fold| fold.coset_values.iter().all(|value| value.len() == 31))
+        );
+    }
+
+    #[test]
+    fn test_accept_decoded_koalabear_proof() {
+        let committer = make_mixed_committer::<KB8, Keccak256Hash<KB8>>(
+            GROUND_OPTIONS,
+            &SAMPLE_BATCHES,
+            &MIXED_BASE_FIELDS,
+        );
+        let (commitment, prover) = committer.commit();
+        let proof = prover.prove(make_points(&SAMPLE_POINTS));
+        let commitment_proto = commitment.to_proto();
+        let proof_proto = proof.to_proto();
+        let commitment =
+            Commitment::<KB8, Keccak256Hash<KB8>>::from_proto(&commitment_proto).unwrap();
+        let proof = Proof::<KB8, Keccak256Hash<KB8>>::from_proto(&proof_proto).unwrap();
+        let result = proof.verify(&commitment);
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -2910,6 +3517,24 @@ mod tests {
         let modulus: U256 = BS::MODULUS.parse().unwrap();
         proto.points[1].v[2] = modulus.to_little_endian().to_vec();
         let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_non_canonical_base_leaf_value() {
+        let (_, proof) = sample_mixed_proof();
+        let mut proto = proof.to_proto();
+        proto.openings[0].proofs[0].leaf_values[0] = vec![1, 0, 0, 0, 0xff, 0xff, 0xff, 0xff];
+        let result = Proof::<GL4, Sha2Hash<GL4>>::from_proto(&proto);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_long_base_leaf_value() {
+        let (_, proof) = sample_mixed_proof();
+        let mut proto = proof.to_proto();
+        proto.openings[0].proofs[0].leaf_values[0].push(0);
+        let result = Proof::<GL4, Sha2Hash<GL4>>::from_proto(&proto);
         assert!(result.is_err());
     }
 

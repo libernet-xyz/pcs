@@ -1,22 +1,22 @@
-use crate::starkom::proto::pcs::v9 as proto;
+use crate::starkom::proto::pcs::v10 as proto;
 use crate::utils;
 use anyhow::{Result, anyhow};
 use primitive_types::{H256, U128, U256, U512};
 use sha2::Digest;
-use starkom_ff::Field256;
+use starkom_ff::{Field, Field256};
 use std::fmt::Debug;
 use std::marker::PhantomData;
 
 utils::prost_name!(
     proto::Sha2HashBackend,
     "Sha2HashBackend",
-    "starkom.proto.pcs.v9"
+    "starkom.proto.pcs.v10"
 );
 
 utils::prost_name!(
     proto::KeccakHashBackend,
     "KeccakHashBackend",
-    "starkom.proto.pcs.v9"
+    "starkom.proto.pcs.v10"
 );
 
 /// Describes a hash backend for hashing internal Merkle tree nodes.
@@ -42,16 +42,13 @@ pub trait MerkleHasher {
 
 /// Describes a hash backend for our proof system.
 ///
-/// In order to warrant sufficient security even under Grover, our proof system works entirely with
-/// 256-bit fields. If the arithmetization process uses a smaller field such as Goldilocks, all
-/// scalar values must be embedded into a 256-bit field such as Goldilocks^4 before they can be
-/// committed.
+/// The functionality is a superset of that provided by [`MerkleHasher`].
 pub trait Hasher<F: Field256>: MerkleHasher {
-    /// Hashes the provided field elements.
+    /// Hashes the provided base field elements.
     ///
     /// NOTE: this is a raw hash, it doesn't automatically prepend any DSTs or element count; the
     /// caller is responsible for those when necessary.
-    fn hash(inputs: impl IntoIterator<Item = F>) -> H256;
+    fn hash(inputs: impl IntoIterator<Item = F::BaseField>) -> H256;
 
     /// Hashes the provided transcript.
     fn hash_transcript(dst: H256, transcript: &[H256]) -> H256;
@@ -194,10 +191,12 @@ mod internal {
     }
 
     impl<H: LowLevelHash, F: Field256> Hasher<F> for HasherImpl<H, F> {
-        fn hash(inputs: impl IntoIterator<Item = F>) -> H256 {
+        fn hash(inputs: impl IntoIterator<Item = F::BaseField>) -> H256 {
+            let length = F::BaseField::LEN;
             let mut hasher = H::default();
             for input in inputs {
-                hasher.update(&input.to_be_bytes());
+                let bytes = input.to_u256().to_big_endian();
+                hasher.update(&bytes[(32 - length)..]);
             }
             hasher.finalize()
         }
@@ -226,6 +225,7 @@ mod tests {
     use prost::Name;
     use starkom_bluesky::Scalar as BS;
     use starkom_goldilocks::GL4;
+    use starkom_koalabear::KB8;
     use std::str::FromStr;
     use std::sync::LazyLock;
 
@@ -235,8 +235,9 @@ mod tests {
         H256::from_slice(hasher.finalize().as_slice())
     });
 
-    fn from_u64<F: Field256>(value: u64) -> F {
-        F::from(value)
+    /// Converts a small integer into an element of the base field of `F`.
+    fn base_from_u64<F: Field256>(value: u64) -> F::BaseField {
+        F::BaseField::try_from(value as usize).unwrap()
     }
 
     fn parse<V: FromStr<Err: Debug>>(s: &'static str) -> V {
@@ -247,54 +248,104 @@ mod tests {
     fn test_hash_backend_type_urls() {
         assert_eq!(
             proto::Sha2HashBackend::type_url(),
-            "type.starkom.io/starkom.proto.pcs.v9.Sha2HashBackend"
+            "type.starkom.io/starkom.proto.pcs.v10.Sha2HashBackend"
         );
         assert_eq!(
             proto::KeccakHashBackend::type_url(),
-            "type.starkom.io/starkom.proto.pcs.v9.KeccakHashBackend"
+            "type.starkom.io/starkom.proto.pcs.v10.KeccakHashBackend"
         );
     }
 
-    fn test_sha2_hash_impl<F: Field256>() {
+    fn test_sha2_hash_impl<F: Field256>(expected: [&'static str; 3]) {
         assert_eq!(
-            Sha2Hash::<F>::hash([from_u64(12)]),
-            parse("0xa82872b96246dac512ddf0515f5da862a92ecebebcb92537b6e3e73199694c45")
+            Sha2Hash::<F>::hash([base_from_u64::<F>(12)]),
+            parse(expected[0])
         );
         assert_eq!(
-            Sha2Hash::<F>::hash([from_u64(34), from_u64(56)]),
-            parse("0xbdcf24876d0b8979976f54ea123b70112da34a5cb4dc381646a3321f0817a5e8")
+            Sha2Hash::<F>::hash([base_from_u64::<F>(34), base_from_u64::<F>(56)]),
+            parse(expected[1])
         );
         assert_eq!(
-            Sha2Hash::<F>::hash([from_u64(78), from_u64(90), from_u64(12)]),
-            parse("0xce080de3e477a622d8b9711eb599aec6fe9ddda88c47c1175bff2aaadc43c3b4")
-        );
-    }
-
-    #[test]
-    fn test_sha2_hash() {
-        test_sha2_hash_impl::<BS>();
-        test_sha2_hash_impl::<GL4>();
-    }
-
-    fn test_keccak256_hash_impl<F: Field256>() {
-        assert_eq!(
-            Keccak256Hash::<F>::hash([from_u64(12)]),
-            parse("0xdf6966c971051c3d54ec59162606531493a51404a002842f56009d7e5cf4a8c7")
-        );
-        assert_eq!(
-            Keccak256Hash::<F>::hash([from_u64(34), from_u64(56)]),
-            parse("0x72700d0d963d58363ea77095ddabb7ed1a429a1fe618c8ace040205d52391bb9")
-        );
-        assert_eq!(
-            Keccak256Hash::<F>::hash([from_u64(78), from_u64(90), from_u64(12)]),
-            parse("0x452eb69ea7065787fb9f51a2894ff6a6ff50ae842aaa68b3ad40ed3580117a8a")
+            Sha2Hash::<F>::hash([
+                base_from_u64::<F>(78),
+                base_from_u64::<F>(90),
+                base_from_u64::<F>(12),
+            ]),
+            parse(expected[2])
         );
     }
 
     #[test]
-    fn test_keccak256_hash() {
-        test_keccak256_hash_impl::<BS>();
-        test_keccak256_hash_impl::<GL4>();
+    fn test_sha2_hash_bluesky() {
+        test_sha2_hash_impl::<BS>([
+            "0xa82872b96246dac512ddf0515f5da862a92ecebebcb92537b6e3e73199694c45",
+            "0xbdcf24876d0b8979976f54ea123b70112da34a5cb4dc381646a3321f0817a5e8",
+            "0xce080de3e477a622d8b9711eb599aec6fe9ddda88c47c1175bff2aaadc43c3b4",
+        ]);
+    }
+
+    #[test]
+    fn test_sha2_hash_goldilocks() {
+        test_sha2_hash_impl::<GL4>([
+            "0xd27a8d9a8d38c7a37c922450a7a1961f138abfa25f5da3df2b972820715fa5ae",
+            "0xa7978a35218774c33d029c976f494b3e220f9ed48dd640e0426fb6cdf84873c2",
+            "0x668a3637e141226dead35825f67cd915432d1dd3711b0dbb47018e2a6bcda74b",
+        ]);
+    }
+
+    #[test]
+    fn test_sha2_hash_koalabear() {
+        test_sha2_hash_impl::<KB8>([
+            "0xc22ceee66b8ab104483c83053173b33f992dd4fcb457284c60ef9d699a1c7059",
+            "0xfb606c01b68bbcd68240cdded4699855adb5077bb20e833188f1ccca89aa0441",
+            "0x88d3ee772a0f65a517336500ef3e3e5fcba85c54ea54e9ee7430e60a156d60a3",
+        ]);
+    }
+
+    fn test_keccak256_hash_impl<F: Field256>(expected: [&'static str; 3]) {
+        assert_eq!(
+            Keccak256Hash::<F>::hash([base_from_u64::<F>(12)]),
+            parse(expected[0])
+        );
+        assert_eq!(
+            Keccak256Hash::<F>::hash([base_from_u64::<F>(34), base_from_u64::<F>(56)]),
+            parse(expected[1])
+        );
+        assert_eq!(
+            Keccak256Hash::<F>::hash([
+                base_from_u64::<F>(78),
+                base_from_u64::<F>(90),
+                base_from_u64::<F>(12),
+            ]),
+            parse(expected[2])
+        );
+    }
+
+    #[test]
+    fn test_keccak256_hash_bluesky() {
+        test_keccak256_hash_impl::<BS>([
+            "0xdf6966c971051c3d54ec59162606531493a51404a002842f56009d7e5cf4a8c7",
+            "0x72700d0d963d58363ea77095ddabb7ed1a429a1fe618c8ace040205d52391bb9",
+            "0x452eb69ea7065787fb9f51a2894ff6a6ff50ae842aaa68b3ad40ed3580117a8a",
+        ]);
+    }
+
+    #[test]
+    fn test_keccak256_hash_goldilocks() {
+        test_keccak256_hash_impl::<GL4>([
+            "0x626899464858d84aa8a337b4fd305d199dad99f1c20a1129ab98bc233c50c6da",
+            "0x8adb2ad7853e6ad763a60b9d7f6990e6e9aac20763774108bed54d2bf97d7efd",
+            "0x9a618a2e56f77252d293ab77d88244f941ea0e9f8715ad79a57956d2103d700d",
+        ]);
+    }
+
+    #[test]
+    fn test_keccak256_hash_koalabear() {
+        test_keccak256_hash_impl::<KB8>([
+            "0x9a5fa99a11a3338d080ebdeaf8b8ced6034f49e60bce1414f85f23b2da0bd83a",
+            "0xe636d0cf62b6c803a036491934663ecc32f1d0aecea706d85be4c4088d3c8c70",
+            "0x08e548e958310c1a2b82559a4f81ee527dd848142615707e81a0adc661b80b55",
+        ]);
     }
 
     fn test_sha2_hash_binary_impl<F: Field256>() {

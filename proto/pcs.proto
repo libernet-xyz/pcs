@@ -2,22 +2,32 @@ syntax = "proto3";
 
 import "google/protobuf/any.proto";
 
-package starkom.proto.pcs.v9;
+package starkom.proto.pcs.v10;
 
 // Identifier for the Starkom-provided SHA2-256 hash backend.
 //
-// The type URL of this message is `type.starkom.io/starkom.proto.pcs.v9.Sha2HashBackend`.
+// The type URL of this message is `type.starkom.io/starkom.proto.pcs.v10.Sha2HashBackend`.
 message Sha2HashBackend {}
 
 // Identifier for the Starkom-provided Keccak-256 hash backend.
 //
-// The type URL of this message is `type.starkom.io/starkom.proto.pcs.v9.KeccakHashBackend`.
+// The type URL of this message is `type.starkom.io/starkom.proto.pcs.v10.KeccakHashBackend`.
 message KeccakHashBackend {}
 
 // A batched DEEP-FRI polynomial commitment.
 //
 // The commitment only depends on the committed polynomials, not on the points opened by a `Proof`,
 // so the points can be chosen after committing.
+//
+// All Fiat-Shamir challenges and opened points are elements of a ~256-bit field G, but the
+// committed polynomials can be defined either over G or over its base field F (e.g. G =
+// Goldilocks^4 and F = Goldilocks). When G is a prime field (e.g. BlueSky) F and G coincide.
+//
+// Under the hood all polynomials are committed over the base field. When the user commits a batch
+// defined over the extension field, all evaluations are flattened into their base field components.
+// Since all Fiat-Shamir challenges must be defined over a wide ~256-bit field for security reasons,
+// the DEEP quotient and FRI folds will always necessarily work on the extension field regardless of
+// which field a polynomial batch was defined on.
 message Commitment {
   // Hash backend used for this commitment.
   //
@@ -31,12 +41,23 @@ message Commitment {
   // Commitment data for a batch of polynomials whose evaluations are stored in the same Merkle
   // tree.
   message Batch {
-    // Root hash of the Merkle tree, stored as a 32 byte sequence.
-    bytes root = 1;
+    // Whether the polynomials of the batch are over the base field rather than the extension field.
+    //
+    // The leaves of the two kinds of batch are hashed with different domain separation tags, so
+    // the root of the Merkle tree also determines this flag: a commitment with the wrong flag fails
+    // verification.
+    bool base_field = 1;
 
-    // Number of polynomials in the batch. Every leaf of the Merkle tree must have exactly this
-    // number of evaluations.
+    // Number of polynomials in the batch.
+    //
+    // Every polynomial over G is committed as its `T` coordinate polynomials over F, `T` being the
+    // extension degree of G over F (eg. 4 for Goldilocks^4). Every leaf of the Merkle tree has
+    // exactly `num_polys` values if the polynomials are over F, and `T * num_polys` values if
+    // they're over G (see `MerkleProof`).
     uint64 num_polys = 2;
+
+    // Root hash of the Merkle tree, stored as a 32 byte sequence.
+    bytes root = 3;
   }
 
   // The polynomial batches, in commitment order. There must be at least one batch.
@@ -46,14 +67,20 @@ message Commitment {
 // A Merkle proof for a leaf of the Merkle tree of a polynomial batch (see `Commitment.Batch`).
 //
 // Batching is supported at the DEEP level, so these Merkle trees have vector leaves rather than
-// scalar ones: if we're batching K polynomials each leaf is the vector of their K evaluations at a
-// point of the extended domain, and the hashes of these vectors are used to build the higher levels
-// of the Merkle tree.
+// scalar ones: if we're batching K polynomials each leaf holds their K evaluations at a point of
+// the extended domain, and the hashes of these vectors are used to build higher levels of the tree.
+//
+// The leaf values are always elements of the base field F. The evaluations of polynomials over F
+// are elements of F, while every evaluation of a polynomial over G is stored as its `T` coordinates
+// over F, in little-endian order (`T` being the extension degree of G over F). For example, a leaf
+// of a batch of 3 polynomials over Goldilocks^4 has 12 Goldilocks values.
 message MerkleProof {
-  // The K evaluations in the opened leaf.
+  // The values of the opened leaf: K elements of F if the polynomials of the batch are over F, or
+  // `K * T` elements of F if they're over G.
   //
-  // Each value is a field element stored in canonical (non-Montgomery) integer form, in
-  // little-endian byte order.
+  // Each value is stored in canonical (non-Montgomery) integer form, in little-endian byte order,
+  // using as many bytes as the base field requires (e.g. 32 bytes for BlueSky, 8 for Goldilocks,
+  // and 4 for KoalaBear).
   repeated bytes leaf_values = 1;
 
   // The leaf-to-root Merkle path, excluding the root hash.
@@ -86,8 +113,9 @@ message Query {
     // The `2^r` evaluations of the coset, in bit-reversed order (that is, in the order of the
     // leaves of the coset subtree). One of them is the evaluation at the queried index.
     //
-    // Each value is a field element stored in canonical (non-Montgomery) integer form, in
-    // little-endian byte order.
+    // Each value is an element of G stored in canonical (non-Montgomery) integer form, in
+    // little-endian byte order, using as many bytes as G requires (e.g. 32 bytes for BlueSky and
+    // Goldilocks^4, 31 for KoalaBear^8).
     repeated bytes coset_values = 1;
 
     // The Merkle path from the root of the coset subtree up to, but excluding, the root of the
@@ -170,24 +198,27 @@ message Proof {
   // The proof-of-work nonce found by the prover.
   uint64 nonce = 8;
 
-  // Number of committed polynomials.
-  uint64 num_polys = 9;
-
   // A point opened by the proof.
   message Point {
     // The (off-domain) X-coordinate of a proven opening.
+    //
+    // This is an element of G stored in canonical (non-Montgomery) integer form, in little-endian
+    // byte order, using as many bytes as G requires (e.g. 32 bytes for BlueSky and Goldilocks^4, 31
+    // for KoalaBear^8).
     bytes z = 1;
 
-    // Evaluations of every committed polynomial in `z`.
+    // Evaluations of every committed polynomial in `z`, in commitment order.
     //
-    // This array must have exactly `num_polys` elements.
+    // This array must have exactly one element for every committed polynomial, i.e. as many as
+    // the `num_polys` of all batches of the `Commitment` put together. They're all elements of G,
+    // even for polynomials over the base field F, because `z` is.
     //
-    // Values are stored in canonical (non-Montgomery) integer form, in little-endian byte order.
+    // Values are stored in the same format as `z`.
     repeated bytes v = 2;
   }
 
   // The points opened by the proof.
-  repeated Point points = 10;
+  repeated Point points = 9;
 
   // Merkle roots of the FRI folding argument, one for every folding round.
   //
@@ -197,7 +228,7 @@ message Proof {
   // if there are zero rounds.
   //
   // Each root hash is stored as a 32 byte sequence.
-  repeated bytes fri_roots = 11;
+  repeated bytes fri_roots = 10;
 
   // The coefficients of the DEEP quotient folded by all the FRI rounds, which is sent in the clear
   // rather than being folded further. With zero rounds this is the whole (unfolded) DEEP quotient.
@@ -206,9 +237,10 @@ message Proof {
   // order. They're the coefficients of the domain-shifted polynomial, so they must be evaluated at
   // the roots of unity of the folded domain, not at the shifted domain points.
   //
-  // Each coefficient is a field element stored in canonical (non-Montgomery) integer form, in
-  // little-endian byte order.
-  repeated bytes folded_quotient = 12;
+  // Each coefficient is an element of G stored in canonical (non-Montgomery) integer form, in
+  // little-endian byte order, using as many bytes as G requires (e.g. 32 bytes for BlueSky and
+  // Goldilocks^4, 31 for KoalaBear^8).
+  repeated bytes folded_quotient = 11;
 
   message Opening {
     repeated MerkleProof proofs = 1;
@@ -216,9 +248,9 @@ message Proof {
 
   // Merkle proofs for the points at the query positions, relative to the raw Merkle trees (not the
   // FRI folds). There's one entry for every FRI query (`openings.len() == queries.len()`).
-  repeated Opening openings = 13;
+  repeated Opening openings = 12;
 
   // FRI queries on the combined DEEP quotient, that is the random linear combination of the DEEP
   // quotients of all opened points. Every FRI leaf therefore holds exactly one value.
-  repeated Query queries = 14;
+  repeated Query queries = 13;
 }
