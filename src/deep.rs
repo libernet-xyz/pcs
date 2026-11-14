@@ -1,12 +1,13 @@
 use crate::fri;
 use crate::hash::Hasher;
 use crate::merkle::{Proof as LeafProof, Tree};
+use crate::scpf;
 use crate::starkom::proto::pcs::v10 as proto;
 use crate::utils;
 use anyhow::{Result, anyhow};
 use primitive_types::{H256, U256};
 use prost_types::Any;
-use starkom_ff::{Field, Field256};
+use starkom_ff::{Field, Field256, PrimeField256};
 use starkom_poly::Polynomial;
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
@@ -35,6 +36,14 @@ static QUOTIENT_DST: LazyLock<H256> = LazyLock::new(|| utils::make_dst(b"starkom
 
 /// Domain separator tag for the proof-of-work hash used for grinding.
 static POW_DST: LazyLock<H256> = LazyLock::new(|| utils::make_dst(b"starkom/deep/pow"));
+
+/// Schema identifier of the SCPF data of commitments (see [`Commitment::to_scpf`]).
+static COMMITMENT_SCHEMA_IDENTIFIER: LazyLock<H256> =
+    LazyLock::new(|| scpf::schema_identifier("starkom.proto.pcs.v10.Commitment"));
+
+/// Schema identifier of the SCPF data of proofs (see [`Proof::to_scpf`]).
+static PROOF_SCHEMA_IDENTIFIER: LazyLock<H256> =
+    LazyLock::new(|| scpf::schema_identifier("starkom.proto.pcs.v10.Proof"));
 
 /// Returns the number of FRI queries required to achieve `security_bits` bits of security using a
 /// blowup factor of `2^blowup_log2` and `grinding_bits` bits of grinding.
@@ -605,6 +614,30 @@ impl<F: Field256, H: Hasher<F>> Commitment<F, H> {
     }
 }
 
+impl<F: PrimeField256, H: Hasher<F>> Commitment<F, H> {
+    /// Serializes this commitment to SCPF, the Starkom Compact Proof Format (see
+    /// [`Proof::to_scpf`]).
+    ///
+    /// The schema identifier is the Keccak-256 hash of `starkom.proto.pcs.v10.Commitment`, and the
+    /// stream holds the fields of the [`Commitment`](`proto::Commitment`) protobuf:
+    ///
+    /// 1. the number of batches, as a varint;
+    /// 2. for every batch in commitment order, `base_field` as a varint (1 for true and 0 for
+    ///    false), then `num_polys` as a varint, then the Merkle root as a pool reference.
+    ///
+    /// The hash backend isn't encoded, so decoders must know it in advance.
+    pub fn to_scpf(&self) -> Vec<u8> {
+        let mut encoder = scpf::Encoder::default();
+        encoder.push_usize(self.batches.len());
+        for batch in &self.batches {
+            encoder.push_bool(batch.base_field);
+            encoder.push_usize(batch.num_polys);
+            encoder.push_hash(batch.root);
+        }
+        encoder.finish(*COMMITMENT_SCHEMA_IDENTIFIER)
+    }
+}
+
 /// Collects batches of polynomials and allows building a DEEP-FRI prover for them.
 ///
 /// This works by building Merkle trees on the batched polynomials, one tree per batch, and
@@ -1083,6 +1116,68 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
                 })
                 .collect::<Result<_>>()?,
         })
+    }
+}
+
+impl<F: PrimeField256, H: Hasher<F>> Proof<F, H> {
+    /// Serializes this proof to SCPF, the Starkom Compact Proof Format.
+    ///
+    /// SCPF is the binary format of the proofs sent to EVM verifiers, and it minimizes the gas
+    /// cost of the calldata and of decoding it (see
+    /// [`FORMAT.md`](https://github.com/libernet-xyz/scpf/blob/main/FORMAT.md)). It only supports
+    /// prime fields of about 256 bits, e.g. BlueSky. The data is made of a header, a pool of
+    /// 32-byte words, and a stream in which unsigned integers are varints, field elements are
+    /// inline 32-byte words holding their big-endian integer values, and hashes are pool
+    /// references, i.e. the varint positions of their words in the pool.
+    ///
+    /// The schema identifier is the Keccak-256 hash of `starkom.proto.pcs.v10.Proof`, and the
+    /// stream holds the fields of the [`Proof`](`proto::Proof`) protobuf in this order:
+    ///
+    /// 1. `degree_bound`, `security_bits`, `blowup_log2`, `fold_rate`, `max_rounds`,
+    ///    `grinding_bits`, and `nonce`, as varints;
+    /// 2. the number of opened points as a varint, then for every point in increasing order its
+    ///    X-coordinate `z` followed by its evaluations `v`, as inline words;
+    /// 3. `fri_roots` as pool references, then the number of coefficients of `folded_quotient` as
+    ///    a varint, followed by the coefficients as inline words;
+    /// 4. for every query, the opening of every batch in commitment order (the leaf values as
+    ///    inline words, then the Merkle path as pool references), followed by the folds of all
+    ///    the rounds in order (the coset values as inline words, then the Merkle path as pool
+    ///    references).
+    ///
+    /// The openings and the queries are interleaved rather than following each other as in the
+    /// protobuf, so that a verifier can check every query as soon as it reads it.
+    ///
+    /// The values that the decoder can derive aren't encoded: the number of FRI roots and of
+    /// queries, the number of coset values, and the number of hashes of every Merkle path (from
+    /// the protocol parameters), the number of evaluations of every point and of values of every
+    /// leaf (from the [`Commitment`]), and the query indices (from the proof of work). The hash
+    /// backend isn't encoded either, so decoders must know it in advance.
+    ///
+    /// NOTE: decoders rely on the shape of the proof that they derive, so the data of a proof
+    /// that doesn't have it, e.g. a malformed one deserialized with [`Self::from_proto`], doesn't
+    /// decode to the same proof.
+    pub fn to_scpf(&self) -> Vec<u8> {
+        let mut encoder = scpf::Encoder::default();
+        encoder.push_usize(self.options.degree_bound);
+        encoder.push_usize(self.options.security_bits);
+        encoder.push_usize(self.options.blowup_log2);
+        encoder.push_usize(self.options.fold_rate);
+        encoder.push_usize(self.options.max_rounds);
+        encoder.push_usize(self.options.grinding_bits);
+        encoder.push_varint(self.nonce);
+        encoder.push_usize(self.points.len());
+        for (&z, values) in &self.points {
+            encoder.push_scalar(z);
+            encoder.push_scalars(values.as_slice());
+        }
+        self.fri_commitment.encode_scpf(&mut encoder);
+        for (proofs, query) in self.openings.iter().zip(&self.queries) {
+            for proof in proofs {
+                proof.encode_scpf(&mut encoder);
+            }
+            query.encode_scpf(&mut encoder);
+        }
+        encoder.finish(*PROOF_SCHEMA_IDENTIFIER)
     }
 }
 
@@ -3583,5 +3678,278 @@ mod tests {
         let proto = proof.to_proto();
         let result = Proof::<BS, Keccak256Hash<BS>>::from_proto(&proto);
         assert!(result.is_err());
+    }
+
+    /// Returns the header of SCPF data with the given schema identifier and pool size.
+    fn scpf_header(schema_identifier: H256, pool_size: u32) -> Vec<u8> {
+        [
+            &b"SCPF"[..],
+            &[0, 0, 0, 0][..],
+            &scpf::VERSION[..],
+            &[0, 0, 0, 0, 0][..],
+            schema_identifier.as_bytes(),
+            &pool_size.to_be_bytes()[..],
+            &[0; 12][..],
+        ]
+        .concat()
+    }
+
+    /// Returns the protobuf encoding of a small BlueSky element (little-endian bytes).
+    fn proto_scalar(value: u64) -> Vec<u8> {
+        BS::from_const(value).to_le_bytes().to_vec()
+    }
+
+    /// Returns the SCPF encoding of a small BlueSky element (an inline big-endian word).
+    fn scpf_scalar(value: u64) -> [u8; 32] {
+        BS::from_const(value).to_be_bytes()
+    }
+
+    /// Returns the Keccak-256 hash of `data`.
+    fn keccak256(data: &[u8]) -> H256 {
+        use sha3::Digest;
+        H256::from_slice(sha3::Keccak256::digest(data).as_slice())
+    }
+
+    /// Returns a hash made of 32 copies of the given byte.
+    fn hash(byte: u8) -> H256 {
+        H256::repeat_byte(byte)
+    }
+
+    /// Returns the protobuf encoding of the hashes made of 32 copies of the given bytes.
+    fn proto_hashes(bytes: &[u8]) -> Vec<Vec<u8>> {
+        bytes.iter().map(|&byte| vec![byte; 32]).collect()
+    }
+
+    /// A proof with small values deserialized from a protobuf, with one batch, one point, one FRI
+    /// round, and two queries. The two batch openings share hash 0xbb and the two folds share hash
+    /// 0xdd, while the other hashes appear once each.
+    fn small_proof_proto() -> proto::Proof {
+        let opening = |leaf: u64, path: [u8; 2]| proto::proof::Opening {
+            proofs: vec![proto::MerkleProof {
+                leaf_values: vec![proto_scalar(leaf)],
+                merkle_path: proto_hashes(&path),
+            }],
+        };
+        let query = |index: u64, coset: [u64; 2]| proto::Query {
+            index,
+            folds: vec![proto::query::LeafProof {
+                coset_values: coset.map(proto_scalar).to_vec(),
+                merkle_path: proto_hashes(&[0xdd]),
+            }],
+        };
+        proto::Proof {
+            hash_backend: Some(Any::from_msg(&proto::KeccakHashBackend::default()).unwrap()),
+            degree_bound: 4,
+            security_bits: 128,
+            blowup_log2: 2,
+            fold_rate: 1,
+            max_rounds: 1,
+            grinding_bits: 8,
+            nonce: 300,
+            points: vec![proto::proof::Point {
+                z: proto_scalar(123),
+                v: vec![proto_scalar(45)],
+            }],
+            fri_roots: proto_hashes(&[0x11]),
+            folded_quotient: vec![proto_scalar(7)],
+            openings: vec![opening(10, [0xaa, 0xbb]), opening(11, [0xcc, 0xbb])],
+            queries: vec![query(5, [20, 21]), query(9, [22, 23])],
+        }
+    }
+
+    #[test]
+    fn test_commitment_schema_identifier() {
+        assert_eq!(
+            *COMMITMENT_SCHEMA_IDENTIFIER,
+            parse("0xbd47f9a987065018ccd907dfa7d41b8eef2c2c88acddffc327829aed3e313b70")
+        );
+    }
+
+    #[test]
+    fn test_proof_schema_identifier() {
+        assert_eq!(
+            *PROOF_SCHEMA_IDENTIFIER,
+            parse("0xb7fcbc946ada95241d640499d14b4c6824a850187a7cd259c954bb722be8c086")
+        );
+    }
+
+    #[test]
+    fn test_commitment_to_scpf() {
+        let committer = make_mixed_committer::<BS, Keccak256Hash<BS>>(
+            OPTIONS,
+            &SAMPLE_BATCHES,
+            &MIXED_BASE_FIELDS,
+        );
+        let (commitment, _) = committer.commit();
+        let data = commitment.to_scpf();
+        assert_eq!(
+            data,
+            [
+                &scpf_header(*COMMITMENT_SCHEMA_IDENTIFIER, 2)[..],
+                commitment.batches()[0].root().as_bytes(),
+                commitment.batches()[1].root().as_bytes(),
+                // The number of batches, then every batch: base field flag, polynomials, root.
+                &[2, 1, 2, 0, 0, 1, 1][..],
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
+    fn test_commitment_from_proto_to_scpf() {
+        let commitment = Commitment::<BS, Sha2Hash<BS>>::from_proto(&proto::Commitment {
+            hash_backend: Some(Any::from_msg(&proto::Sha2HashBackend::default()).unwrap()),
+            batches: vec![
+                proto::commitment::Batch {
+                    base_field: false,
+                    num_polys: 300,
+                    root: vec![0xaa; 32],
+                },
+                proto::commitment::Batch {
+                    base_field: true,
+                    num_polys: 1,
+                    root: vec![0xbb; 32],
+                },
+                proto::commitment::Batch {
+                    base_field: false,
+                    num_polys: 2,
+                    root: vec![0xaa; 32],
+                },
+            ],
+        })
+        .unwrap();
+        let data = commitment.to_scpf();
+        assert_eq!(
+            data,
+            [
+                &scpf_header(*COMMITMENT_SCHEMA_IDENTIFIER, 2)[..],
+                hash(0xaa).as_bytes(),
+                hash(0xbb).as_bytes(),
+                &[3, 0, 0x81, 0x2c, 0, 1, 1, 1, 0, 2, 0][..],
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
+    fn test_proof_to_scpf() {
+        let proof = Proof::<BS, Keccak256Hash<BS>>::from_proto(&small_proof_proto()).unwrap();
+        let data = proof.to_scpf();
+        // The pool has the two hashes referenced twice first, then the others: 0xbb, 0xdd, 0x11,
+        // 0xaa, 0xcc.
+        assert_eq!(
+            data,
+            [
+                &scpf_header(*PROOF_SCHEMA_IDENTIFIER, 5)[..],
+                hash(0xbb).as_bytes(),
+                hash(0xdd).as_bytes(),
+                hash(0x11).as_bytes(),
+                hash(0xaa).as_bytes(),
+                hash(0xcc).as_bytes(),
+                // Degree bound, security bits (128 takes two bytes), blowup, fold rate, max rounds,
+                // grinding bits, nonce (300 takes two bytes), and number of points.
+                &[4, 0x80, 0x80, 2, 1, 1, 8, 0x81, 0x2c, 1][..],
+                &scpf_scalar(123)[..],
+                &scpf_scalar(45)[..],
+                // The FRI root and the number of coefficients of the folded quotient.
+                &[2, 1][..],
+                &scpf_scalar(7)[..],
+                // First query: the batch opening, then the fold.
+                &scpf_scalar(10)[..],
+                &[3, 0][..],
+                &scpf_scalar(20)[..],
+                &scpf_scalar(21)[..],
+                &[1][..],
+                // Second query.
+                &scpf_scalar(11)[..],
+                &[4, 0][..],
+                &scpf_scalar(22)[..],
+                &scpf_scalar(23)[..],
+                &[1][..],
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
+    fn test_proof_without_rounds_to_scpf() {
+        let mut proto = small_proof_proto();
+        proto.max_rounds = 0;
+        proto.fri_roots.clear();
+        proto.folded_quotient = vec![proto_scalar(7), proto_scalar(8)];
+        for query in &mut proto.queries {
+            query.folds.clear();
+        }
+        let proof = Proof::<BS, Keccak256Hash<BS>>::from_proto(&proto).unwrap();
+        let data = proof.to_scpf();
+        assert_eq!(
+            data,
+            [
+                &scpf_header(*PROOF_SCHEMA_IDENTIFIER, 3)[..],
+                hash(0xbb).as_bytes(),
+                hash(0xaa).as_bytes(),
+                hash(0xcc).as_bytes(),
+                &[4, 0x80, 0x80, 2, 1, 0, 8, 0x81, 0x2c, 1][..],
+                &scpf_scalar(123)[..],
+                &scpf_scalar(45)[..],
+                // No FRI roots, then the two coefficients of the folded quotient.
+                &[2][..],
+                &scpf_scalar(7)[..],
+                &scpf_scalar(8)[..],
+                &scpf_scalar(10)[..],
+                &[1, 0][..],
+                &scpf_scalar(11)[..],
+                &[2, 0][..],
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
+    fn test_proof_with_unordered_points_to_scpf() {
+        let mut proto = small_proof_proto();
+        proto.points = vec![
+            proto::proof::Point {
+                z: proto_scalar(456),
+                v: vec![proto_scalar(67)],
+            },
+            proto::proof::Point {
+                z: proto_scalar(123),
+                v: vec![proto_scalar(45)],
+            },
+        ];
+        proto.openings.clear();
+        proto.queries.clear();
+        let proof = Proof::<BS, Keccak256Hash<BS>>::from_proto(&proto).unwrap();
+        let data = proof.to_scpf();
+        // The points are encoded in increasing order.
+        assert_eq!(
+            data,
+            [
+                &scpf_header(*PROOF_SCHEMA_IDENTIFIER, 1)[..],
+                hash(0x11).as_bytes(),
+                &[4, 0x80, 0x80, 2, 1, 1, 8, 0x81, 0x2c, 2][..],
+                &scpf_scalar(123)[..],
+                &scpf_scalar(45)[..],
+                &scpf_scalar(456)[..],
+                &scpf_scalar(67)[..],
+                &[0, 1][..],
+                &scpf_scalar(7)[..],
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
+    fn test_sample_proof_to_scpf() {
+        let committer = make_committer::<BS, Keccak256Hash<BS>>(GROUND_OPTIONS, &SAMPLE_BATCHES);
+        let (_, prover) = committer.commit();
+        let proof = prover.prove(make_points(&SAMPLE_POINTS));
+        let data = proof.to_scpf();
+        assert_eq!(data.len(), 17216);
+        assert_eq!(
+            keccak256(data.as_slice()),
+            parse("0x3b6914d37314ce7011868cf14716101de02dbd9c0228c4d26517d1f1773046d1")
+        );
     }
 }

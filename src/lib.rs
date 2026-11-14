@@ -15,6 +15,7 @@ pub mod starkom {
 
 mod deep;
 mod merkle;
+mod scpf;
 mod utils;
 
 pub mod fri;

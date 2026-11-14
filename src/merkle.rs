@@ -1,10 +1,11 @@
 use crate::hash::{Hasher, MerkleHasher};
+use crate::scpf;
 use crate::starkom::proto::pcs::v10 as proto;
 use crate::utils;
 use anyhow::{Result, anyhow};
 use primitive_types::{H256, U256, U512};
 use sha2::Digest;
-use starkom_ff::{Field, Field256};
+use starkom_ff::{Field, Field256, PrimeField256};
 use std::any::TypeId;
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
@@ -294,6 +295,15 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
                 .collect::<Result<_>>()?,
             _data: PhantomData,
         })
+    }
+}
+
+impl<F: PrimeField256, H: Hasher<F>> Proof<F, H> {
+    /// Pushes this Merkle proof to an SCPF stream: the leaf values as inline words, then the
+    /// Merkle path from the leaf up as pool references (see [`crate::Proof::to_scpf`]).
+    pub(crate) fn encode_scpf(&self, encoder: &mut scpf::Encoder) {
+        encoder.push_scalars(self.leaf.as_slice());
+        encoder.push_hashes(self.path.as_slice());
     }
 }
 

@@ -1,10 +1,11 @@
 use crate::hash::Hasher;
 use crate::merkle;
+use crate::scpf;
 use crate::starkom::proto::pcs::v10 as proto;
 use crate::utils;
 use anyhow::{Result, anyhow};
 use primitive_types::H256;
-use starkom_ff::{Field, Field256};
+use starkom_ff::{Field, Field256, PrimeField256};
 use starkom_poly::Polynomial;
 use std::marker::PhantomData;
 use std::sync::LazyLock;
@@ -132,6 +133,16 @@ impl<F: Field256, H: Hasher<F>> LeafProof<F, H> {
                 .collect::<Result<_>>()?,
             _data: PhantomData,
         })
+    }
+}
+
+impl<F: PrimeField256, H: Hasher<F>> LeafProof<F, H> {
+    /// Pushes this proof to an SCPF stream: the coset values as inline words, then the Merkle path
+    /// from the root of the coset subtree up as pool references (see
+    /// [`crate::Proof::to_scpf`]).
+    fn encode_scpf(&self, encoder: &mut scpf::Encoder) {
+        encoder.push_scalars(self.coset.as_slice());
+        encoder.push_hashes(self.path.as_slice());
     }
 }
 
@@ -267,6 +278,21 @@ impl<F: Field256> Commitment<F> {
     /// shifted domain points.
     pub fn folded_polynomial(&self) -> &Polynomial<F> {
         &self.folded_polynomial
+    }
+}
+
+impl<F: PrimeField256> Commitment<F> {
+    /// Pushes this commitment to an SCPF stream: the Merkle roots as pool references, then the
+    /// number of coefficients of the folded polynomial as a varint, then the coefficients as inline
+    /// words (see [`crate::Proof::to_scpf`]).
+    ///
+    /// The number of roots isn't encoded because it's the number of rounds, which the decoder
+    /// derives from the protocol parameters.
+    pub(crate) fn encode_scpf(&self, encoder: &mut scpf::Encoder) {
+        encoder.push_hashes(self.roots.as_slice());
+        let coefficients = self.folded_polynomial.coefficients();
+        encoder.push_usize(coefficients.len());
+        encoder.push_scalars(coefficients);
     }
 }
 
@@ -487,6 +513,20 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
                 .map(|fold| LeafProof::from_proto(fold, fold_rate))
                 .collect::<Result<_>>()?,
         })
+    }
+}
+
+impl<F: PrimeField256, H: Hasher<F>> Query<F, H> {
+    /// Pushes this query to an SCPF stream: the proofs of all the rounds in order (see
+    /// [`crate::Proof::to_scpf`]).
+    ///
+    /// The index isn't encoded because the decoder derives it from the proof of work, and neither
+    /// are the numbers of rounds, coset values, and hashes of every Merkle path, which the decoder
+    /// derives from the protocol parameters.
+    pub(crate) fn encode_scpf(&self, encoder: &mut scpf::Encoder) {
+        for fold in &self.folds {
+            fold.encode_scpf(encoder);
+        }
     }
 }
 

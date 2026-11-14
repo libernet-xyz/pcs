@@ -64,6 +64,10 @@ cheaper to commit and open, and a valid proof guarantees that they're actually o
 Two hash backends are provided, one using SHA2-256 and one using Keccak-256, and both are
 implemented in the most EVM-friendly possible way. Check out Starkom's [EVM verifier][evm-verifier].
 
+Commitments and proofs can be serialized to protobufs, and those over ~256-bit prime fields (e.g.
+BlueSky) also to [SCPF][scpf], the Starkom Compact Proof Format, which minimizes the gas cost of
+sending them to EVM verifiers (see [`Proof::to_scpf`][proof-to-scpf]).
+
 [bls12-381]: https://docs.rs/starkom-ff/latest/starkom_ff/bls12_381/struct.Scalar.html
 [bluesky]: https://docs.rs/starkom-bluesky
 [committer-add-base-batch]: https://docs.rs/starkom-pcs/latest/starkom_pcs/struct.Committer.html#method.add_base_batch
@@ -77,6 +81,8 @@ implemented in the most EVM-friendly possible way. Check out Starkom's [EVM veri
 [koalabear]: https://docs.rs/starkom-koalabear
 [num_queries]: https://docs.rs/starkom-pcs/latest/starkom_pcs/fn.num_queries.html
 [plonk-options-blind]: https://docs.rs/starkom-plonk/latest/starkom_plonk/struct.Options.html#structfield.blind
+[proof-to-scpf]: https://docs.rs/starkom-pcs/latest/starkom_pcs/struct.Proof.html#method.to_scpf
 [proof-verify]: https://docs.rs/starkom-pcs/latest/starkom_pcs/struct.Proof.html#method.verify
+[scpf]: https://github.com/libernet-xyz/scpf/blob/main/FORMAT.md
 [schraderbrau]: https://docs.rs/starkom-schraderbrau
 [starkom-plonk]: https://docs.rs/starkom-plonk
