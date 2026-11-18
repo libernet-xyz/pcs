@@ -1,4 +1,4 @@
-use crate::starkom::proto::pcs::v10 as proto;
+use crate::starkom::proto::pcs::v11 as proto;
 use crate::utils;
 use anyhow::{Result, anyhow};
 use primitive_types::{H256, U128, U256, U512};
@@ -10,13 +10,13 @@ use std::marker::PhantomData;
 utils::prost_name!(
     proto::Sha2HashBackend,
     "Sha2HashBackend",
-    "starkom.proto.pcs.v10"
+    "starkom.proto.pcs.v11"
 );
 
 utils::prost_name!(
     proto::KeccakHashBackend,
     "KeccakHashBackend",
-    "starkom.proto.pcs.v10"
+    "starkom.proto.pcs.v11"
 );
 
 /// Describes a hash backend for hashing internal Merkle tree nodes.
@@ -248,11 +248,11 @@ mod tests {
     fn test_hash_backend_type_urls() {
         assert_eq!(
             proto::Sha2HashBackend::type_url(),
-            "type.starkom.io/starkom.proto.pcs.v10.Sha2HashBackend"
+            "type.starkom.io/starkom.proto.pcs.v11.Sha2HashBackend"
         );
         assert_eq!(
             proto::KeccakHashBackend::type_url(),
-            "type.starkom.io/starkom.proto.pcs.v10.KeccakHashBackend"
+            "type.starkom.io/starkom.proto.pcs.v11.KeccakHashBackend"
         );
     }
 

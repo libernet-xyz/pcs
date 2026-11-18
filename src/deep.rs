@@ -1,9 +1,9 @@
 use crate::fri;
 use crate::hash::Hasher;
 use crate::merkle::{Proof as LeafProof, Tree};
-use crate::starkom::proto::pcs::v10 as proto;
+use crate::starkom::proto::pcs::v11 as proto;
 use crate::utils;
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use primitive_types::{H256, U256};
 use prost_types::Any;
 use starkom_ff::{Field, Field256};
@@ -15,6 +15,13 @@ use std::sync::LazyLock;
 /// The number of bits of a proof-of-work hash, which is also the most leading zero bits it can
 /// have.
 pub const PROOF_OF_WORK_BITS: usize = 256;
+
+/// The largest valid value of [`Options::max_rounds`], which is also the value to use for no limit
+/// on the number of FRI rounds.
+///
+/// It's `2^32 - 1` on every platform, so that the same options are valid everywhere, e.g. on 64-bit
+/// platforms and on `wasm32` alike, even though `usize` has different sizes.
+pub const MAX_FRI_ROUNDS: usize = u32::MAX as usize;
 
 /// Domain separator tag used by [`Committer::transcript_hash`].
 static TRANSCRIPT_DST: LazyLock<H256> =
@@ -49,10 +56,6 @@ pub fn num_queries(security_bits: usize, blowup_log2: usize, grinding_bits: usiz
 }
 
 /// The parameters of the DEEP-FRI protocol.
-///
-/// The prover specifies them in [`Committer::new`] and they're recorded in every [`Proof`], so
-/// verifiers must check them against the expected ones (see [`Proof::options`] and
-/// [`Options::satisfies`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Options {
     /// The proven degree bound, which must be a power of 2.
@@ -66,9 +69,6 @@ pub struct Options {
     /// Every FRI query provides [`blowup_log2`](`Self::blowup_log2`) bits of security and grinding
     /// provides [`grinding_bits`](`Self::grinding_bits`), so a proof has the smallest number of
     /// queries that reaches this many bits (see [`num_queries`]). Any value is valid.
-    ///
-    /// The prover chooses it, so verifiers must check it against the expected one (see
-    /// [`Self::satisfies`]).
     pub security_bits: usize,
 
     /// The base-2 logarithm of the blowup factor, which must be greater than 0.
@@ -100,7 +100,8 @@ pub struct Options {
     /// Every round costs a Merkle proof per query, while every coefficient of the folded quotient
     /// is sent only once, so the optimum stops folding when the number of coefficients is roughly
     /// comparable to the number of queries times the size of a round's Merkle proof (a few hundred
-    /// coefficients in practice). Any value is valid.
+    /// coefficients in practice). Must be at most [`MAX_FRI_ROUNDS`], which also stands for no
+    /// limit (see [`Self::validate`]).
     pub max_rounds: usize,
 
     /// The number of grinding bits.
@@ -110,9 +111,8 @@ pub struct Options {
     /// grinding save one FRI query (see [`num_queries`]). 0 disables grinding.
     ///
     /// Must be at most [`PROOF_OF_WORK_BITS`], the number of bits of the proof-of-work hash,
-    /// because no hash can satisfy more (see [`Self::validate`]). Values above
-    /// [`security_bits`](`Self::security_bits`) are valid but save no further queries, because at
-    /// least one query is always required.
+    /// because no hash can satisfy more. Values above [`security_bits`](`Self::security_bits`) are
+    /// valid but save no further queries, because at least one query is always required.
     pub grinding_bits: usize,
 }
 
@@ -139,31 +139,36 @@ impl Options {
         fri::num_rounds(self.degree_bound, self.fold_rate, self.max_rounds)
     }
 
-    /// Returns true iff these options are acceptable to a verifier that expects `other`: the
-    /// security level and the number of grinding bits must be greater than or equal to the expected
-    /// ones, and all other parameters must be equal.
+    /// Returns true iff these options, typically those of a proof, are acceptable to a verifier
+    /// that expects `other`.
     ///
-    /// The number of queries is derived from both (see [`num_queries`]), so a proof with a higher
-    /// security level than expected is at least as sound. Soundness doesn't depend on the number of
-    /// grinding bits, but more grinding bits mean fewer queries, so a proof with more grinding bits
-    /// than expected is never more expensive to verify.
+    /// The degree bound, the security level, and the blowup factor must be equal to the expected
+    /// ones, the number of grinding bits must be greater than or equal to the expected one, and the
+    /// fold rate and the maximum number of rounds can have any value.
+    ///
+    /// The expected number of grinding bits is the minimum difficulty required by the verifier,
+    /// while the number of grinding bits of a proof is the difficulty targeted by its prover. The
+    /// proof of work must reach the target, and every `blowup_log2` bits of grinding above the
+    /// minimum save a query (see [`num_queries`]), so provers can trade grinding for smaller
+    /// proofs. A higher security level, on the other hand, would only mean more queries, which
+    /// would reveal more evaluations of the committed polynomials than their blinding might cover
+    /// (see the zero-knowledge notes in the crate documentation), so it must be exact. The fold
+    /// rate and the maximum number of rounds only affect the size of the proof and the cost of
+    /// verifying it, so provers can choose them freely.
     pub fn satisfies(&self, other: &Self) -> bool {
-        self.security_bits >= other.security_bits
+        self.degree_bound == other.degree_bound
+            && self.security_bits == other.security_bits
+            && self.blowup_log2 == other.blowup_log2
             && self.grinding_bits >= other.grinding_bits
-            && Self {
-                security_bits: other.security_bits,
-                grinding_bits: other.grinding_bits,
-                ..*self
-            }
-            .eq(other)
     }
 
     /// Checks that these options are valid for the field `F`, returning an error otherwise.
     ///
     /// The degree bound must be a power of 2, `blowup_log2` and `fold_rate` must be greater than 0,
-    /// the size of the extended evaluation domain must not exceed the 2-adicity of `F::BaseField`,
-    /// and `grinding_bits` must not exceed [`PROOF_OF_WORK_BITS`]. `security_bits` and `max_rounds`
-    /// can have any value.
+    /// the size of the extended evaluation domain must not exceed the 2-adicity of `F::BaseField`
+    /// and must fit in a `usize` (so it's less than 2^32 on 32-bit platforms), `max_rounds` must
+    /// not exceed [`MAX_FRI_ROUNDS`], and `grinding_bits` must not exceed [`PROOF_OF_WORK_BITS`].
+    /// `security_bits` can have any value.
     pub fn validate<F: Field>(&self) -> Result<()> {
         if !self.degree_bound.is_power_of_two() {
             return Err(anyhow!(
@@ -178,12 +183,21 @@ impl Options {
             return Err(anyhow!("invalid fold rate 0"));
         }
         let degree_bound_log2 = self.degree_bound.trailing_zeros() as usize;
-        if degree_bound_log2 + self.blowup_log2 > F::BaseField::S {
+        let domain_size_log2 = degree_bound_log2
+            .checked_add(self.blowup_log2)
+            .context("invalid extended domain size (too large on this platform)")?;
+        if domain_size_log2 > F::BaseField::S {
             return Err(anyhow!(
                 "invalid extended domain size 2^{{{}+{}}} (exceeds the 2-adicity of the field, {})",
                 degree_bound_log2,
                 self.blowup_log2,
                 F::BaseField::S
+            ));
+        }
+        if self.max_rounds > MAX_FRI_ROUNDS {
+            return Err(anyhow!(
+                "invalid maximum number of rounds {} (exceeds {MAX_FRI_ROUNDS})",
+                self.max_rounds
             ));
         }
         if self.grinding_bits > PROOF_OF_WORK_BITS {
@@ -258,22 +272,39 @@ fn rlc<F: Field>(values: impl IntoIterator<Item = F>, alpha: F) -> F {
     rlc
 }
 
-/// Encodes the transcript of the DEEP layer, that is all Merkle roots of the committed polynomials,
-/// all opened points, and their claimed evaluations.
+/// Encodes the transcript of the DEEP layer, that is the protocol parameters, all Merkle roots of
+/// the committed polynomials, all opened points, and their claimed evaluations.
+///
+/// The parameters come first, in the order of the fields of [`Options`]. They're those declared by
+/// the proof, which the verifier checks against the expected ones separately (see
+/// [`Options::satisfies`]). Binding them prevents a prover from changing them after seeing the
+/// challenges: e.g. declaring a number of grinding bits that matches the proof of work it found, or
+/// choosing the FRI settings that suit the query indices.
 fn deep_transcript<F: Field256>(
+    options: &Options,
     tree_roots: &[H256],
     num_polys: usize,
     points: &BTreeMap<F, Vec<F>>,
 ) -> impl Iterator<Item = H256> {
-    std::iter::once(utils::encode_usize(tree_roots.len()))
-        .chain(tree_roots.iter().copied())
-        .chain(std::iter::once(utils::encode_usize(num_polys)))
-        .chain(std::iter::once(utils::encode_usize(points.len())))
-        .chain(points.iter().flat_map(|(z, values)| {
-            std::iter::once(z)
-                .chain(values.iter())
-                .map(|value| H256::from_slice(&value.to_be_bytes()))
-        }))
+    [
+        options.degree_bound,
+        options.security_bits,
+        options.blowup_log2,
+        options.fold_rate,
+        options.max_rounds,
+        options.grinding_bits,
+    ]
+    .into_iter()
+    .map(utils::encode_usize)
+    .chain(std::iter::once(utils::encode_usize(tree_roots.len())))
+    .chain(tree_roots.iter().copied())
+    .chain(std::iter::once(utils::encode_usize(num_polys)))
+    .chain(std::iter::once(utils::encode_usize(points.len())))
+    .chain(points.iter().flat_map(|(z, values)| {
+        std::iter::once(z)
+            .chain(values.iter())
+            .map(|value| H256::from_slice(&value.to_be_bytes()))
+    }))
 }
 
 /// Derives the two Fiat-Shamir challenges of the DEEP layer.
@@ -282,27 +313,30 @@ fn deep_transcript<F: Field256>(
 /// polynomials, while the second one uses [`QUOTIENT_DST`] and is used to combine all DEEP
 /// quotients.
 ///
-/// Both challenges are bound to all Merkle roots of the committed polynomials and to all opened
-/// points and their claimed evaluations.
+/// Both challenges are bound to the protocol parameters, to all Merkle roots of the committed
+/// polynomials, and to all opened points and their claimed evaluations (see [`deep_transcript`]).
 fn deep_challenges<F: Field256, H: Hasher<F>>(
+    options: &Options,
     tree_roots: &[H256],
     num_polys: usize,
     points: &BTreeMap<F, Vec<F>>,
 ) -> (F, F) {
-    let transcript: Vec<H256> = deep_transcript(tree_roots, num_polys, points).collect();
+    let transcript: Vec<H256> = deep_transcript(options, tree_roots, num_polys, points).collect();
     (
         H::challenge(*RLC_DST, transcript.as_slice()),
         H::challenge(*QUOTIENT_DST, transcript.as_slice()),
     )
 }
 
-/// Hashes the full transcript of a proof up to the queries: all Merkle roots of the committed
-/// polynomials, all opened points and their claimed evaluations, all FRI roots, and the
-/// coefficients of the folded quotient.
+/// Hashes the full transcript of a proof up to the queries: the protocol parameters, all Merkle
+/// roots of the committed polynomials, all opened points and their claimed evaluations (see
+/// [`deep_transcript`]), all FRI roots, and the coefficients of the folded quotient.
 ///
 /// The returned seed is the input of the proof of work, which in turn determines the FRI query
-/// indices (see [`get_query_indices`]).
+/// indices (see [`get_query_indices`]). Since the seed binds the number of grinding bits, the
+/// prover commits to its grinding target before searching for a nonce.
 fn query_seed<F: Field256, H: Hasher<F>>(
+    options: &Options,
     tree_roots: &[H256],
     num_polys: usize,
     points: &BTreeMap<F, Vec<F>>,
@@ -311,7 +345,7 @@ fn query_seed<F: Field256, H: Hasher<F>>(
     let folded_quotient = fri_commitment.folded_polynomial();
     H::hash_transcript(
         *QUERY_DST0,
-        deep_transcript(tree_roots, num_polys, points)
+        deep_transcript(options, tree_roots, num_polys, points)
             .chain(std::iter::once(utils::encode_usize(fri_commitment.len())))
             .chain(fri_commitment.roots().iter().copied())
             .chain(std::iter::once(utils::encode_usize(folded_quotient.len())))
@@ -798,11 +832,11 @@ pub struct Proof<F: Field256, H: Hasher<F>> {
 impl<F: Field256, H: Hasher<F>> Proof<F, H> {
     /// Returns the protocol parameters used in the proof.
     ///
-    /// Callers must check them against the expected ones, typically with [`Options::satisfies`].
-    /// In particular the security level is chosen by the prover, so a proof that isn't checked can
-    /// have as few as one query. Soundness doesn't depend on the number of grinding bits because
-    /// the number of queries is automatically derived from it, but it should still be checked
-    /// along with the other parameters.
+    /// The prover chooses them, so [`Self::verify`] checks them against the ones expected by the
+    /// verifier using [`Options::satisfies`]. The number of grinding bits is the prover's target:
+    /// the number of queries is derived from it and the proof of work must reach it, and since all
+    /// the parameters are bound into the Fiat-Shamir transcript the prover commits to them before
+    /// grinding, so a higher target than the expected one is as sound.
     pub fn options(&self) -> &Options {
         &self.options
     }
@@ -818,12 +852,17 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
         &self.points
     }
 
-    /// Verifies this proof against the given commitment.
+    /// Verifies this proof against the given `commitment`.
     ///
     /// If verification succeeds, the committed polynomials have degree *at most*
     /// [`Options::degree_bound`], the ones of the base-field batches are over the base field (see
     /// [`Committer::add_base_batch`]), and their evaluations at the [opened points](`Self::points`)
     /// are the ones claimed by the proof.
+    ///
+    /// `options` are the protocol parameters expected by the verifier, and they must come from a
+    /// trusted source (e.g. a verification key) rather than from the proof. The
+    /// [options of the proof](`Self::options`) must [satisfy](`Options::satisfies`) them, otherwise
+    /// an error is returned.
     ///
     /// WARNING: honest provers commit polynomials of degree *strictly less* than
     /// [`Options::degree_bound`], but a valid proof only guarantees a degree *at most* equal to it.
@@ -839,7 +878,14 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
     ///
     /// NOTE: the proof proves the evaluations at whatever points it contains, so callers must check
     /// that the [opened points](`Self::points`) are the ones they expect.
-    pub fn verify(&self, commitment: &Commitment<F, H>) -> Result<()> {
+    pub fn verify(&self, options: &Options, commitment: &Commitment<F, H>) -> Result<()> {
+        if !self.options.satisfies(options) {
+            return Err(anyhow!(
+                "the options of the proof ({:?}) don't satisfy the expected ones ({options:?})",
+                self.options
+            ));
+        }
+
         check_points_off_domain(
             self.points.keys().copied(),
             self.options.extended_domain_size(),
@@ -868,8 +914,6 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
             }
         }
 
-        // The number of queries must be checked before deriving the query indices, so that the work
-        // of deriving them is bounded by the size of the proof even if its security level is huge.
         let num_queries = self.options.num_queries();
         if self.openings.len() != num_queries {
             return Err(anyhow!(
@@ -888,6 +932,7 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
 
         let tree_roots = commitment.tree_roots();
         let seed = query_seed::<F, H>(
+            &self.options,
             tree_roots.as_slice(),
             num_polys,
             &self.points,
@@ -899,7 +944,13 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
         }
         let indices = get_query_indices::<F, H>(pow, &self.options);
 
-        let (alpha, beta) = deep_challenges::<F, H>(tree_roots.as_slice(), num_polys, &self.points);
+        let (alpha, beta) = deep_challenges::<F, H>(
+            &self.options,
+            tree_roots.as_slice(),
+            num_polys,
+            &self.points,
+        );
+        let fri_seed = H256::from_slice(&beta.to_be_bytes());
 
         for ((query, openings), &expected_index) in
             (self.queries.iter().zip(self.openings.iter())).zip(indices.iter())
@@ -958,7 +1009,7 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
                 }),
                 beta,
             );
-            query.verify(&self.fri_commitment, quotient)?;
+            query.verify(&self.fri_commitment, fri_seed, quotient)?;
         }
 
         Ok(())
@@ -972,7 +1023,7 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
             security_bits: self.options.security_bits as u32,
             blowup_log2: self.options.blowup_log2 as u32,
             fold_rate: self.options.fold_rate as u32,
-            max_rounds: self.options.max_rounds as u64,
+            max_rounds: self.options.max_rounds as u32,
             grinding_bits: self.options.grinding_bits as u32,
             nonce: self.nonce,
             points: self
@@ -1018,7 +1069,7 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
         check_hash_backend::<H::ProtoTag>(&proto.hash_backend)?;
 
         let options = Options {
-            degree_bound: proto.degree_bound as usize,
+            degree_bound: usize::try_from(proto.degree_bound)?,
             security_bits: proto.security_bits as usize,
             blowup_log2: proto.blowup_log2 as usize,
             fold_rate: proto.fold_rate as usize,
@@ -1168,7 +1219,8 @@ impl<F: Field256, H: Hasher<F>> Prover<F, H> {
             .collect();
 
         let tree_roots: Vec<H256> = self.batches.iter().map(Batch::root_hash).collect();
-        let (alpha, beta) = deep_challenges::<F, H>(tree_roots.as_slice(), num_polys, &points);
+        let (alpha, beta) =
+            deep_challenges::<F, H>(&self.options, tree_roots.as_slice(), num_polys, &points);
 
         let combined = Batch::combine(&self.batches, alpha);
 
@@ -1191,10 +1243,17 @@ impl<F: Field256, H: Hasher<F>> Prover<F, H> {
             self.options.blowup_log2,
             self.options.fold_rate,
             self.options.max_rounds,
+            H256::from_slice(&beta.to_be_bytes()),
         );
         let fri_commitment = fri_prover.commit();
 
-        let seed = query_seed::<F, H>(tree_roots.as_slice(), num_polys, &points, &fri_commitment);
+        let seed = query_seed::<F, H>(
+            &self.options,
+            tree_roots.as_slice(),
+            num_polys,
+            &points,
+            &fri_commitment,
+        );
         let (nonce, pow) = self.grind_nonce(seed);
         let indices = get_query_indices::<F, H>(pow, &self.options);
         let openings = indices
@@ -1292,7 +1351,7 @@ mod tests {
         security_bits: 128,
         blowup_log2: 2,
         fold_rate: 1,
-        max_rounds: usize::MAX,
+        max_rounds: MAX_FRI_ROUNDS,
         grinding_bits: 0,
     };
 
@@ -1345,6 +1404,7 @@ mod tests {
         valid: bool,
     ) -> u64 {
         let seed = query_seed::<BS, Sha2Hash<BS>>(
+            &proof.options,
             commitment.tree_roots().as_slice(),
             commitment.num_polys(),
             &proof.points,
@@ -1460,7 +1520,7 @@ mod tests {
             security_bits: 128,
             blowup_log2: 6,
             fold_rate: 1,
-            max_rounds: usize::MAX,
+            max_rounds: MAX_FRI_ROUNDS,
             grinding_bits: 20,
         };
         assert_eq!(options.extended_domain_size(), 1 << 18);
@@ -1473,7 +1533,7 @@ mod tests {
             security_bits: 128,
             blowup_log2: 6,
             fold_rate: 1,
-            max_rounds: usize::MAX,
+            max_rounds: MAX_FRI_ROUNDS,
             grinding_bits: 0,
         };
         assert_eq!(options.num_queries(), 22);
@@ -1486,7 +1546,7 @@ mod tests {
             security_bits: 128,
             blowup_log2: 6,
             fold_rate: 1,
-            max_rounds: usize::MAX,
+            max_rounds: MAX_FRI_ROUNDS,
             grinding_bits: 20,
         };
         assert_eq!(options.num_queries(), 18);
@@ -1498,7 +1558,7 @@ mod tests {
             security_bits,
             blowup_log2: 6,
             fold_rate: 1,
-            max_rounds: usize::MAX,
+            max_rounds: MAX_FRI_ROUNDS,
             grinding_bits,
         };
         assert_eq!(options.num_queries(), expected);
@@ -1531,12 +1591,12 @@ mod tests {
 
     #[test]
     fn test_options_num_rounds() {
-        test_options_num_rounds_impl(1, 3, usize::MAX, 0);
-        test_options_num_rounds_impl(4096, 1, usize::MAX, 12);
-        test_options_num_rounds_impl(4096, 3, usize::MAX, 4);
-        test_options_num_rounds_impl(4096, 5, usize::MAX, 2);
-        test_options_num_rounds_impl(4096, 12, usize::MAX, 1);
-        test_options_num_rounds_impl(4096, 20, usize::MAX, 0);
+        test_options_num_rounds_impl(1, 3, MAX_FRI_ROUNDS, 0);
+        test_options_num_rounds_impl(4096, 1, MAX_FRI_ROUNDS, 12);
+        test_options_num_rounds_impl(4096, 3, MAX_FRI_ROUNDS, 4);
+        test_options_num_rounds_impl(4096, 5, MAX_FRI_ROUNDS, 2);
+        test_options_num_rounds_impl(4096, 12, MAX_FRI_ROUNDS, 1);
+        test_options_num_rounds_impl(4096, 20, MAX_FRI_ROUNDS, 0);
     }
 
     #[test]
@@ -1558,7 +1618,7 @@ mod tests {
             security_bits: 128,
             blowup_log2,
             fold_rate,
-            max_rounds: usize::MAX,
+            max_rounds: MAX_FRI_ROUNDS,
             grinding_bits,
         };
         let result = options.validate::<F>();
@@ -1576,7 +1636,7 @@ mod tests {
             security_bits: 128,
             blowup_log2,
             fold_rate,
-            max_rounds: usize::MAX,
+            max_rounds: MAX_FRI_ROUNDS,
             grinding_bits,
         };
         let result = options.validate::<F>();
@@ -1627,6 +1687,20 @@ mod tests {
         test_invalid_options_impl::<GL4>(1 << 30, 3, 1, 0);
     }
 
+    /// The size of the extended domain would overflow without saturation.
+    #[test]
+    fn test_options_with_huge_blowup() {
+        test_invalid_options_impl::<BS>(4, usize::MAX, 1, 0);
+        test_invalid_options_impl::<GL4>(4, usize::MAX, 1, 0);
+    }
+
+    /// The 2-adicity of BlueSky allows the extended domain, but it doesn't fit in a 32-bit `usize`.
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn test_options_with_domain_exceeding_usize() {
+        test_invalid_options_impl::<BS>(1 << 30, 2, 1, 0);
+    }
+
     #[test]
     fn test_options_with_large_fold_rate() {
         test_valid_options_impl::<BS>(4, 2, 10, 0);
@@ -1637,6 +1711,28 @@ mod tests {
     fn test_options_with_zero_fold_rate() {
         test_invalid_options_impl::<BS>(4, 2, 0, 0);
         test_invalid_options_impl::<GL4>(4, 2, 0, 0);
+    }
+
+    #[test]
+    fn test_options_with_largest_max_rounds() {
+        let options = Options {
+            max_rounds: MAX_FRI_ROUNDS,
+            ..OPTIONS
+        };
+        let result = options.validate::<BS>();
+        assert!(result.is_ok());
+    }
+
+    // `MAX_FRI_ROUNDS` is `usize::MAX` on 32-bit platforms, where no larger value exists.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn test_options_with_too_many_max_rounds() {
+        let options = Options {
+            max_rounds: MAX_FRI_ROUNDS + 1,
+            ..OPTIONS
+        };
+        let result = options.validate::<BS>();
+        assert!(result.is_err());
     }
 
     #[test]
@@ -1699,12 +1795,12 @@ mod tests {
     }
 
     #[test]
-    fn test_options_with_higher_security_level_satisfy() {
+    fn test_options_with_higher_security_level_dont_satisfy() {
         let options = Options {
             security_bits: 256,
             ..EXPECTED_OPTIONS
         };
-        assert!(options.satisfies(&EXPECTED_OPTIONS));
+        assert!(!options.satisfies(&EXPECTED_OPTIONS));
     }
 
     #[test]
@@ -1717,15 +1813,16 @@ mod tests {
     }
 
     #[test]
-    fn test_options_with_higher_security_level_and_fewer_grinding_bits_dont_satisfy() {
+    fn test_options_with_higher_security_level_and_more_grinding_bits_dont_satisfy() {
         let options = Options {
             security_bits: 256,
-            grinding_bits: 19,
+            grinding_bits: 21,
             ..EXPECTED_OPTIONS
         };
         assert!(!options.satisfies(&EXPECTED_OPTIONS));
     }
 
+    /// Checks that `options` don't satisfy [`EXPECTED_OPTIONS`], even with more grinding bits.
     fn test_options_dont_satisfy_impl(options: Options) {
         assert!(!options.satisfies(&EXPECTED_OPTIONS));
         assert!(
@@ -1735,9 +1832,14 @@ mod tests {
             }
             .satisfies(&EXPECTED_OPTIONS)
         );
+    }
+
+    /// Checks that `options` satisfy [`EXPECTED_OPTIONS`], also with more grinding bits.
+    fn test_options_satisfy_impl(options: Options) {
+        assert!(options.satisfies(&EXPECTED_OPTIONS));
         assert!(
-            !Options {
-                security_bits: 256,
+            Options {
+                grinding_bits: 21,
                 ..options
             }
             .satisfies(&EXPECTED_OPTIONS)
@@ -1769,25 +1871,38 @@ mod tests {
     }
 
     #[test]
-    fn test_options_with_different_fold_rate_dont_satisfy() {
-        test_options_dont_satisfy_impl(Options {
-            fold_rate: 2,
+    fn test_options_with_different_fold_rate_satisfy() {
+        test_options_satisfy_impl(Options {
+            fold_rate: 1,
             ..EXPECTED_OPTIONS
         });
-        test_options_dont_satisfy_impl(Options {
+        test_options_satisfy_impl(Options {
             fold_rate: 4,
             ..EXPECTED_OPTIONS
         });
     }
 
     #[test]
-    fn test_options_with_different_max_rounds_dont_satisfy() {
-        test_options_dont_satisfy_impl(Options {
-            max_rounds: 1,
+    fn test_options_with_different_max_rounds_satisfy() {
+        test_options_satisfy_impl(Options {
+            max_rounds: 0,
             ..EXPECTED_OPTIONS
         });
-        test_options_dont_satisfy_impl(Options {
+        test_options_satisfy_impl(Options {
             max_rounds: 3,
+            ..EXPECTED_OPTIONS
+        });
+        test_options_satisfy_impl(Options {
+            max_rounds: MAX_FRI_ROUNDS,
+            ..EXPECTED_OPTIONS
+        });
+    }
+
+    #[test]
+    fn test_options_with_different_fold_rate_and_max_rounds_satisfy() {
+        test_options_satisfy_impl(Options {
+            fold_rate: 2,
+            max_rounds: 6,
             ..EXPECTED_OPTIONS
         });
     }
@@ -1851,7 +1966,7 @@ mod tests {
             security_bits: 128,
             blowup_log2: 4,
             fold_rate: 1,
-            max_rounds: usize::MAX,
+            max_rounds: MAX_FRI_ROUNDS,
             grinding_bits: 104,
         };
         let indices = get_query_indices::<BS, Sha2Hash<BS>>(H256::repeat_byte(0x34), &options);
@@ -1885,6 +2000,16 @@ mod tests {
         assert_eq!(result, BS::ZERO);
     }
 
+    /// The protocol parameters used to test the Fiat-Shamir transcript.
+    const TRANSCRIPT_OPTIONS: Options = Options {
+        degree_bound: 4,
+        security_bits: 128,
+        blowup_log2: 2,
+        fold_rate: 1,
+        max_rounds: 1,
+        grinding_bits: 8,
+    };
+
     /// The Merkle roots of the committed polynomials used to test the Fiat-Shamir transcript.
     fn transcript_tree_roots() -> [H256; 2] {
         [H256::repeat_byte(0x56), H256::repeat_byte(0x78)]
@@ -1916,21 +2041,26 @@ mod tests {
 
     #[test]
     fn test_deep_challenges() {
-        let (alpha, beta) =
-            deep_challenges::<BS, Sha2Hash<BS>>(&transcript_tree_roots(), 3, &transcript_points());
+        let (alpha, beta) = deep_challenges::<BS, Sha2Hash<BS>>(
+            &TRANSCRIPT_OPTIONS,
+            &transcript_tree_roots(),
+            3,
+            &transcript_points(),
+        );
         assert_eq!(
             alpha,
-            parse("0x097f51584f3018cfb58caa2989196f63076af96bff20325da17bf923ef269335")
+            parse("0x243dd98505084f06fd875df85a4e5ac05d8a11bc902de34df348450a0ec0b5df")
         );
         assert_eq!(
             beta,
-            parse("0x152a37a010a775d0c161debac79b64a26f915125a5e1fff14b875fc51d9301f7")
+            parse("0x18dd843cc2e3b8c7b8a4a95564c1a4ffbe859311199fa6eb90dfcac60d6e0cbf")
         );
     }
 
     #[test]
     fn test_query_seed() {
         let seed = query_seed::<BS, Sha2Hash<BS>>(
+            &TRANSCRIPT_OPTIONS,
             &transcript_tree_roots(),
             3,
             &transcript_points(),
@@ -1938,8 +2068,86 @@ mod tests {
         );
         assert_eq!(
             seed,
-            parse("0xc3749a4732349eda6ce66d199ac4fa709842b54fa6e99c88ed80fb2d75f411c5")
+            parse("0xaf36070d70665854c2cc836979578c0f06368b82d4dbd001b7442790fb57478e")
         );
+    }
+
+    /// Every field of the protocol parameters that differs from [`TRANSCRIPT_OPTIONS`] in one of
+    /// these options.
+    const OTHER_TRANSCRIPT_OPTIONS: [Options; 6] = [
+        Options {
+            degree_bound: 8,
+            ..TRANSCRIPT_OPTIONS
+        },
+        Options {
+            security_bits: 127,
+            ..TRANSCRIPT_OPTIONS
+        },
+        Options {
+            blowup_log2: 3,
+            ..TRANSCRIPT_OPTIONS
+        },
+        Options {
+            fold_rate: 2,
+            ..TRANSCRIPT_OPTIONS
+        },
+        Options {
+            max_rounds: 2,
+            ..TRANSCRIPT_OPTIONS
+        },
+        Options {
+            grinding_bits: 9,
+            ..TRANSCRIPT_OPTIONS
+        },
+    ];
+
+    fn test_deep_challenges_bind_options_impl(options: Options) {
+        let challenges = deep_challenges::<BS, Sha2Hash<BS>>(
+            &TRANSCRIPT_OPTIONS,
+            &transcript_tree_roots(),
+            3,
+            &transcript_points(),
+        );
+        let other_challenges = deep_challenges::<BS, Sha2Hash<BS>>(
+            &options,
+            &transcript_tree_roots(),
+            3,
+            &transcript_points(),
+        );
+        assert_ne!(challenges.0, other_challenges.0);
+        assert_ne!(challenges.1, other_challenges.1);
+    }
+
+    #[test]
+    fn test_deep_challenges_bind_options() {
+        for options in OTHER_TRANSCRIPT_OPTIONS {
+            test_deep_challenges_bind_options_impl(options);
+        }
+    }
+
+    fn test_query_seed_binds_options_impl(options: Options) {
+        let seed = query_seed::<BS, Sha2Hash<BS>>(
+            &TRANSCRIPT_OPTIONS,
+            &transcript_tree_roots(),
+            3,
+            &transcript_points(),
+            &transcript_fri_commitment(),
+        );
+        let other_seed = query_seed::<BS, Sha2Hash<BS>>(
+            &options,
+            &transcript_tree_roots(),
+            3,
+            &transcript_points(),
+            &transcript_fri_commitment(),
+        );
+        assert_ne!(seed, other_seed);
+    }
+
+    #[test]
+    fn test_query_seed_binds_options() {
+        for options in OTHER_TRANSCRIPT_OPTIONS {
+            test_query_seed_binds_options_impl(options);
+        }
     }
 
     #[test]
@@ -1950,9 +2158,20 @@ mod tests {
         let values = other_points.remove(&BS::from_const(456)).unwrap();
         other_points.insert(BS::from_const(789), values);
         let fri_commitment = transcript_fri_commitment();
-        let seed = query_seed::<BS, Sha2Hash<BS>>(&tree_roots, 3, &points, &fri_commitment);
-        let other_seed =
-            query_seed::<BS, Sha2Hash<BS>>(&tree_roots, 3, &other_points, &fri_commitment);
+        let seed = query_seed::<BS, Sha2Hash<BS>>(
+            &TRANSCRIPT_OPTIONS,
+            &tree_roots,
+            3,
+            &points,
+            &fri_commitment,
+        );
+        let other_seed = query_seed::<BS, Sha2Hash<BS>>(
+            &TRANSCRIPT_OPTIONS,
+            &tree_roots,
+            3,
+            &other_points,
+            &fri_commitment,
+        );
         assert_ne!(seed, other_seed);
     }
 
@@ -1963,9 +2182,20 @@ mod tests {
         let mut other_points = points.clone();
         other_points.get_mut(&BS::from_const(456)).unwrap()[2] += BS::ONE;
         let fri_commitment = transcript_fri_commitment();
-        let seed = query_seed::<BS, Sha2Hash<BS>>(&tree_roots, 3, &points, &fri_commitment);
-        let other_seed =
-            query_seed::<BS, Sha2Hash<BS>>(&tree_roots, 3, &other_points, &fri_commitment);
+        let seed = query_seed::<BS, Sha2Hash<BS>>(
+            &TRANSCRIPT_OPTIONS,
+            &tree_roots,
+            3,
+            &points,
+            &fri_commitment,
+        );
+        let other_seed = query_seed::<BS, Sha2Hash<BS>>(
+            &TRANSCRIPT_OPTIONS,
+            &tree_roots,
+            3,
+            &other_points,
+            &fri_commitment,
+        );
         assert_ne!(seed, other_seed);
     }
 
@@ -1977,7 +2207,7 @@ mod tests {
             security_bits: 128,
             blowup_log2: 2,
             fold_rate: 1,
-            max_rounds: usize::MAX,
+            max_rounds: MAX_FRI_ROUNDS,
             grinding_bits: 0,
         });
     }
@@ -2490,8 +2720,8 @@ mod tests {
         assert_eq!(
             proof.fri_commitment.roots(),
             [
-                parse::<H256>("0x1cfc697bb66e15c8357f7a749010a210ae829f520944e21e4df00cfa7212ec8c"),
-                parse("0xc61b2df672d90a4aef984d6b7d485f673cec75f1868d39e6ba659a4ec3883f6f"),
+                parse::<H256>("0x863a81ca23ba5093f76b4e0d82ab5dea1b6572b42ff7da4a040686279f3b761d"),
+                parse("0x265b906c7e2dadb76e48016201025b3e235a488650d9d8b77a4685fd7016e4da"),
             ]
         );
     }
@@ -2504,7 +2734,7 @@ mod tests {
         assert_eq!(
             proof.fri_commitment.folded_polynomial().coefficients(),
             [parse::<BS>(
-                "0x0e9f1ad4b8e8061af017e701db60283baf50808a86959003141baed02ddbf544"
+                "0x0970ce84dbf476f5e4a0d0971c7a75f0094fc87e817b70adce05a23485ced770"
             )]
         );
     }
@@ -2522,7 +2752,7 @@ mod tests {
         let committer = make_committer::<BS, Sha2Hash<BS>>(GROUND_OPTIONS, &SAMPLE_BATCHES);
         let (_, prover) = committer.commit();
         let proof = prover.prove(make_points(&SAMPLE_POINTS));
-        assert_eq!(proof.nonce(), 204);
+        assert_eq!(proof.nonce(), 367);
     }
 
     #[test]
@@ -2550,7 +2780,7 @@ mod tests {
             ..OPTIONS
         };
         let (commitment, proof) = sample_proof(options);
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert_eq!(proof.options().security_bits, security_bits);
         assert_eq!(proof.openings.len(), expected);
         assert_eq!(proof.queries.len(), expected);
@@ -2578,7 +2808,7 @@ mod tests {
         let committer = make_mixed_committer::<F, H>(options, batches, base_fields);
         let (commitment, prover) = committer.commit();
         let proof = prover.prove(make_points(points));
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert!(result.is_ok());
     }
 
@@ -2766,7 +2996,7 @@ mod tests {
                 security_bits: 128,
                 blowup_log2: 1,
                 fold_rate: 1,
-                max_rounds: usize::MAX,
+                max_rounds: MAX_FRI_ROUNDS,
                 grinding_bits: 0,
             },
         );
@@ -2790,7 +3020,7 @@ mod tests {
                 security_bits: 128,
                 blowup_log2: 3,
                 fold_rate: 1,
-                max_rounds: usize::MAX,
+                max_rounds: MAX_FRI_ROUNDS,
                 grinding_bits: 0,
             },
         );
@@ -2823,21 +3053,21 @@ mod tests {
         let (commitment, prover) = committer.commit();
         let proof1 = prover.prove(make_points(&SAMPLE_POINTS));
         let proof2 = prover.prove(make_points(&[789]));
-        assert!(proof1.verify(&commitment).is_ok());
-        assert!(proof2.verify(&commitment).is_ok());
+        assert!(proof1.verify(&proof1.options, &commitment).is_ok());
+        assert!(proof2.verify(&proof2.options, &commitment).is_ok());
     }
 
     #[test]
     fn test_accept_untampered_proof() {
         let (commitment, proof) = sample_proof(OPTIONS);
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_accept_untampered_ground_proof() {
         let (commitment, proof) = sample_proof(GROUND_OPTIONS);
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert!(result.is_ok());
     }
 
@@ -2937,7 +3167,7 @@ mod tests {
     fn test_reject_mismatched_max_rounds() {
         let (commitment, mut proof) = sample_proof(OPTIONS);
         proof.options.max_rounds = 1;
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert!(result.is_err());
     }
 
@@ -2955,7 +3185,7 @@ mod tests {
         coefficients[1] += BS::ONE;
         proof.fri_commitment =
             fri::Commitment::new(vec![], Polynomial::with_coefficients(coefficients));
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert!(result.is_err());
     }
 
@@ -2966,7 +3196,7 @@ mod tests {
         roots[1] = H256::repeat_byte(0x42);
         proof.fri_commitment =
             fri::Commitment::new(roots, proof.fri_commitment.folded_polynomial().clone());
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert!(result.is_err());
     }
 
@@ -2974,7 +3204,7 @@ mod tests {
     fn test_reject_mismatched_fold_rate() {
         let (commitment, mut proof) = sample_proof(OPTIONS);
         proof.options.fold_rate = 2;
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert!(result.is_err());
     }
 
@@ -2982,7 +3212,7 @@ mod tests {
     fn test_reject_mismatched_degree_bound() {
         let (commitment, mut proof) = sample_proof(OPTIONS);
         proof.options.degree_bound *= 2;
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert!(result.is_err());
     }
 
@@ -2992,7 +3222,7 @@ mod tests {
         let values = proof.points[&BS::from_const(123)].clone();
         let z = Polynomial::<BS>::coset_element2(0, OPTIONS.extended_domain_size());
         proof.points = BTreeMap::from([(z, values)]);
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert!(result.is_err());
     }
 
@@ -3000,7 +3230,7 @@ mod tests {
     fn test_reject_tampered_evaluation() {
         let (commitment, mut proof) = sample_proof(OPTIONS);
         proof.points.get_mut(&BS::from_const(123)).unwrap()[0] += BS::ONE;
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert!(result.is_err());
     }
 
@@ -3008,7 +3238,7 @@ mod tests {
     fn test_reject_no_points() {
         let (commitment, mut proof) = sample_proof(OPTIONS);
         proof.points.clear();
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert!(result.is_err());
     }
 
@@ -3016,7 +3246,7 @@ mod tests {
     fn test_reject_missing_evaluation() {
         let (commitment, mut proof) = sample_proof(OPTIONS);
         proof.points.get_mut(&BS::from_const(123)).unwrap().pop();
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert!(result.is_err());
     }
 
@@ -3028,7 +3258,7 @@ mod tests {
             .get_mut(&BS::from_const(123))
             .unwrap()
             .push(BS::ZERO);
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert!(result.is_err());
     }
 
@@ -3037,7 +3267,7 @@ mod tests {
         let (commitment, mut proof) = sample_proof(OPTIONS);
         let values = proof.points[&BS::from_const(123)].clone();
         proof.points.insert(BS::from_const(789), values);
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert!(result.is_err());
     }
 
@@ -3047,7 +3277,7 @@ mod tests {
         let values = proof.points[&BS::from_const(123)].clone();
         let other_values = proof.points.insert(BS::from_const(456), values).unwrap();
         proof.points.insert(BS::from_const(123), other_values);
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert!(result.is_err());
     }
 
@@ -3062,7 +3292,7 @@ mod tests {
             ],
         );
         let (foreign, _) = committer.commit();
-        let result = proof.verify(&foreign);
+        let result = proof.verify(&proof.options, &foreign);
         assert!(result.is_err());
     }
 
@@ -3071,7 +3301,7 @@ mod tests {
         let (mut commitment, proof) = sample_proof(OPTIONS);
         commitment.batches[0].num_polys = 1;
         commitment.batches[1].num_polys = 2;
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert!(result.is_err());
     }
 
@@ -3081,7 +3311,7 @@ mod tests {
     fn test_reject_base_batch_reported_as_extension() {
         let (mut commitment, proof) = sample_mixed_proof();
         commitment.batches[0].base_field = false;
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert!(result.is_err());
     }
 
@@ -3091,7 +3321,7 @@ mod tests {
     fn test_reject_extension_batch_reported_as_base() {
         let (mut commitment, proof) = sample_mixed_proof();
         commitment.batches[1].base_field = true;
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert!(result.is_err());
     }
 
@@ -3107,9 +3337,9 @@ mod tests {
         base_relabeled.batches[0].base_field = false;
         let mut extension_relabeled = commitment.clone();
         extension_relabeled.batches[1].base_field = true;
-        assert!(proof.verify(&commitment).is_ok());
-        assert!(proof.verify(&base_relabeled).is_err());
-        assert!(proof.verify(&extension_relabeled).is_err());
+        assert!(proof.verify(&proof.options, &commitment).is_ok());
+        assert!(proof.verify(&proof.options, &base_relabeled).is_err());
+        assert!(proof.verify(&proof.options, &extension_relabeled).is_err());
     }
 
     #[test]
@@ -3118,7 +3348,7 @@ mod tests {
         let mut proto = proof.to_proto();
         proto.openings[3].proofs[0].leaf_values[1] = vec![42, 0, 0, 0, 0, 0, 0, 0];
         let proof = Proof::<GL4, Sha2Hash<GL4>>::from_proto(&proto).unwrap();
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert!(result.is_err());
     }
 
@@ -3128,7 +3358,7 @@ mod tests {
         let mut proto = proof.to_proto();
         proto.openings[3].proofs[1].leaf_values[2] = vec![42, 0, 0, 0, 0, 0, 0, 0];
         let proof = Proof::<GL4, Sha2Hash<GL4>>::from_proto(&proto).unwrap();
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert!(result.is_err());
     }
 
@@ -3136,7 +3366,7 @@ mod tests {
     fn test_reject_missing_query() {
         let (commitment, mut proof) = sample_proof(OPTIONS);
         proof.queries.pop();
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert!(result.is_err());
     }
 
@@ -3144,7 +3374,7 @@ mod tests {
     fn test_reject_missing_openings() {
         let (commitment, mut proof) = sample_proof(OPTIONS);
         proof.openings.pop();
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert!(result.is_err());
     }
 
@@ -3152,7 +3382,7 @@ mod tests {
     fn test_reject_missing_opening_within_query() {
         let (commitment, mut proof) = sample_proof(OPTIONS);
         proof.openings[0].pop();
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert!(result.is_err());
     }
 
@@ -3160,7 +3390,7 @@ mod tests {
     fn test_reject_swapped_openings() {
         let (commitment, mut proof) = sample_proof(OPTIONS);
         proof.openings.swap(0, 1);
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert!(result.is_err());
     }
 
@@ -3177,7 +3407,7 @@ mod tests {
         let (_, other_prover) = committer.commit();
         let mut other_proof = other_prover.prove(make_points(&[123]));
         proof.openings[0][0] = other_proof.openings[0].remove(0);
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert!(result.is_err());
     }
 
@@ -3191,7 +3421,7 @@ mod tests {
             .merkle_path
             .extend(vec![vec![0; 32]; 64]);
         let proof = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert!(result.is_err());
     }
 
@@ -3199,7 +3429,7 @@ mod tests {
     fn test_reject_invalid_nonce() {
         let (commitment, mut proof) = sample_proof(GROUND_OPTIONS);
         proof.nonce = find_nonce(&commitment, &proof, false);
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert!(result.is_err());
     }
 
@@ -3207,7 +3437,7 @@ mod tests {
     fn test_reject_other_valid_nonce() {
         let (commitment, mut proof) = sample_proof(GROUND_OPTIONS);
         proof.nonce = find_nonce(&commitment, &proof, true);
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert!(result.is_err());
     }
 
@@ -3215,7 +3445,7 @@ mod tests {
     fn test_reject_overstated_grinding() {
         let (commitment, mut proof) = sample_proof(GROUND_OPTIONS);
         proof.options.grinding_bits = 128;
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert!(result.is_err());
     }
 
@@ -3223,7 +3453,7 @@ mod tests {
     fn test_reject_overstated_security_level() {
         let (commitment, mut proof) = sample_proof(OPTIONS);
         proof.options.security_bits = 130;
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert!(result.is_err());
     }
 
@@ -3231,7 +3461,7 @@ mod tests {
     fn test_reject_understated_security_level() {
         let (commitment, mut proof) = sample_proof(OPTIONS);
         proof.options.security_bits = 126;
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert!(result.is_err());
     }
 
@@ -3241,7 +3471,7 @@ mod tests {
     fn test_reject_huge_security_level() {
         let (commitment, mut proof) = sample_proof(OPTIONS);
         proof.options.security_bits = usize::MAX;
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert!(result.is_err());
     }
 
@@ -3249,7 +3479,7 @@ mod tests {
     fn test_reject_unsatisfiable_grinding() {
         let (commitment, mut proof) = sample_proof(GROUND_OPTIONS);
         proof.options.grinding_bits = 257;
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert!(result.is_err());
     }
 
@@ -3257,7 +3487,7 @@ mod tests {
     fn test_reject_maximum_grinding() {
         let (commitment, mut proof) = sample_proof(GROUND_OPTIONS);
         proof.options.grinding_bits = usize::MAX;
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert!(result.is_err());
     }
 
@@ -3273,11 +3503,129 @@ mod tests {
         );
     }
 
+    /// Replaces the options of a valid proof with `options`, which give the same numbers of queries
+    /// and FRI rounds, so that only the Fiat-Shamir transcript can tell them apart.
+    fn test_reject_proof_with_other_options_impl(options: Options) {
+        let (commitment, mut proof) = sample_proof(GROUND_OPTIONS);
+        assert_eq!(options.num_queries(), proof.options.num_queries());
+        assert_eq!(options.num_rounds(), proof.options.num_rounds());
+        proof.options = options;
+        let result = proof.verify(&proof.options, &commitment);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_proof_with_other_grinding_bits() {
+        test_reject_proof_with_other_options_impl(Options {
+            grinding_bits: 9,
+            ..GROUND_OPTIONS
+        });
+    }
+
+    #[test]
+    fn test_reject_proof_with_other_security_level() {
+        test_reject_proof_with_other_options_impl(Options {
+            security_bits: 127,
+            ..GROUND_OPTIONS
+        });
+    }
+
+    #[test]
+    fn test_reject_proof_with_other_max_rounds() {
+        test_reject_proof_with_other_options_impl(Options {
+            max_rounds: 2,
+            ..GROUND_OPTIONS
+        });
+    }
+
+    /// Makes an honest proof with `options`, which is valid on its own, and checks that a verifier
+    /// expecting [`GROUND_OPTIONS`] rejects it.
+    fn test_reject_unexpected_options_impl(options: Options) {
+        let (commitment, proof) = sample_proof(options);
+        assert!(proof.verify(&options, &commitment).is_ok());
+        let result = proof.verify(&GROUND_OPTIONS, &commitment);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_lower_security_level_than_expected() {
+        test_reject_unexpected_options_impl(Options {
+            security_bits: 8,
+            ..GROUND_OPTIONS
+        });
+    }
+
+    #[test]
+    fn test_reject_higher_security_level_than_expected() {
+        test_reject_unexpected_options_impl(Options {
+            security_bits: 129,
+            ..GROUND_OPTIONS
+        });
+    }
+
+    /// The extended evaluation domain has the same size, but the proven degree bound is weaker.
+    #[test]
+    fn test_reject_higher_degree_bound_than_expected() {
+        test_reject_unexpected_options_impl(Options {
+            degree_bound: 8,
+            blowup_log2: 1,
+            ..GROUND_OPTIONS
+        });
+    }
+
+    #[test]
+    fn test_reject_other_blowup_than_expected() {
+        test_reject_unexpected_options_impl(Options {
+            blowup_log2: 3,
+            ..GROUND_OPTIONS
+        });
+    }
+
+    #[test]
+    fn test_reject_fewer_grinding_bits_than_expected() {
+        test_reject_unexpected_options_impl(Options {
+            grinding_bits: 0,
+            ..GROUND_OPTIONS
+        });
+    }
+
+    /// Makes an honest proof with `options` and checks that a verifier expecting
+    /// [`GROUND_OPTIONS`] accepts it.
+    fn test_accept_compatible_options_impl(options: Options) {
+        let (commitment, proof) = sample_proof(options);
+        let result = proof.verify(&GROUND_OPTIONS, &commitment);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_accept_more_grinding_bits_than_expected() {
+        test_accept_compatible_options_impl(Options {
+            grinding_bits: 10,
+            ..GROUND_OPTIONS
+        });
+    }
+
+    #[test]
+    fn test_accept_other_fri_settings_than_expected() {
+        test_accept_compatible_options_impl(Options {
+            fold_rate: 2,
+            ..GROUND_OPTIONS
+        });
+        test_accept_compatible_options_impl(Options {
+            max_rounds: 1,
+            ..GROUND_OPTIONS
+        });
+        test_accept_compatible_options_impl(Options {
+            max_rounds: 0,
+            ..GROUND_OPTIONS
+        });
+    }
+
     #[test]
     fn test_reject_understated_grinding() {
         let (commitment, mut proof) = sample_proof(GROUND_OPTIONS);
         proof.options.grinding_bits = 0;
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert!(result.is_err());
     }
 
@@ -3289,9 +3637,9 @@ mod tests {
         assert_eq!(proto.security_bits, 128);
         assert_eq!(proto.blowup_log2, 2);
         assert_eq!(proto.fold_rate, 1);
-        assert_eq!(proto.max_rounds, u64::MAX);
+        assert_eq!(proto.max_rounds, u32::MAX);
         assert_eq!(proto.grinding_bits, 8);
-        assert_eq!(proto.nonce, 204);
+        assert_eq!(proto.nonce, 367);
         assert_eq!(
             proto.points,
             [
@@ -3363,7 +3711,7 @@ mod tests {
         let proof_proto = proof.to_proto();
         let commitment = Commitment::<GL4, Sha2Hash<GL4>>::from_proto(&commitment_proto).unwrap();
         let proof = Proof::<GL4, Sha2Hash<GL4>>::from_proto(&proof_proto).unwrap();
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert!(result.is_ok());
     }
 
@@ -3408,7 +3756,7 @@ mod tests {
         let commitment =
             Commitment::<KB8, Keccak256Hash<KB8>>::from_proto(&commitment_proto).unwrap();
         let proof = Proof::<KB8, Keccak256Hash<KB8>>::from_proto(&proof_proto).unwrap();
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert!(result.is_ok());
     }
 
@@ -3428,7 +3776,7 @@ mod tests {
         let proof_proto = proof.to_proto();
         let commitment = Commitment::<BS, Sha2Hash<BS>>::from_proto(&commitment_proto).unwrap();
         let proof = Proof::<BS, Sha2Hash<BS>>::from_proto(&proof_proto).unwrap();
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert!(result.is_ok());
     }
 
@@ -3451,7 +3799,7 @@ mod tests {
         let proof_proto = proof.to_proto();
         let commitment = Commitment::<BS, Sha2Hash<BS>>::from_proto(&commitment_proto).unwrap();
         let proof = Proof::<BS, Sha2Hash<BS>>::from_proto(&proof_proto).unwrap();
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert!(result.is_ok());
     }
 
@@ -3480,6 +3828,36 @@ mod tests {
         proto.blowup_log2 = 64;
         let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto);
         assert!(result.is_err());
+    }
+
+    /// The size of the extended domain would overflow on 32-bit platforms without saturation.
+    #[test]
+    fn test_reject_huge_blowup_in_proto() {
+        let (_, proof) = sample_proof(OPTIONS);
+        let mut proto = proof.to_proto();
+        proto.blowup_log2 = u32::MAX;
+        let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto);
+        assert!(result.is_err());
+    }
+
+    fn test_reject_degree_bound_in_proto_impl(degree_bound: u64) {
+        let (_, proof) = sample_proof(OPTIONS);
+        let mut proto = proof.to_proto();
+        proto.degree_bound = degree_bound;
+        let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto);
+        assert!(result.is_err());
+    }
+
+    /// Both would be truncated to the honest degree bound, 4, on 32-bit platforms.
+    #[test]
+    fn test_reject_degree_bound_truncated_on_32_bit_platforms() {
+        test_reject_degree_bound_in_proto_impl((1 << 32) + 4);
+        test_reject_degree_bound_in_proto_impl((1 << 40) + 4);
+    }
+
+    #[test]
+    fn test_reject_huge_degree_bound_in_proto() {
+        test_reject_degree_bound_in_proto_impl(u64::MAX);
     }
 
     #[test]
@@ -3545,7 +3923,7 @@ mod tests {
         let mut proto = proof.to_proto();
         proto.fri_roots.clear();
         let proof = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
-        let result = proof.verify(&commitment);
+        let result = proof.verify(&proof.options, &commitment);
         assert!(result.is_err());
     }
 

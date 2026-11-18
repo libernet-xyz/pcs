@@ -1,6 +1,6 @@
 use crate::hash::Hasher;
 use crate::merkle;
-use crate::starkom::proto::pcs::v10 as proto;
+use crate::starkom::proto::pcs::v11 as proto;
 use crate::utils;
 use anyhow::{Result, anyhow};
 use primitive_types::H256;
@@ -11,6 +11,16 @@ use std::sync::LazyLock;
 
 /// Domain separator tag used when deriving the Fiat-Shamir challenge for FRI folding.
 static FOLD_DST: LazyLock<H256> = LazyLock::new(|| utils::make_dst(b"starkom/fri/fold"));
+
+/// Derives the Fiat-Shamir folding challenge of a round.
+fn folding_challenge<F: Field256, H: Hasher<F>>(previous: H256, root: H256) -> F {
+    H::challenge(*FOLD_DST, &[previous, root])
+}
+
+/// Encodes a folding challenge for chaining it to the next one.
+fn encode_challenge<F: Field256>(alpha: F) -> H256 {
+    H256::from_slice(&alpha.to_be_bytes())
+}
 
 /// Returns the number of rounds of the folding argument.
 ///
@@ -365,10 +375,19 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
     /// round, or `value` itself if there are zero rounds, must match the evaluation of the folded
     /// polynomial.
     ///
+    /// `transcript_hash` must be the same one passed to [`Prover::new`], i.e. a hash of the
+    /// transcript of the caller's protocol up to the FRI commitment. The folding challenges are
+    /// chained to it.
+    ///
     /// If verification succeeds, the committed polynomial has degree less than `2^(rounds * r)`
     /// times the number of coefficients of the folded polynomial, with `r` being the fold rate, and
     /// therefore less than the degree bound.
-    pub fn verify(&self, commitment: &Commitment<F>, mut value: F) -> Result<()> {
+    pub fn verify(
+        &self,
+        commitment: &Commitment<F>,
+        transcript_hash: H256,
+        mut value: F,
+    ) -> Result<()> {
         let mut n = self.degree_bound << self.blowup_log2;
         assert!(n.is_power_of_two());
 
@@ -391,6 +410,7 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
         }
 
         let mut index = self.index;
+        let mut previous = transcript_hash;
 
         for (proof, &root_hash) in self.folds.iter().zip(commitment.roots()) {
             if proof.fold_rate() != self.fold_rate {
@@ -414,7 +434,8 @@ impl<F: Field256, H: Hasher<F>> Query<F, H> {
             }
             proof.verify(index, root_hash)?;
 
-            let alpha = H::challenge(*FOLD_DST, &[root_hash]);
+            let alpha = folding_challenge::<F, H>(previous, root_hash);
+            previous = encode_challenge(alpha);
             let m = n >> self.fold_rate;
             value = Self::fold_coset(proof.coset().to_vec(), index % m, n, alpha);
             n = m;
@@ -558,12 +579,18 @@ impl<F: Field256, H: Hasher<F>> Prover<F, H> {
     /// times with the challenges `alpha`, `alpha^2`, `alpha^4`, and so on, with `alpha` derived
     /// from the Merkle root of the round. That is equivalent to folding them once with arity `2^r`
     /// and challenge `alpha`.
+    ///
+    /// `transcript_hash` must be a hash of the transcript of the caller's protocol up to the FRI
+    /// commitment. The challenge of the first round is derived from it, and every subsequent
+    /// challenge from the previous one, so that every challenge is bound to the whole transcript.
+    /// The verifier must pass the same hash to [`Query::verify`].
     pub fn new(
         polynomial: Polynomial<F>,
         degree_bound: usize,
         blowup_log2: usize,
         fold_rate: usize,
         max_rounds: usize,
+        transcript_hash: H256,
     ) -> Self {
         assert!(degree_bound.is_power_of_two());
         assert!(degree_bound >= polynomial.degree_bound());
@@ -578,9 +605,11 @@ impl<F: Field256, H: Hasher<F>> Prover<F, H> {
         let mut values = polynomial.clone().lde2(n);
         let mut coefficients = polynomial.take();
         let mut trees = Vec::with_capacity(num_rounds);
+        let mut previous = transcript_hash;
         for _ in 0..num_rounds {
             let tree = Tree::new(values.as_slice());
-            let mut alpha = H::challenge(*FOLD_DST, &[tree.root_hash()]);
+            let mut alpha = folding_challenge::<F, H>(previous, tree.root_hash());
+            previous = encode_challenge(alpha);
             trees.push(tree);
             for _ in 0..fold_rate {
                 values = Self::fold(values.as_slice(), alpha);
@@ -665,6 +694,7 @@ impl<F: Field256, H: Hasher<F>> Prover<F, H> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MAX_FRI_ROUNDS;
     use crate::hash::{Keccak256Hash, Sha2Hash};
     use starkom_bluesky::Scalar as BS;
     use starkom_goldilocks::GL4;
@@ -674,6 +704,12 @@ mod tests {
     fn parse<V: FromStr<Err: Debug>>(s: &'static str) -> V {
         s.parse().unwrap()
     }
+
+    /// The transcript hash of the caller's protocol used in all tests.
+    const TRANSCRIPT_HASH: H256 = H256([0x5e; 32]);
+
+    /// A transcript hash other than [`TRANSCRIPT_HASH`].
+    const OTHER_TRANSCRIPT_HASH: H256 = H256([0x6f; 32]);
 
     /// Eight distinct evaluations to build trees from.
     fn sample_values() -> Vec<BS> {
@@ -757,10 +793,10 @@ mod tests {
 
     #[test]
     fn test_num_rounds_without_limit() {
-        test_num_rounds_impl(1, 1, usize::MAX, 0);
-        test_num_rounds_impl(8, 1, usize::MAX, 3);
-        test_num_rounds_impl(64, 3, usize::MAX, 2);
-        test_num_rounds_impl(16384, 3, usize::MAX, 4);
+        test_num_rounds_impl(1, 1, MAX_FRI_ROUNDS, 0);
+        test_num_rounds_impl(8, 1, MAX_FRI_ROUNDS, 3);
+        test_num_rounds_impl(64, 3, MAX_FRI_ROUNDS, 2);
+        test_num_rounds_impl(16384, 3, MAX_FRI_ROUNDS, 4);
     }
 
     #[test]
@@ -774,20 +810,20 @@ mod tests {
 
     #[test]
     fn test_num_rounds_with_rate_above_folds() {
-        test_num_rounds_impl(4, 3, usize::MAX, 0);
-        test_num_rounds_impl(128, 8, usize::MAX, 0);
+        test_num_rounds_impl(4, 3, MAX_FRI_ROUNDS, 0);
+        test_num_rounds_impl(128, 8, MAX_FRI_ROUNDS, 0);
     }
 
     #[test]
     #[should_panic]
     fn test_num_rounds_with_rate_0() {
-        num_rounds(8, 0, usize::MAX);
+        num_rounds(8, 0, MAX_FRI_ROUNDS);
     }
 
     #[test]
     #[should_panic]
     fn test_num_rounds_with_invalid_degree_bound() {
-        num_rounds(6, 1, usize::MAX);
+        num_rounds(6, 1, MAX_FRI_ROUNDS);
     }
 
     #[test]
@@ -848,6 +884,23 @@ mod tests {
         assert_eq!(
             *FOLD_DST,
             parse::<H256>("0x9ffd3556faeb2cae194ce95adf6b3580f590504daa0dea56966ce4ef233844af")
+        );
+    }
+
+    #[test]
+    fn test_folding_challenge() {
+        assert_eq!(
+            folding_challenge::<BS, Sha2Hash<BS>>(TRANSCRIPT_HASH, H256([0x12; 32])),
+            parse("0x3fe9cfa6c6c6f2a17e41964cd508555eab0299ae240f0fa8455072d8345b1545")
+        );
+    }
+
+    #[test]
+    fn test_chained_folding_challenge() {
+        let previous = folding_challenge::<BS, Sha2Hash<BS>>(TRANSCRIPT_HASH, H256([0x12; 32]));
+        assert_eq!(
+            folding_challenge::<BS, Sha2Hash<BS>>(encode_challenge(previous), H256([0x34; 32])),
+            parse("0x1edcc0a00dd45e162775dd35aa997b87f4783d982cf3471dc4ecb053cd4e551d")
         );
     }
 
@@ -1192,7 +1245,6 @@ mod tests {
     const DEGREE_BOUND: usize = 8;
     const BLOWUP_LOG2: usize = 2;
     const FOLD_RATE: usize = 1;
-    const MAX_ROUNDS: usize = usize::MAX;
     const QUERY_INDEX: usize = 3;
 
     /// Builds a polynomial from its coefficients.
@@ -1223,7 +1275,14 @@ mod tests {
         expected_roots: &[&'static str],
         expected_folded_polynomial: &[&'static str],
     ) {
-        let prover = Prover::<BS, H>::new(honest_polynomial(), 8, 2, fold_rate, max_rounds);
+        let prover = Prover::<BS, H>::new(
+            honest_polynomial(),
+            8,
+            2,
+            fold_rate,
+            max_rounds,
+            TRANSCRIPT_HASH,
+        );
         let commitment = prover.commit();
         assert_eq!(
             commitment.roots(),
@@ -1245,23 +1304,23 @@ mod tests {
     fn test_commitment_with_fold_rate_1() {
         test_commitment_impl::<Sha2Hash<BS>>(
             1,
-            usize::MAX,
+            MAX_FRI_ROUNDS,
             &[
                 "0x4dbf05b032faad3a0279e11536170c9dc6c2444b65bfda0917160a556b76ab5b",
-                "0x3beefd65cfe8506f9b499e8397100d6d695d97af5742e70b60100f056d55307b",
-                "0x7d5697dea024a95e3d383fdc569fb615fa391a96f710201c970bebe336476c9b",
+                "0x1788d451347692b604464d5b587f4595d2157fa2b68bfff3edd16cd20e551d15",
+                "0xd1e1970191b82722dd83378a1a1505efbb8aa6473f49889fa4e3f41347af4fd9",
             ],
-            &["0x498284459f1ebaa29b74fa6160113aff504a94794da2deb4190b7050842f686c"],
+            &["0x0f79f29029e7a601c624b51a64358961f23a971f2b21d73934f2ac4ea1371f00"],
         );
         test_commitment_impl::<Keccak256Hash<BS>>(
             1,
-            usize::MAX,
+            MAX_FRI_ROUNDS,
             &[
                 "0xf62fdcf4604e703d26974310d70bca5ef93f22d316f2083167b3bc4fd4437f8f",
-                "0x3e708444a31aed3a38ef8d8074873506efba437be058889e79b8499095e5eefd",
-                "0xbb62bc0c84acc6aa08f2bac9f342426dc3e9c284630031807c3f848f35b15dcc",
+                "0xd84d2cb88326e9a67bac0d64e5d974340869abc52ae0cbfea86c94a4201d2d6c",
+                "0x8720fa18457a7fafc42a2376bd1697b4dddf3368e586f6bb20d05f35a78c76ea",
             ],
-            &["0x5f39da2f621ee22a45dc105e400ff563f2c6ffaebfae9914734b7aa7f0b2df4f"],
+            &["0x6fa49a02abcfa3cdbe7130a06505d44f65afae20f79459693a78efff103e3382"],
         );
     }
 
@@ -1269,20 +1328,20 @@ mod tests {
     fn test_commitment_with_fold_rate_2() {
         test_commitment_impl::<Sha2Hash<BS>>(
             2,
-            usize::MAX,
+            MAX_FRI_ROUNDS,
             &["0x4dbf05b032faad3a0279e11536170c9dc6c2444b65bfda0917160a556b76ab5b"],
             &[
-                "0x223cdfe19f534f19b38372a42464ceb4a7136427c6140aa80ed3f34096d03266",
-                "0x478b9dab28cff46eae9d5fd746db792992acdb77600a7686a5f035cd9fca7712",
+                "0x246fb4756a2eba2fe7a4623d4a4e52bac8939a986f3734ee63477851547d9596",
+                "0x42699ccae500f23c84af2c9bb10b8aae4ffc879959336af31e5e00d4cd93d070",
             ],
         );
         test_commitment_impl::<Keccak256Hash<BS>>(
             2,
-            usize::MAX,
+            MAX_FRI_ROUNDS,
             &["0xf62fdcf4604e703d26974310d70bca5ef93f22d316f2083167b3bc4fd4437f8f"],
             &[
-                "0x34da8614b0f50cfe28a1e96719f05dc4dc18e7201e5dd32b93a2b782cf6ac201",
-                "0x3f55dd48fe5538bcc9f934e9a33f8bd484e3cd7d34744ac08f266d262146df7f",
+                "0x2e6ea18cfd4ab2138139fbf39ec4978c42b314b4a41ff6121feab18fd2093753",
+                "0x01f82fd8cbfaa9b558571e800a27619be8e61c24ac97d47e88ac7cb75a629ad0",
             ],
         );
     }
@@ -1291,15 +1350,15 @@ mod tests {
     fn test_commitment_with_fold_rate_3() {
         test_commitment_impl::<Sha2Hash<BS>>(
             3,
-            usize::MAX,
+            MAX_FRI_ROUNDS,
             &["0x4dbf05b032faad3a0279e11536170c9dc6c2444b65bfda0917160a556b76ab5b"],
-            &["0x3f2a2db74fbf3875efc75d2b0fc2a7fa6b3b3ba0c3774168548036effacefffd"],
+            &["0x0cba3f9693a5e4f0fd70ddc1ed1aa22c855e4ed659a40b2a675244e3a6f4758a"],
         );
         test_commitment_impl::<Keccak256Hash<BS>>(
             3,
-            usize::MAX,
+            MAX_FRI_ROUNDS,
             &["0xf62fdcf4604e703d26974310d70bca5ef93f22d316f2083167b3bc4fd4437f8f"],
-            &["0x77fcd1e8fad3d79dd58d54f22a33f97014ed1161713ceb7728d98e0f5aa11905"],
+            &["0x2d0c0af54cff1cf17017806fd621fcc1f38eb26edf53cec0dc26bda6b6b75149"],
         );
     }
 
@@ -1310,10 +1369,10 @@ mod tests {
             1,
             &["0x4dbf05b032faad3a0279e11536170c9dc6c2444b65bfda0917160a556b76ab5b"],
             &[
-                "0x5113579bb66be96da73beb99454bad6a8b372e4a8bee85cb896353fa3c4ceebd",
-                "0x480a0a00b13c1e9ffee51392c28ae94358b45d0a7c440f844013941ecdb4ca47",
-                "0x63d7d7b3e4bfd83ffbbfd520c4db3268388b6d9d511b00ad004b4d62c8695a86",
-                "0x2b084d50ea188d28bac1cb99b68fa4322681591974a01ac377a699af54fc8e7a",
+                "0x4fc43eeba3a8a8939570952f72f13bdc2ae7925c528aaae907a94a1b978922a5",
+                "0x6de836ca9b41881f6bc07b46fc83f0f27f62e681b440f6b96fde30e32f40a77e",
+                "0x7f55bf0b417232ef00e4504c19fb775a789862af4744a15eb81b80f3a20d2380",
+                "0x326910767e0b364112b742ae81ef101f606db142266d57bf7c88c45d2ef625a5",
             ],
         );
         test_commitment_impl::<Keccak256Hash<BS>>(
@@ -1321,10 +1380,10 @@ mod tests {
             1,
             &["0xf62fdcf4604e703d26974310d70bca5ef93f22d316f2083167b3bc4fd4437f8f"],
             &[
-                "0x1c7f11b5aab72663576b493b95048e8d6dc05332911790c251dcfcc295d40566",
-                "0x443b8e49b780a8b9ff2749fedb14685e1a6e9e9d83719729fcbe826adc61ed0e",
-                "0x066ee82f37eed7b7adf992c085b0f3e409fccd8c462f7374737a445fed2aa534",
-                "0x6e8b2584d2d8f9b54912366797f9d0a1179d01858dec9e008b0dd3b76a689771",
+                "0x691476cd933e6dad66b79cfcc7073b3594acf3c8f7aeeafdf5545e8631789c2e",
+                "0x122c4359a283fbbaf413b3381e62806cc5bca001b3784d9f1c04f101518ce1d8",
+                "0x6d47c7f649acdbe2be732775612c1552fa82fa78944d44c8ce3a63ddafcfdc8e",
+                "0x780bcb92e8c6e000207aa628f36c633e585df01bca0325315146d85cc9b3d0c2",
             ],
         );
     }
@@ -1336,11 +1395,12 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             FOLD_RATE,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
+            TRANSCRIPT_HASH,
         );
         assert_eq!(prover.degree_bound(), DEGREE_BOUND);
         assert_eq!(prover.fold_rate(), FOLD_RATE);
-        assert_eq!(prover.max_rounds(), MAX_ROUNDS);
+        assert_eq!(prover.max_rounds(), MAX_FRI_ROUNDS);
         assert_eq!(prover.extended_domain_size(), DEGREE_BOUND << BLOWUP_LOG2);
         assert_eq!(prover.size(), DEGREE_BOUND << BLOWUP_LOG2);
     }
@@ -1360,6 +1420,7 @@ mod tests {
             blowup_log2,
             fold_rate,
             max_rounds,
+            TRANSCRIPT_HASH,
         );
         let commitment = prover.commit();
         let n = degree_bound << blowup_log2;
@@ -1374,7 +1435,7 @@ mod tests {
             assert_eq!(query.len(), num_rounds);
             assert!(
                 query
-                    .verify(&commitment, polynomial.evaluate(query.x()))
+                    .verify(&commitment, TRANSCRIPT_HASH, polynomial.evaluate(query.x()))
                     .is_ok()
             );
         }
@@ -1432,7 +1493,7 @@ mod tests {
             degree_bound,
             blowup_log2,
             1,
-            usize::MAX,
+            MAX_FRI_ROUNDS,
             num_rounds,
         );
     }
@@ -1451,7 +1512,7 @@ mod tests {
             degree_bound,
             blowup_log2,
             fold_rate,
-            usize::MAX,
+            MAX_FRI_ROUNDS,
             num_rounds,
         );
     }
@@ -1616,10 +1677,11 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             FOLD_RATE,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
+            TRANSCRIPT_HASH,
         );
         let query = prover.query(QUERY_INDEX);
-        let result = query.verify(&prover.commit(), honest_value());
+        let result = query.verify(&prover.commit(), TRANSCRIPT_HASH, honest_value());
         assert!(result.is_ok());
     }
 
@@ -1630,12 +1692,35 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             FOLD_RATE,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
+            TRANSCRIPT_HASH,
         );
         let query = prover.query(QUERY_INDEX);
-        let foreign =
-            Prover::<BS, Sha2Hash<BS>>::new(foreign_polynomial(), 8, 2, 1, MAX_ROUNDS).commit();
-        let result = query.verify(&foreign, honest_value());
+        let foreign = Prover::<BS, Sha2Hash<BS>>::new(
+            foreign_polynomial(),
+            8,
+            2,
+            1,
+            MAX_FRI_ROUNDS,
+            TRANSCRIPT_HASH,
+        )
+        .commit();
+        let result = query.verify(&foreign, TRANSCRIPT_HASH, honest_value());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_other_transcript_hash() {
+        let prover = Prover::<BS, Sha2Hash<BS>>::new(
+            honest_polynomial(),
+            DEGREE_BOUND,
+            BLOWUP_LOG2,
+            FOLD_RATE,
+            MAX_FRI_ROUNDS,
+            TRANSCRIPT_HASH,
+        );
+        let query = prover.query(QUERY_INDEX);
+        let result = query.verify(&prover.commit(), OTHER_TRANSCRIPT_HASH, honest_value());
         assert!(result.is_err());
     }
 
@@ -1646,13 +1731,14 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             FOLD_RATE,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
+            TRANSCRIPT_HASH,
         );
         let mut commitment = prover.commit();
         commitment.roots[2] = H256::repeat_byte(0xAA);
         let result = prover
             .query(QUERY_INDEX)
-            .verify(&commitment, honest_value());
+            .verify(&commitment, TRANSCRIPT_HASH, honest_value());
         assert!(result.is_err());
     }
 
@@ -1663,12 +1749,13 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             FOLD_RATE,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
+            TRANSCRIPT_HASH,
         );
         let commitment = prover.commit();
         let mut query = prover.query(QUERY_INDEX);
         query.folds.truncate(2);
-        let result = query.verify(&commitment, honest_value());
+        let result = query.verify(&commitment, TRANSCRIPT_HASH, honest_value());
         assert!(result.is_err());
     }
 
@@ -1679,13 +1766,14 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             FOLD_RATE,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
+            TRANSCRIPT_HASH,
         );
         let mut commitment = prover.commit();
         commitment.roots.truncate(2);
         let result = prover
             .query(QUERY_INDEX)
-            .verify(&commitment, honest_value());
+            .verify(&commitment, TRANSCRIPT_HASH, honest_value());
         assert!(result.is_err());
     }
 
@@ -1696,13 +1784,14 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             FOLD_RATE,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
+            TRANSCRIPT_HASH,
         );
         let commitment = prover.commit();
         let mut query = prover.query(QUERY_INDEX);
         let mut donor = prover.query(QUERY_INDEX);
         query.folds.push(donor.folds.pop().unwrap());
-        let result = query.verify(&commitment, honest_value());
+        let result = query.verify(&commitment, TRANSCRIPT_HASH, honest_value());
         assert!(result.is_err());
     }
 
@@ -1713,13 +1802,14 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             FOLD_RATE,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
+            TRANSCRIPT_HASH,
         );
         let mut commitment = prover.commit();
         let mut query = prover.query(QUERY_INDEX);
         commitment.roots.truncate(2);
         query.folds.truncate(2);
-        let result = query.verify(&commitment, honest_value());
+        let result = query.verify(&commitment, TRANSCRIPT_HASH, honest_value());
         assert!(result.is_err());
     }
 
@@ -1730,7 +1820,8 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             FOLD_RATE,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
+            TRANSCRIPT_HASH,
         );
         let mut commitment = prover.commit();
         let mut coefficients = commitment.folded_polynomial.take();
@@ -1738,7 +1829,7 @@ mod tests {
         commitment.folded_polynomial = Polynomial::with_coefficients(coefficients);
         let result = prover
             .query(QUERY_INDEX)
-            .verify(&commitment, honest_value());
+            .verify(&commitment, TRANSCRIPT_HASH, honest_value());
         assert!(result.is_err());
     }
 
@@ -1749,7 +1840,8 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             FOLD_RATE,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
+            TRANSCRIPT_HASH,
         );
         let mut commitment = prover.commit();
         let mut coefficients = commitment.folded_polynomial.take();
@@ -1757,21 +1849,27 @@ mod tests {
         commitment.folded_polynomial = Polynomial::with_coefficients(coefficients);
         let result = prover
             .query(QUERY_INDEX)
-            .verify(&commitment, honest_value());
+            .verify(&commitment, TRANSCRIPT_HASH, honest_value());
         assert!(result.is_err());
     }
 
     #[test]
     fn test_reject_oversized_folded_polynomial_without_rounds() {
-        let prover =
-            Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2, 1, 0);
+        let prover = Prover::<BS, Sha2Hash<BS>>::new(
+            honest_polynomial(),
+            DEGREE_BOUND,
+            BLOWUP_LOG2,
+            1,
+            0,
+            TRANSCRIPT_HASH,
+        );
         let mut commitment = prover.commit();
         let mut coefficients = commitment.folded_polynomial.take();
         coefficients.push(BS::ZERO);
         commitment.folded_polynomial = Polynomial::with_coefficients(coefficients);
         let result = prover
             .query(QUERY_INDEX)
-            .verify(&commitment, honest_value());
+            .verify(&commitment, TRANSCRIPT_HASH, honest_value());
         assert!(result.is_err());
     }
 
@@ -1781,19 +1879,31 @@ mod tests {
         // coefficients of which only the first is non-zero. A shorter folded polynomial proves a
         // stronger degree bound.
         let polynomial = make_polynomial(&[12, 34]);
-        let prover =
-            Prover::<BS, Sha2Hash<BS>>::new(polynomial.clone(), DEGREE_BOUND, BLOWUP_LOG2, 1, 1);
+        let prover = Prover::<BS, Sha2Hash<BS>>::new(
+            polynomial.clone(),
+            DEGREE_BOUND,
+            BLOWUP_LOG2,
+            1,
+            1,
+            TRANSCRIPT_HASH,
+        );
         let mut commitment = prover.commit();
         commitment.folded_polynomial = commitment.folded_polynomial.clone().trim();
         let query = prover.query(QUERY_INDEX);
-        let result = query.verify(&commitment, polynomial.evaluate(query.x()));
+        let result = query.verify(&commitment, TRANSCRIPT_HASH, polynomial.evaluate(query.x()));
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_zero_rounds_folded_polynomial() {
-        let prover =
-            Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2, 1, 0);
+        let prover = Prover::<BS, Sha2Hash<BS>>::new(
+            honest_polynomial(),
+            DEGREE_BOUND,
+            BLOWUP_LOG2,
+            1,
+            0,
+            TRANSCRIPT_HASH,
+        );
         let commitment = prover.commit();
         assert_eq!(commitment.len(), 0);
         assert_eq!(
@@ -1809,13 +1919,14 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             FOLD_RATE,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
+            TRANSCRIPT_HASH,
         );
         let commitment = prover.commit();
         let mut query = prover.query(QUERY_INDEX);
         let mut donor = prover.query(QUERY_INDEX);
         query.folds[0] = donor.folds.remove(1);
-        let result = query.verify(&commitment, honest_value());
+        let result = query.verify(&commitment, TRANSCRIPT_HASH, honest_value());
         assert!(result.is_err());
     }
 
@@ -1826,21 +1937,28 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             FOLD_RATE,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
+            TRANSCRIPT_HASH,
         );
         let commitment = prover.commit();
         let query = prover.query(QUERY_INDEX);
-        let result = query.verify(&commitment, honest_value() + BS::ONE);
+        let result = query.verify(&commitment, TRANSCRIPT_HASH, honest_value() + BS::ONE);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_reject_wrong_value_without_rounds() {
-        let prover =
-            Prover::<BS, Sha2Hash<BS>>::new(honest_polynomial(), DEGREE_BOUND, BLOWUP_LOG2, 1, 0);
+        let prover = Prover::<BS, Sha2Hash<BS>>::new(
+            honest_polynomial(),
+            DEGREE_BOUND,
+            BLOWUP_LOG2,
+            1,
+            0,
+            TRANSCRIPT_HASH,
+        );
         let commitment = prover.commit();
         let query = prover.query(QUERY_INDEX);
-        let result = query.verify(&commitment, honest_value() + BS::ONE);
+        let result = query.verify(&commitment, TRANSCRIPT_HASH, honest_value() + BS::ONE);
         assert!(result.is_err());
     }
 
@@ -1851,12 +1969,13 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             FOLD_RATE,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
+            TRANSCRIPT_HASH,
         );
         let commitment = prover.commit();
         let mut query = prover.query(QUERY_INDEX);
         query.folds[0].coset.swap(0, 1);
-        let result = query.verify(&commitment, honest_value());
+        let result = query.verify(&commitment, TRANSCRIPT_HASH, honest_value());
         assert!(result.is_err());
     }
 
@@ -1867,12 +1986,13 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             FOLD_RATE,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
+            TRANSCRIPT_HASH,
         );
         let commitment = prover.commit();
         let mut query = prover.query(QUERY_INDEX);
         query.folds[1].coset[1] += BS::ONE;
-        let result = query.verify(&commitment, honest_value());
+        let result = query.verify(&commitment, TRANSCRIPT_HASH, honest_value());
         assert!(result.is_err());
     }
 
@@ -1883,13 +2003,14 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             FOLD_RATE,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
+            TRANSCRIPT_HASH,
         );
         let commitment = prover.commit();
         let mut query = prover.query(QUERY_INDEX);
         let mut other = prover.query(QUERY_INDEX + 4);
         query.folds[1] = other.folds.remove(1);
-        let result = query.verify(&commitment, honest_value());
+        let result = query.verify(&commitment, TRANSCRIPT_HASH, honest_value());
         assert!(result.is_err());
     }
 
@@ -1900,12 +2021,13 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             FOLD_RATE,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
+            TRANSCRIPT_HASH,
         );
         let commitment = prover.commit();
         let mut query = prover.query(QUERY_INDEX);
         query.folds[0].path.push(H256::zero());
-        let result = query.verify(&commitment, honest_value());
+        let result = query.verify(&commitment, TRANSCRIPT_HASH, honest_value());
         assert!(result.is_err());
     }
 
@@ -1916,7 +2038,8 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             FOLD_RATE,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
+            TRANSCRIPT_HASH,
         );
         let mut proto = prover.query(QUERY_INDEX).to_proto();
         proto.index = (QUERY_INDEX + (DEGREE_BOUND << BLOWUP_LOG2)) as u64;
@@ -1924,7 +2047,7 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             FOLD_RATE,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
             &proto,
         );
         assert!(result.is_err());
@@ -1937,7 +2060,8 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             FOLD_RATE,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
+            TRANSCRIPT_HASH,
         );
         let mut proto = prover.query(QUERY_INDEX).to_proto();
         proto.index = u64::MAX;
@@ -1945,7 +2069,7 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             FOLD_RATE,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
             &proto,
         );
         assert!(result.is_err());
@@ -1958,12 +2082,13 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             FOLD_RATE,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
+            TRANSCRIPT_HASH,
         );
         let commitment = prover.commit();
         let mut query = prover.query(QUERY_INDEX);
         query.folds[1].path.pop();
-        let result = query.verify(&commitment, honest_value());
+        let result = query.verify(&commitment, TRANSCRIPT_HASH, honest_value());
         assert!(result.is_err());
     }
 
@@ -1974,7 +2099,8 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             FOLD_RATE,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
+            TRANSCRIPT_HASH,
         );
         let mut proto = prover.query(QUERY_INDEX).to_proto();
         let modulus: primitive_types::U256 = BS::MODULUS.parse().unwrap();
@@ -1983,7 +2109,7 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             FOLD_RATE,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
             &proto,
         );
         assert!(result.is_err());
@@ -1996,7 +2122,8 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             FOLD_RATE,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
+            TRANSCRIPT_HASH,
         );
         let mut proto = prover.query(QUERY_INDEX).to_proto();
         proto.folds[2].coset_values.clear();
@@ -2004,7 +2131,7 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             FOLD_RATE,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
             &proto,
         );
         assert!(result.is_err());
@@ -2017,7 +2144,8 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             FOLD_RATE,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
+            TRANSCRIPT_HASH,
         );
         let mut proto = prover.query(QUERY_INDEX).to_proto();
         let coset_values = &mut proto.folds[0].coset_values;
@@ -2026,7 +2154,7 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             FOLD_RATE,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
             &proto,
         );
         assert!(result.is_err());
@@ -2039,7 +2167,8 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             FOLD_RATE,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
+            TRANSCRIPT_HASH,
         );
         let mut proto = prover.query(QUERY_INDEX).to_proto();
         proto.folds[1].coset_values[0].resize(33, 0);
@@ -2047,7 +2176,7 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             FOLD_RATE,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
             &proto,
         );
         assert!(result.is_err());
@@ -2060,7 +2189,8 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             FOLD_RATE,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
+            TRANSCRIPT_HASH,
         );
         let mut proto = prover.query(QUERY_INDEX).to_proto();
         let modulus: primitive_types::U256 = BS::MODULUS.parse().unwrap();
@@ -2069,7 +2199,7 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             FOLD_RATE,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
             &proto,
         );
         assert!(result.is_err());
@@ -2082,7 +2212,8 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             FOLD_RATE,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
+            TRANSCRIPT_HASH,
         );
         let mut proto = prover.query(QUERY_INDEX).to_proto();
         proto.folds[0].merkle_path[1].pop();
@@ -2090,7 +2221,7 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             FOLD_RATE,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
             &proto,
         );
         assert!(result.is_err());
@@ -2103,13 +2234,14 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             3,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
+            TRANSCRIPT_HASH,
         );
         let commitment = prover.commit();
         let mut query = prover.query(QUERY_INDEX);
         let proof = &mut query.folds[0];
         proof.coset[4] += BS::ONE;
-        let result = query.verify(&commitment, honest_value());
+        let result = query.verify(&commitment, TRANSCRIPT_HASH, honest_value());
         assert!(result.is_err());
     }
 
@@ -2120,12 +2252,13 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             3,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
+            TRANSCRIPT_HASH,
         );
         let commitment = prover.commit();
         let mut query = prover.query(QUERY_INDEX);
         query.folds[0].coset.swap(1, 2);
-        let result = query.verify(&commitment, honest_value());
+        let result = query.verify(&commitment, TRANSCRIPT_HASH, honest_value());
         assert!(result.is_err());
     }
 
@@ -2136,12 +2269,13 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             3,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
+            TRANSCRIPT_HASH,
         );
         let commitment = prover.commit();
         let mut query = prover.query(QUERY_INDEX);
         query.fold_rate = 2;
-        let result = query.verify(&commitment, honest_value());
+        let result = query.verify(&commitment, TRANSCRIPT_HASH, honest_value());
         assert!(result.is_err());
     }
 
@@ -2152,11 +2286,17 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             3,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
+            TRANSCRIPT_HASH,
         );
         let proto = prover.query(QUERY_INDEX).to_proto();
-        let result =
-            Query::<BS, Sha2Hash<BS>>::from_proto(DEGREE_BOUND, BLOWUP_LOG2, 1, MAX_ROUNDS, &proto);
+        let result = Query::<BS, Sha2Hash<BS>>::from_proto(
+            DEGREE_BOUND,
+            BLOWUP_LOG2,
+            1,
+            MAX_FRI_ROUNDS,
+            &proto,
+        );
         assert!(result.is_err());
     }
 
@@ -2167,11 +2307,17 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             FOLD_RATE,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
+            TRANSCRIPT_HASH,
         );
         let proto = prover.query(QUERY_INDEX).to_proto();
-        let result =
-            Query::<BS, Sha2Hash<BS>>::from_proto(DEGREE_BOUND, BLOWUP_LOG2, 3, MAX_ROUNDS, &proto);
+        let result = Query::<BS, Sha2Hash<BS>>::from_proto(
+            DEGREE_BOUND,
+            BLOWUP_LOG2,
+            3,
+            MAX_FRI_ROUNDS,
+            &proto,
+        );
         assert!(result.is_err());
     }
 
@@ -2182,14 +2328,15 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             3,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
+            TRANSCRIPT_HASH,
         );
         let query = prover.query(QUERY_INDEX);
         let decoded = Query::<BS, Sha2Hash<BS>>::from_proto(
             DEGREE_BOUND,
             BLOWUP_LOG2,
             3,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
             &query.to_proto(),
         )
         .unwrap();
@@ -2203,7 +2350,8 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             FOLD_RATE,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
+            TRANSCRIPT_HASH,
         );
         let commitment = prover.commit();
         let query = prover.query(QUERY_INDEX);
@@ -2211,13 +2359,17 @@ mod tests {
             DEGREE_BOUND,
             BLOWUP_LOG2,
             FOLD_RATE,
-            MAX_ROUNDS,
+            MAX_FRI_ROUNDS,
             &query.to_proto(),
         )
         .unwrap();
         assert_eq!(decoded.index(), query.index());
         assert_eq!(decoded.len(), query.len());
         assert_eq!(decoded.x(), query.x());
-        assert!(decoded.verify(&commitment, honest_value()).is_ok());
+        assert!(
+            decoded
+                .verify(&commitment, TRANSCRIPT_HASH, honest_value())
+                .is_ok()
+        );
     }
 }

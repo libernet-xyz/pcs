@@ -10,17 +10,20 @@ This crate contains Starkom's quantum-resistant polynomial commitment scheme, a 
 implementation that works with any field with sufficient 2-adicity.
 
 > [!NOTE]
-> This PCS is **not** perfectly zero-knowledge out of the box: even though all committed polynomials
-> are automatically shifted to a coset of the evaluation domain so that none of its Merkle queries
-> reveal any live domain locations, the queries can still leak enough information for an external
-> observer to interpolate the original polynomials.
+> This PCS is **not** perfectly zero-knowledge out of the box. Even though all committed polynomials
+> are automatically shifted to a coset of the evaluation domain, so that none of its Merkle queries
+> reveal any live domain locations, the FRI queries can still leak enough information for an
+> external observer to interpolate the original polynomials.
 >
 > To make it fully zero-knowledge you need to do the following.
 >
 > 1. Add at least [`num_queries`][num_queries] + T \* (num_opened_points + 1) uniformly random
 >    elements to every polynomial, where T is the [`EXTENSION_DEGREE`][extension-degree] of the
->    field you're using. Every query reveals one element of every polynomial, and every opened point
->    reveals T elements because it's in the 256-bit field. The remaining T elements add ~256 bits of
+>    field you're using. Compute `num_queries` from the options expected by the verifier, i.e. with
+>    the minimum number of grinding bits it accepts: provers can target more grinding bits (see
+>    [`Options::satisfies`][options-satisfies]), which means fewer queries, but never fewer grinding
+>    bits. Every query reveals one element of every polynomial, and every opened point reveals T
+>    elements because it's in the 256-bit field. The remaining T elements add ~256 bits of
 >    excess entropy: the Merkle roots and paths are deterministic hashes of all evaluations, so with
 >    less excess entropy an observer could guess a low-entropy polynomial and check the guess
 >    against them by brute force.
@@ -76,7 +79,8 @@ implemented in the most EVM-friendly possible way. Check out Starkom's [EVM veri
 [kb8]: https://docs.rs/starkom-koalabear/latest/starkom_koalabear/kb8/struct.Scalar.html
 [koalabear]: https://docs.rs/starkom-koalabear
 [num_queries]: https://docs.rs/starkom-pcs/latest/starkom_pcs/fn.num_queries.html
-[plonk-options-blind]: https://docs.rs/starkom-plonk/latest/starkom_plonk/struct.Options.html#structfield.blind
+[options-satisfies]: https://docs.rs/starkom-pcs/latest/starkom_pcs/struct.Options.html#method.satisfies
+[plonk-options-blind]: https://docs.rs/starkom-plonk/latest/starkom_plonk/struct.CircuitOptions.html#structfield.blind
 [proof-verify]: https://docs.rs/starkom-pcs/latest/starkom_pcs/struct.Proof.html#method.verify
 [schraderbrau]: https://docs.rs/starkom-schraderbrau
 [starkom-plonk]: https://docs.rs/starkom-plonk
