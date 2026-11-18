@@ -2,16 +2,16 @@ syntax = "proto3";
 
 import "google/protobuf/any.proto";
 
-package starkom.proto.pcs.v10;
+package starkom.proto.pcs.v11;
 
 // Identifier for the Starkom-provided SHA2-256 hash backend.
 //
-// The type URL of this message is `type.starkom.io/starkom.proto.pcs.v10.Sha2HashBackend`.
+// The type URL of this message is `type.starkom.io/starkom.proto.pcs.v11.Sha2HashBackend`.
 message Sha2HashBackend {}
 
 // Identifier for the Starkom-provided Keccak-256 hash backend.
 //
-// The type URL of this message is `type.starkom.io/starkom.proto.pcs.v10.KeccakHashBackend`.
+// The type URL of this message is `type.starkom.io/starkom.proto.pcs.v11.KeccakHashBackend`.
 message KeccakHashBackend {}
 
 // A batched DEEP-FRI polynomial commitment.
@@ -186,7 +186,7 @@ message Proof {
   // `log2(degree_bound) / fold_rate`, rounded down. Rather than being folded further, the
   // polynomial resulting from the last round is sent in the clear (see `folded_quotient`). With 0
   // there's no folding at all and the whole DEEP quotient is sent in the clear.
-  uint64 max_rounds = 6;
+  uint32 max_rounds = 6;
 
   // Number of grinding bits.
   //

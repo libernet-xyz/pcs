@@ -1,7 +1,7 @@
 use crate::fri;
 use crate::hash::Hasher;
 use crate::merkle::{Proof as LeafProof, Tree};
-use crate::starkom::proto::pcs::v10 as proto;
+use crate::starkom::proto::pcs::v11 as proto;
 use crate::utils;
 use anyhow::{Result, anyhow};
 use primitive_types::{H256, U256};
@@ -15,6 +15,13 @@ use std::sync::LazyLock;
 /// The number of bits of a proof-of-work hash, which is also the most leading zero bits it can
 /// have.
 pub const PROOF_OF_WORK_BITS: usize = 256;
+
+/// The largest valid value of [`Options::max_rounds`], which is also the value to use for no limit
+/// on the number of FRI rounds.
+///
+/// It's `2^32 - 1` on every platform, so that the same options are valid everywhere, e.g. on 64-bit
+/// platforms and on `wasm32` alike, even though `usize` has different sizes.
+pub const MAX_FRI_ROUNDS: usize = u32::MAX as usize;
 
 /// Domain separator tag used by [`Committer::transcript_hash`].
 static TRANSCRIPT_DST: LazyLock<H256> =
@@ -100,7 +107,8 @@ pub struct Options {
     /// Every round costs a Merkle proof per query, while every coefficient of the folded quotient
     /// is sent only once, so the optimum stops folding when the number of coefficients is roughly
     /// comparable to the number of queries times the size of a round's Merkle proof (a few hundred
-    /// coefficients in practice). Any value is valid.
+    /// coefficients in practice). Must be at most [`MAX_FRI_ROUNDS`], which also stands for no
+    /// limit (see [`Self::validate`]).
     pub max_rounds: usize,
 
     /// The number of grinding bits.
@@ -162,8 +170,8 @@ impl Options {
     ///
     /// The degree bound must be a power of 2, `blowup_log2` and `fold_rate` must be greater than 0,
     /// the size of the extended evaluation domain must not exceed the 2-adicity of `F::BaseField`,
-    /// and `grinding_bits` must not exceed [`PROOF_OF_WORK_BITS`]. `security_bits` and `max_rounds`
-    /// can have any value.
+    /// `max_rounds` must not exceed [`MAX_FRI_ROUNDS`], and `grinding_bits` must not exceed
+    /// [`PROOF_OF_WORK_BITS`]. `security_bits` can have any value.
     pub fn validate<F: Field>(&self) -> Result<()> {
         if !self.degree_bound.is_power_of_two() {
             return Err(anyhow!(
@@ -184,6 +192,12 @@ impl Options {
                 degree_bound_log2,
                 self.blowup_log2,
                 F::BaseField::S
+            ));
+        }
+        if self.max_rounds > MAX_FRI_ROUNDS {
+            return Err(anyhow!(
+                "invalid maximum number of rounds {} (exceeds {MAX_FRI_ROUNDS})",
+                self.max_rounds
             ));
         }
         if self.grinding_bits > PROOF_OF_WORK_BITS {
@@ -972,7 +986,7 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
             security_bits: self.options.security_bits as u32,
             blowup_log2: self.options.blowup_log2 as u32,
             fold_rate: self.options.fold_rate as u32,
-            max_rounds: self.options.max_rounds as u64,
+            max_rounds: self.options.max_rounds as u32,
             grinding_bits: self.options.grinding_bits as u32,
             nonce: self.nonce,
             points: self
@@ -1292,7 +1306,7 @@ mod tests {
         security_bits: 128,
         blowup_log2: 2,
         fold_rate: 1,
-        max_rounds: usize::MAX,
+        max_rounds: MAX_FRI_ROUNDS,
         grinding_bits: 0,
     };
 
@@ -1460,7 +1474,7 @@ mod tests {
             security_bits: 128,
             blowup_log2: 6,
             fold_rate: 1,
-            max_rounds: usize::MAX,
+            max_rounds: MAX_FRI_ROUNDS,
             grinding_bits: 20,
         };
         assert_eq!(options.extended_domain_size(), 1 << 18);
@@ -1473,7 +1487,7 @@ mod tests {
             security_bits: 128,
             blowup_log2: 6,
             fold_rate: 1,
-            max_rounds: usize::MAX,
+            max_rounds: MAX_FRI_ROUNDS,
             grinding_bits: 0,
         };
         assert_eq!(options.num_queries(), 22);
@@ -1486,7 +1500,7 @@ mod tests {
             security_bits: 128,
             blowup_log2: 6,
             fold_rate: 1,
-            max_rounds: usize::MAX,
+            max_rounds: MAX_FRI_ROUNDS,
             grinding_bits: 20,
         };
         assert_eq!(options.num_queries(), 18);
@@ -1498,7 +1512,7 @@ mod tests {
             security_bits,
             blowup_log2: 6,
             fold_rate: 1,
-            max_rounds: usize::MAX,
+            max_rounds: MAX_FRI_ROUNDS,
             grinding_bits,
         };
         assert_eq!(options.num_queries(), expected);
@@ -1531,12 +1545,12 @@ mod tests {
 
     #[test]
     fn test_options_num_rounds() {
-        test_options_num_rounds_impl(1, 3, usize::MAX, 0);
-        test_options_num_rounds_impl(4096, 1, usize::MAX, 12);
-        test_options_num_rounds_impl(4096, 3, usize::MAX, 4);
-        test_options_num_rounds_impl(4096, 5, usize::MAX, 2);
-        test_options_num_rounds_impl(4096, 12, usize::MAX, 1);
-        test_options_num_rounds_impl(4096, 20, usize::MAX, 0);
+        test_options_num_rounds_impl(1, 3, MAX_FRI_ROUNDS, 0);
+        test_options_num_rounds_impl(4096, 1, MAX_FRI_ROUNDS, 12);
+        test_options_num_rounds_impl(4096, 3, MAX_FRI_ROUNDS, 4);
+        test_options_num_rounds_impl(4096, 5, MAX_FRI_ROUNDS, 2);
+        test_options_num_rounds_impl(4096, 12, MAX_FRI_ROUNDS, 1);
+        test_options_num_rounds_impl(4096, 20, MAX_FRI_ROUNDS, 0);
     }
 
     #[test]
@@ -1558,7 +1572,7 @@ mod tests {
             security_bits: 128,
             blowup_log2,
             fold_rate,
-            max_rounds: usize::MAX,
+            max_rounds: MAX_FRI_ROUNDS,
             grinding_bits,
         };
         let result = options.validate::<F>();
@@ -1576,7 +1590,7 @@ mod tests {
             security_bits: 128,
             blowup_log2,
             fold_rate,
-            max_rounds: usize::MAX,
+            max_rounds: MAX_FRI_ROUNDS,
             grinding_bits,
         };
         let result = options.validate::<F>();
@@ -1637,6 +1651,28 @@ mod tests {
     fn test_options_with_zero_fold_rate() {
         test_invalid_options_impl::<BS>(4, 2, 0, 0);
         test_invalid_options_impl::<GL4>(4, 2, 0, 0);
+    }
+
+    #[test]
+    fn test_options_with_largest_max_rounds() {
+        let options = Options {
+            max_rounds: MAX_FRI_ROUNDS,
+            ..OPTIONS
+        };
+        let result = options.validate::<BS>();
+        assert!(result.is_ok());
+    }
+
+    // `MAX_FRI_ROUNDS` is `usize::MAX` on 32-bit platforms, where no larger value exists.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn test_options_with_too_many_max_rounds() {
+        let options = Options {
+            max_rounds: MAX_FRI_ROUNDS + 1,
+            ..OPTIONS
+        };
+        let result = options.validate::<BS>();
+        assert!(result.is_err());
     }
 
     #[test]
@@ -1851,7 +1887,7 @@ mod tests {
             security_bits: 128,
             blowup_log2: 4,
             fold_rate: 1,
-            max_rounds: usize::MAX,
+            max_rounds: MAX_FRI_ROUNDS,
             grinding_bits: 104,
         };
         let indices = get_query_indices::<BS, Sha2Hash<BS>>(H256::repeat_byte(0x34), &options);
@@ -1977,7 +2013,7 @@ mod tests {
             security_bits: 128,
             blowup_log2: 2,
             fold_rate: 1,
-            max_rounds: usize::MAX,
+            max_rounds: MAX_FRI_ROUNDS,
             grinding_bits: 0,
         });
     }
@@ -2766,7 +2802,7 @@ mod tests {
                 security_bits: 128,
                 blowup_log2: 1,
                 fold_rate: 1,
-                max_rounds: usize::MAX,
+                max_rounds: MAX_FRI_ROUNDS,
                 grinding_bits: 0,
             },
         );
@@ -2790,7 +2826,7 @@ mod tests {
                 security_bits: 128,
                 blowup_log2: 3,
                 fold_rate: 1,
-                max_rounds: usize::MAX,
+                max_rounds: MAX_FRI_ROUNDS,
                 grinding_bits: 0,
             },
         );
@@ -3289,7 +3325,7 @@ mod tests {
         assert_eq!(proto.security_bits, 128);
         assert_eq!(proto.blowup_log2, 2);
         assert_eq!(proto.fold_rate, 1);
-        assert_eq!(proto.max_rounds, u64::MAX);
+        assert_eq!(proto.max_rounds, u32::MAX);
         assert_eq!(proto.grinding_bits, 8);
         assert_eq!(proto.nonce, 204);
         assert_eq!(
@@ -3498,6 +3534,15 @@ mod tests {
         proto.grinding_bits = u32::MAX;
         let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_largest_max_rounds_from_proto() {
+        let (_, proof) = sample_proof(OPTIONS);
+        let mut proto = proof.to_proto();
+        proto.max_rounds = u32::MAX;
+        let decoded = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
+        assert_eq!(decoded.options().max_rounds, MAX_FRI_ROUNDS);
     }
 
     #[test]
