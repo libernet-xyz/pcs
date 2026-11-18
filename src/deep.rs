@@ -3,7 +3,7 @@ use crate::hash::Hasher;
 use crate::merkle::{Proof as LeafProof, Tree};
 use crate::starkom::proto::pcs::v11 as proto;
 use crate::utils;
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use primitive_types::{H256, U256};
 use prost_types::Any;
 use starkom_ff::{Field, Field256};
@@ -165,9 +165,10 @@ impl Options {
     /// Checks that these options are valid for the field `F`, returning an error otherwise.
     ///
     /// The degree bound must be a power of 2, `blowup_log2` and `fold_rate` must be greater than 0,
-    /// the size of the extended evaluation domain must not exceed the 2-adicity of `F::BaseField`,
-    /// `max_rounds` must not exceed [`MAX_FRI_ROUNDS`], and `grinding_bits` must not exceed
-    /// [`PROOF_OF_WORK_BITS`]. `security_bits` can have any value.
+    /// the size of the extended evaluation domain must not exceed the 2-adicity of `F::BaseField`
+    /// and must fit in a `usize` (so it's less than 2^32 on 32-bit platforms), `max_rounds` must
+    /// not exceed [`MAX_FRI_ROUNDS`], and `grinding_bits` must not exceed [`PROOF_OF_WORK_BITS`].
+    /// `security_bits` can have any value.
     pub fn validate<F: Field>(&self) -> Result<()> {
         if !self.degree_bound.is_power_of_two() {
             return Err(anyhow!(
@@ -182,7 +183,10 @@ impl Options {
             return Err(anyhow!("invalid fold rate 0"));
         }
         let degree_bound_log2 = self.degree_bound.trailing_zeros() as usize;
-        if degree_bound_log2 + self.blowup_log2 > F::BaseField::S {
+        let domain_size_log2 = degree_bound_log2
+            .checked_add(self.blowup_log2)
+            .context("invalid extended domain size (too large on this platform)")?;
+        if domain_size_log2 > F::BaseField::S {
             return Err(anyhow!(
                 "invalid extended domain size 2^{{{}+{}}} (exceeds the 2-adicity of the field, {})",
                 degree_bound_log2,
@@ -1064,7 +1068,7 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
         check_hash_backend::<H::ProtoTag>(&proto.hash_backend)?;
 
         let options = Options {
-            degree_bound: proto.degree_bound as usize,
+            degree_bound: usize::try_from(proto.degree_bound)?,
             security_bits: proto.security_bits as usize,
             blowup_log2: proto.blowup_log2 as usize,
             fold_rate: proto.fold_rate as usize,
@@ -1679,6 +1683,20 @@ mod tests {
     fn test_options_with_oversized_domain() {
         test_invalid_options_impl::<BS>(1 << 60, 3, 1, 0);
         test_invalid_options_impl::<GL4>(1 << 30, 3, 1, 0);
+    }
+
+    /// The size of the extended domain would overflow without saturation.
+    #[test]
+    fn test_options_with_huge_blowup() {
+        test_invalid_options_impl::<BS>(4, usize::MAX, 1, 0);
+        test_invalid_options_impl::<GL4>(4, usize::MAX, 1, 0);
+    }
+
+    /// The 2-adicity of BlueSky allows the extended domain, but it doesn't fit in a 32-bit `usize`.
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn test_options_with_domain_exceeding_usize() {
+        test_invalid_options_impl::<BS>(1 << 30, 2, 1, 0);
     }
 
     #[test]
@@ -3808,6 +3826,36 @@ mod tests {
         proto.blowup_log2 = 64;
         let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto);
         assert!(result.is_err());
+    }
+
+    /// The size of the extended domain would overflow on 32-bit platforms without saturation.
+    #[test]
+    fn test_reject_huge_blowup_in_proto() {
+        let (_, proof) = sample_proof(OPTIONS);
+        let mut proto = proof.to_proto();
+        proto.blowup_log2 = u32::MAX;
+        let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto);
+        assert!(result.is_err());
+    }
+
+    fn test_reject_degree_bound_in_proto_impl(degree_bound: u64) {
+        let (_, proof) = sample_proof(OPTIONS);
+        let mut proto = proof.to_proto();
+        proto.degree_bound = degree_bound;
+        let result = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto);
+        assert!(result.is_err());
+    }
+
+    /// Both would be truncated to the honest degree bound, 4, on 32-bit platforms.
+    #[test]
+    fn test_reject_degree_bound_truncated_on_32_bit_platforms() {
+        test_reject_degree_bound_in_proto_impl((1 << 32) + 4);
+        test_reject_degree_bound_in_proto_impl((1 << 40) + 4);
+    }
+
+    #[test]
+    fn test_reject_huge_degree_bound_in_proto() {
+        test_reject_degree_bound_in_proto_impl(u64::MAX);
     }
 
     #[test]
