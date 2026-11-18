@@ -147,23 +147,27 @@ impl Options {
         fri::num_rounds(self.degree_bound, self.fold_rate, self.max_rounds)
     }
 
-    /// Returns true iff these options are acceptable to a verifier that expects `other`: the
-    /// security level and the number of grinding bits must be greater than or equal to the expected
-    /// ones, and all other parameters must be equal.
+    /// Returns true iff these options, typically those of a proof, are acceptable to a verifier
+    /// that expects `other`.
     ///
-    /// The number of queries is derived from both (see [`num_queries`]), so a proof with a higher
-    /// security level than expected is at least as sound. Soundness doesn't depend on the number of
-    /// grinding bits, but more grinding bits mean fewer queries, so a proof with more grinding bits
-    /// than expected is never more expensive to verify.
+    /// The degree bound, the security level, and the blowup factor must be equal to the expected
+    /// ones, the number of grinding bits must be greater than or equal to the expected one, and the
+    /// fold rate and the maximum number of rounds can have any value.
+    ///
+    /// The expected number of grinding bits is the minimum difficulty required by the verifier,
+    /// while the number of grinding bits of a proof is the difficulty targeted by its prover. The
+    /// proof of work must reach the target, and every `blowup_log2` bits of grinding above the
+    /// minimum save a query (see [`num_queries`]), so provers can trade grinding for smaller
+    /// proofs. A higher security level, on the other hand, would only mean more queries, which
+    /// would reveal more evaluations of the committed polynomials than their blinding might cover
+    /// (see the zero-knowledge notes in the crate documentation), so it must be exact. The fold
+    /// rate and the maximum number of rounds only affect the size of the proof and the cost of
+    /// verifying it, so provers can choose them freely.
     pub fn satisfies(&self, other: &Self) -> bool {
-        self.security_bits >= other.security_bits
+        self.degree_bound == other.degree_bound
+            && self.security_bits == other.security_bits
+            && self.blowup_log2 == other.blowup_log2
             && self.grinding_bits >= other.grinding_bits
-            && Self {
-                security_bits: other.security_bits,
-                grinding_bits: other.grinding_bits,
-                ..*self
-            }
-            .eq(other)
     }
 
     /// Checks that these options are valid for the field `F`, returning an error otherwise.
@@ -272,22 +276,39 @@ fn rlc<F: Field>(values: impl IntoIterator<Item = F>, alpha: F) -> F {
     rlc
 }
 
-/// Encodes the transcript of the DEEP layer, that is all Merkle roots of the committed polynomials,
-/// all opened points, and their claimed evaluations.
+/// Encodes the transcript of the DEEP layer, that is the protocol parameters, all Merkle roots of
+/// the committed polynomials, all opened points, and their claimed evaluations.
+///
+/// The parameters come first, in the order of the fields of [`Options`]. They're those declared by
+/// the proof, which the verifier checks against the expected ones separately (see
+/// [`Options::satisfies`]). Binding them prevents a prover from changing them after seeing the
+/// challenges: e.g. declaring a number of grinding bits that matches the proof of work it found, or
+/// choosing the FRI settings that suit the query indices.
 fn deep_transcript<F: Field256>(
+    options: &Options,
     tree_roots: &[H256],
     num_polys: usize,
     points: &BTreeMap<F, Vec<F>>,
 ) -> impl Iterator<Item = H256> {
-    std::iter::once(utils::encode_usize(tree_roots.len()))
-        .chain(tree_roots.iter().copied())
-        .chain(std::iter::once(utils::encode_usize(num_polys)))
-        .chain(std::iter::once(utils::encode_usize(points.len())))
-        .chain(points.iter().flat_map(|(z, values)| {
-            std::iter::once(z)
-                .chain(values.iter())
-                .map(|value| H256::from_slice(&value.to_be_bytes()))
-        }))
+    [
+        options.degree_bound,
+        options.security_bits,
+        options.blowup_log2,
+        options.fold_rate,
+        options.max_rounds,
+        options.grinding_bits,
+    ]
+    .into_iter()
+    .map(utils::encode_usize)
+    .chain(std::iter::once(utils::encode_usize(tree_roots.len())))
+    .chain(tree_roots.iter().copied())
+    .chain(std::iter::once(utils::encode_usize(num_polys)))
+    .chain(std::iter::once(utils::encode_usize(points.len())))
+    .chain(points.iter().flat_map(|(z, values)| {
+        std::iter::once(z)
+            .chain(values.iter())
+            .map(|value| H256::from_slice(&value.to_be_bytes()))
+    }))
 }
 
 /// Derives the two Fiat-Shamir challenges of the DEEP layer.
@@ -296,27 +317,30 @@ fn deep_transcript<F: Field256>(
 /// polynomials, while the second one uses [`QUOTIENT_DST`] and is used to combine all DEEP
 /// quotients.
 ///
-/// Both challenges are bound to all Merkle roots of the committed polynomials and to all opened
-/// points and their claimed evaluations.
+/// Both challenges are bound to the protocol parameters, to all Merkle roots of the committed
+/// polynomials, and to all opened points and their claimed evaluations (see [`deep_transcript`]).
 fn deep_challenges<F: Field256, H: Hasher<F>>(
+    options: &Options,
     tree_roots: &[H256],
     num_polys: usize,
     points: &BTreeMap<F, Vec<F>>,
 ) -> (F, F) {
-    let transcript: Vec<H256> = deep_transcript(tree_roots, num_polys, points).collect();
+    let transcript: Vec<H256> = deep_transcript(options, tree_roots, num_polys, points).collect();
     (
         H::challenge(*RLC_DST, transcript.as_slice()),
         H::challenge(*QUOTIENT_DST, transcript.as_slice()),
     )
 }
 
-/// Hashes the full transcript of a proof up to the queries: all Merkle roots of the committed
-/// polynomials, all opened points and their claimed evaluations, all FRI roots, and the
-/// coefficients of the folded quotient.
+/// Hashes the full transcript of a proof up to the queries: the protocol parameters, all Merkle
+/// roots of the committed polynomials, all opened points and their claimed evaluations (see
+/// [`deep_transcript`]), all FRI roots, and the coefficients of the folded quotient.
 ///
 /// The returned seed is the input of the proof of work, which in turn determines the FRI query
-/// indices (see [`get_query_indices`]).
+/// indices (see [`get_query_indices`]). Since the seed binds the number of grinding bits, the
+/// prover commits to its grinding target before searching for a nonce.
 fn query_seed<F: Field256, H: Hasher<F>>(
+    options: &Options,
     tree_roots: &[H256],
     num_polys: usize,
     points: &BTreeMap<F, Vec<F>>,
@@ -325,7 +349,7 @@ fn query_seed<F: Field256, H: Hasher<F>>(
     let folded_quotient = fri_commitment.folded_polynomial();
     H::hash_transcript(
         *QUERY_DST0,
-        deep_transcript(tree_roots, num_polys, points)
+        deep_transcript(options, tree_roots, num_polys, points)
             .chain(std::iter::once(utils::encode_usize(fri_commitment.len())))
             .chain(fri_commitment.roots().iter().copied())
             .chain(std::iter::once(utils::encode_usize(folded_quotient.len())))
@@ -814,9 +838,10 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
     ///
     /// Callers must check them against the expected ones, typically with [`Options::satisfies`].
     /// In particular the security level is chosen by the prover, so a proof that isn't checked can
-    /// have as few as one query. Soundness doesn't depend on the number of grinding bits because
-    /// the number of queries is automatically derived from it, but it should still be checked
-    /// along with the other parameters.
+    /// have as few as one query. The number of grinding bits is the prover's target: the number of
+    /// queries is derived from it and the proof of work must reach it, and since all the parameters
+    /// are bound into the Fiat-Shamir transcript the prover commits to them before grinding, so a
+    /// higher target than the expected one is as sound.
     pub fn options(&self) -> &Options {
         &self.options
     }
@@ -882,8 +907,6 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
             }
         }
 
-        // The number of queries must be checked before deriving the query indices, so that the work
-        // of deriving them is bounded by the size of the proof even if its security level is huge.
         let num_queries = self.options.num_queries();
         if self.openings.len() != num_queries {
             return Err(anyhow!(
@@ -902,6 +925,7 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
 
         let tree_roots = commitment.tree_roots();
         let seed = query_seed::<F, H>(
+            &self.options,
             tree_roots.as_slice(),
             num_polys,
             &self.points,
@@ -913,7 +937,12 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
         }
         let indices = get_query_indices::<F, H>(pow, &self.options);
 
-        let (alpha, beta) = deep_challenges::<F, H>(tree_roots.as_slice(), num_polys, &self.points);
+        let (alpha, beta) = deep_challenges::<F, H>(
+            &self.options,
+            tree_roots.as_slice(),
+            num_polys,
+            &self.points,
+        );
 
         for ((query, openings), &expected_index) in
             (self.queries.iter().zip(self.openings.iter())).zip(indices.iter())
@@ -1182,7 +1211,8 @@ impl<F: Field256, H: Hasher<F>> Prover<F, H> {
             .collect();
 
         let tree_roots: Vec<H256> = self.batches.iter().map(Batch::root_hash).collect();
-        let (alpha, beta) = deep_challenges::<F, H>(tree_roots.as_slice(), num_polys, &points);
+        let (alpha, beta) =
+            deep_challenges::<F, H>(&self.options, tree_roots.as_slice(), num_polys, &points);
 
         let combined = Batch::combine(&self.batches, alpha);
 
@@ -1208,7 +1238,13 @@ impl<F: Field256, H: Hasher<F>> Prover<F, H> {
         );
         let fri_commitment = fri_prover.commit();
 
-        let seed = query_seed::<F, H>(tree_roots.as_slice(), num_polys, &points, &fri_commitment);
+        let seed = query_seed::<F, H>(
+            &self.options,
+            tree_roots.as_slice(),
+            num_polys,
+            &points,
+            &fri_commitment,
+        );
         let (nonce, pow) = self.grind_nonce(seed);
         let indices = get_query_indices::<F, H>(pow, &self.options);
         let openings = indices
@@ -1359,6 +1395,7 @@ mod tests {
         valid: bool,
     ) -> u64 {
         let seed = query_seed::<BS, Sha2Hash<BS>>(
+            &proof.options,
             commitment.tree_roots().as_slice(),
             commitment.num_polys(),
             &proof.points,
@@ -1735,12 +1772,12 @@ mod tests {
     }
 
     #[test]
-    fn test_options_with_higher_security_level_satisfy() {
+    fn test_options_with_higher_security_level_dont_satisfy() {
         let options = Options {
             security_bits: 256,
             ..EXPECTED_OPTIONS
         };
-        assert!(options.satisfies(&EXPECTED_OPTIONS));
+        assert!(!options.satisfies(&EXPECTED_OPTIONS));
     }
 
     #[test]
@@ -1753,15 +1790,16 @@ mod tests {
     }
 
     #[test]
-    fn test_options_with_higher_security_level_and_fewer_grinding_bits_dont_satisfy() {
+    fn test_options_with_higher_security_level_and_more_grinding_bits_dont_satisfy() {
         let options = Options {
             security_bits: 256,
-            grinding_bits: 19,
+            grinding_bits: 21,
             ..EXPECTED_OPTIONS
         };
         assert!(!options.satisfies(&EXPECTED_OPTIONS));
     }
 
+    /// Checks that `options` don't satisfy [`EXPECTED_OPTIONS`], even with more grinding bits.
     fn test_options_dont_satisfy_impl(options: Options) {
         assert!(!options.satisfies(&EXPECTED_OPTIONS));
         assert!(
@@ -1771,9 +1809,14 @@ mod tests {
             }
             .satisfies(&EXPECTED_OPTIONS)
         );
+    }
+
+    /// Checks that `options` satisfy [`EXPECTED_OPTIONS`], also with more grinding bits.
+    fn test_options_satisfy_impl(options: Options) {
+        assert!(options.satisfies(&EXPECTED_OPTIONS));
         assert!(
-            !Options {
-                security_bits: 256,
+            Options {
+                grinding_bits: 21,
                 ..options
             }
             .satisfies(&EXPECTED_OPTIONS)
@@ -1805,25 +1848,38 @@ mod tests {
     }
 
     #[test]
-    fn test_options_with_different_fold_rate_dont_satisfy() {
-        test_options_dont_satisfy_impl(Options {
-            fold_rate: 2,
+    fn test_options_with_different_fold_rate_satisfy() {
+        test_options_satisfy_impl(Options {
+            fold_rate: 1,
             ..EXPECTED_OPTIONS
         });
-        test_options_dont_satisfy_impl(Options {
+        test_options_satisfy_impl(Options {
             fold_rate: 4,
             ..EXPECTED_OPTIONS
         });
     }
 
     #[test]
-    fn test_options_with_different_max_rounds_dont_satisfy() {
-        test_options_dont_satisfy_impl(Options {
-            max_rounds: 1,
+    fn test_options_with_different_max_rounds_satisfy() {
+        test_options_satisfy_impl(Options {
+            max_rounds: 0,
             ..EXPECTED_OPTIONS
         });
-        test_options_dont_satisfy_impl(Options {
+        test_options_satisfy_impl(Options {
             max_rounds: 3,
+            ..EXPECTED_OPTIONS
+        });
+        test_options_satisfy_impl(Options {
+            max_rounds: MAX_FRI_ROUNDS,
+            ..EXPECTED_OPTIONS
+        });
+    }
+
+    #[test]
+    fn test_options_with_different_fold_rate_and_max_rounds_satisfy() {
+        test_options_satisfy_impl(Options {
+            fold_rate: 2,
+            max_rounds: 6,
             ..EXPECTED_OPTIONS
         });
     }
@@ -1921,6 +1977,16 @@ mod tests {
         assert_eq!(result, BS::ZERO);
     }
 
+    /// The protocol parameters used to test the Fiat-Shamir transcript.
+    const TRANSCRIPT_OPTIONS: Options = Options {
+        degree_bound: 4,
+        security_bits: 128,
+        blowup_log2: 2,
+        fold_rate: 1,
+        max_rounds: 1,
+        grinding_bits: 8,
+    };
+
     /// The Merkle roots of the committed polynomials used to test the Fiat-Shamir transcript.
     fn transcript_tree_roots() -> [H256; 2] {
         [H256::repeat_byte(0x56), H256::repeat_byte(0x78)]
@@ -1952,21 +2018,26 @@ mod tests {
 
     #[test]
     fn test_deep_challenges() {
-        let (alpha, beta) =
-            deep_challenges::<BS, Sha2Hash<BS>>(&transcript_tree_roots(), 3, &transcript_points());
+        let (alpha, beta) = deep_challenges::<BS, Sha2Hash<BS>>(
+            &TRANSCRIPT_OPTIONS,
+            &transcript_tree_roots(),
+            3,
+            &transcript_points(),
+        );
         assert_eq!(
             alpha,
-            parse("0x097f51584f3018cfb58caa2989196f63076af96bff20325da17bf923ef269335")
+            parse("0x243dd98505084f06fd875df85a4e5ac05d8a11bc902de34df348450a0ec0b5df")
         );
         assert_eq!(
             beta,
-            parse("0x152a37a010a775d0c161debac79b64a26f915125a5e1fff14b875fc51d9301f7")
+            parse("0x18dd843cc2e3b8c7b8a4a95564c1a4ffbe859311199fa6eb90dfcac60d6e0cbf")
         );
     }
 
     #[test]
     fn test_query_seed() {
         let seed = query_seed::<BS, Sha2Hash<BS>>(
+            &TRANSCRIPT_OPTIONS,
             &transcript_tree_roots(),
             3,
             &transcript_points(),
@@ -1974,8 +2045,86 @@ mod tests {
         );
         assert_eq!(
             seed,
-            parse("0xc3749a4732349eda6ce66d199ac4fa709842b54fa6e99c88ed80fb2d75f411c5")
+            parse("0xaf36070d70665854c2cc836979578c0f06368b82d4dbd001b7442790fb57478e")
         );
+    }
+
+    /// Every field of the protocol parameters that differs from [`TRANSCRIPT_OPTIONS`] in one of
+    /// these options.
+    const OTHER_TRANSCRIPT_OPTIONS: [Options; 6] = [
+        Options {
+            degree_bound: 8,
+            ..TRANSCRIPT_OPTIONS
+        },
+        Options {
+            security_bits: 127,
+            ..TRANSCRIPT_OPTIONS
+        },
+        Options {
+            blowup_log2: 3,
+            ..TRANSCRIPT_OPTIONS
+        },
+        Options {
+            fold_rate: 2,
+            ..TRANSCRIPT_OPTIONS
+        },
+        Options {
+            max_rounds: 2,
+            ..TRANSCRIPT_OPTIONS
+        },
+        Options {
+            grinding_bits: 9,
+            ..TRANSCRIPT_OPTIONS
+        },
+    ];
+
+    fn test_deep_challenges_bind_options_impl(options: Options) {
+        let challenges = deep_challenges::<BS, Sha2Hash<BS>>(
+            &TRANSCRIPT_OPTIONS,
+            &transcript_tree_roots(),
+            3,
+            &transcript_points(),
+        );
+        let other_challenges = deep_challenges::<BS, Sha2Hash<BS>>(
+            &options,
+            &transcript_tree_roots(),
+            3,
+            &transcript_points(),
+        );
+        assert_ne!(challenges.0, other_challenges.0);
+        assert_ne!(challenges.1, other_challenges.1);
+    }
+
+    #[test]
+    fn test_deep_challenges_bind_options() {
+        for options in OTHER_TRANSCRIPT_OPTIONS {
+            test_deep_challenges_bind_options_impl(options);
+        }
+    }
+
+    fn test_query_seed_binds_options_impl(options: Options) {
+        let seed = query_seed::<BS, Sha2Hash<BS>>(
+            &TRANSCRIPT_OPTIONS,
+            &transcript_tree_roots(),
+            3,
+            &transcript_points(),
+            &transcript_fri_commitment(),
+        );
+        let other_seed = query_seed::<BS, Sha2Hash<BS>>(
+            &options,
+            &transcript_tree_roots(),
+            3,
+            &transcript_points(),
+            &transcript_fri_commitment(),
+        );
+        assert_ne!(seed, other_seed);
+    }
+
+    #[test]
+    fn test_query_seed_binds_options() {
+        for options in OTHER_TRANSCRIPT_OPTIONS {
+            test_query_seed_binds_options_impl(options);
+        }
     }
 
     #[test]
@@ -1986,9 +2135,20 @@ mod tests {
         let values = other_points.remove(&BS::from_const(456)).unwrap();
         other_points.insert(BS::from_const(789), values);
         let fri_commitment = transcript_fri_commitment();
-        let seed = query_seed::<BS, Sha2Hash<BS>>(&tree_roots, 3, &points, &fri_commitment);
-        let other_seed =
-            query_seed::<BS, Sha2Hash<BS>>(&tree_roots, 3, &other_points, &fri_commitment);
+        let seed = query_seed::<BS, Sha2Hash<BS>>(
+            &TRANSCRIPT_OPTIONS,
+            &tree_roots,
+            3,
+            &points,
+            &fri_commitment,
+        );
+        let other_seed = query_seed::<BS, Sha2Hash<BS>>(
+            &TRANSCRIPT_OPTIONS,
+            &tree_roots,
+            3,
+            &other_points,
+            &fri_commitment,
+        );
         assert_ne!(seed, other_seed);
     }
 
@@ -1999,9 +2159,20 @@ mod tests {
         let mut other_points = points.clone();
         other_points.get_mut(&BS::from_const(456)).unwrap()[2] += BS::ONE;
         let fri_commitment = transcript_fri_commitment();
-        let seed = query_seed::<BS, Sha2Hash<BS>>(&tree_roots, 3, &points, &fri_commitment);
-        let other_seed =
-            query_seed::<BS, Sha2Hash<BS>>(&tree_roots, 3, &other_points, &fri_commitment);
+        let seed = query_seed::<BS, Sha2Hash<BS>>(
+            &TRANSCRIPT_OPTIONS,
+            &tree_roots,
+            3,
+            &points,
+            &fri_commitment,
+        );
+        let other_seed = query_seed::<BS, Sha2Hash<BS>>(
+            &TRANSCRIPT_OPTIONS,
+            &tree_roots,
+            3,
+            &other_points,
+            &fri_commitment,
+        );
         assert_ne!(seed, other_seed);
     }
 
@@ -2526,8 +2697,8 @@ mod tests {
         assert_eq!(
             proof.fri_commitment.roots(),
             [
-                parse::<H256>("0x1cfc697bb66e15c8357f7a749010a210ae829f520944e21e4df00cfa7212ec8c"),
-                parse("0xc61b2df672d90a4aef984d6b7d485f673cec75f1868d39e6ba659a4ec3883f6f"),
+                parse::<H256>("0x863a81ca23ba5093f76b4e0d82ab5dea1b6572b42ff7da4a040686279f3b761d"),
+                parse("0xda38621c35e3db5f2575e9088d981bdcbfc7aeda8cca83d33519ee050c12cdbc"),
             ]
         );
     }
@@ -2540,7 +2711,7 @@ mod tests {
         assert_eq!(
             proof.fri_commitment.folded_polynomial().coefficients(),
             [parse::<BS>(
-                "0x0e9f1ad4b8e8061af017e701db60283baf50808a86959003141baed02ddbf544"
+                "0x6321f80a49c46f782bc0a1efcded0b1737427d837ae9320e4167795c5af15d6d"
             )]
         );
     }
@@ -2558,7 +2729,7 @@ mod tests {
         let committer = make_committer::<BS, Sha2Hash<BS>>(GROUND_OPTIONS, &SAMPLE_BATCHES);
         let (_, prover) = committer.commit();
         let proof = prover.prove(make_points(&SAMPLE_POINTS));
-        assert_eq!(proof.nonce(), 204);
+        assert_eq!(proof.nonce(), 118);
     }
 
     #[test]
@@ -3309,6 +3480,41 @@ mod tests {
         );
     }
 
+    /// Replaces the options of a valid proof with `options`, which give the same numbers of queries
+    /// and FRI rounds, so that only the Fiat-Shamir transcript can tell them apart.
+    fn test_reject_proof_with_other_options_impl(options: Options) {
+        let (commitment, mut proof) = sample_proof(GROUND_OPTIONS);
+        assert_eq!(options.num_queries(), proof.options.num_queries());
+        assert_eq!(options.num_rounds(), proof.options.num_rounds());
+        proof.options = options;
+        let result = proof.verify(&commitment);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_proof_with_other_grinding_bits() {
+        test_reject_proof_with_other_options_impl(Options {
+            grinding_bits: 9,
+            ..GROUND_OPTIONS
+        });
+    }
+
+    #[test]
+    fn test_reject_proof_with_other_security_level() {
+        test_reject_proof_with_other_options_impl(Options {
+            security_bits: 127,
+            ..GROUND_OPTIONS
+        });
+    }
+
+    #[test]
+    fn test_reject_proof_with_other_max_rounds() {
+        test_reject_proof_with_other_options_impl(Options {
+            max_rounds: 2,
+            ..GROUND_OPTIONS
+        });
+    }
+
     #[test]
     fn test_reject_understated_grinding() {
         let (commitment, mut proof) = sample_proof(GROUND_OPTIONS);
@@ -3327,7 +3533,7 @@ mod tests {
         assert_eq!(proto.fold_rate, 1);
         assert_eq!(proto.max_rounds, u32::MAX);
         assert_eq!(proto.grinding_bits, 8);
-        assert_eq!(proto.nonce, 204);
+        assert_eq!(proto.nonce, 118);
         assert_eq!(
             proto.points,
             [
