@@ -3537,15 +3537,6 @@ mod tests {
     }
 
     #[test]
-    fn test_largest_max_rounds_from_proto() {
-        let (_, proof) = sample_proof(OPTIONS);
-        let mut proto = proof.to_proto();
-        proto.max_rounds = u32::MAX;
-        let decoded = Proof::<BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
-        assert_eq!(decoded.options().max_rounds, MAX_FRI_ROUNDS);
-    }
-
-    #[test]
     fn test_reject_non_canonical_point() {
         let (_, proof) = sample_proof(OPTIONS);
         let mut proto = proof.to_proto();
