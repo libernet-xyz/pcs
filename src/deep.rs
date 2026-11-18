@@ -950,6 +950,7 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
             num_polys,
             &self.points,
         );
+        let fri_seed = H256::from_slice(&beta.to_be_bytes());
 
         for ((query, openings), &expected_index) in
             (self.queries.iter().zip(self.openings.iter())).zip(indices.iter())
@@ -1008,7 +1009,7 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
                 }),
                 beta,
             );
-            query.verify(&self.fri_commitment, quotient)?;
+            query.verify(&self.fri_commitment, fri_seed, quotient)?;
         }
 
         Ok(())
@@ -1242,6 +1243,7 @@ impl<F: Field256, H: Hasher<F>> Prover<F, H> {
             self.options.blowup_log2,
             self.options.fold_rate,
             self.options.max_rounds,
+            H256::from_slice(&beta.to_be_bytes()),
         );
         let fri_commitment = fri_prover.commit();
 
@@ -2719,7 +2721,7 @@ mod tests {
             proof.fri_commitment.roots(),
             [
                 parse::<H256>("0x863a81ca23ba5093f76b4e0d82ab5dea1b6572b42ff7da4a040686279f3b761d"),
-                parse("0xda38621c35e3db5f2575e9088d981bdcbfc7aeda8cca83d33519ee050c12cdbc"),
+                parse("0x265b906c7e2dadb76e48016201025b3e235a488650d9d8b77a4685fd7016e4da"),
             ]
         );
     }
@@ -2732,7 +2734,7 @@ mod tests {
         assert_eq!(
             proof.fri_commitment.folded_polynomial().coefficients(),
             [parse::<BS>(
-                "0x6321f80a49c46f782bc0a1efcded0b1737427d837ae9320e4167795c5af15d6d"
+                "0x0970ce84dbf476f5e4a0d0971c7a75f0094fc87e817b70adce05a23485ced770"
             )]
         );
     }
@@ -2750,7 +2752,7 @@ mod tests {
         let committer = make_committer::<BS, Sha2Hash<BS>>(GROUND_OPTIONS, &SAMPLE_BATCHES);
         let (_, prover) = committer.commit();
         let proof = prover.prove(make_points(&SAMPLE_POINTS));
-        assert_eq!(proof.nonce(), 118);
+        assert_eq!(proof.nonce(), 367);
     }
 
     #[test]
@@ -3637,7 +3639,7 @@ mod tests {
         assert_eq!(proto.fold_rate, 1);
         assert_eq!(proto.max_rounds, u32::MAX);
         assert_eq!(proto.grinding_bits, 8);
-        assert_eq!(proto.nonce, 118);
+        assert_eq!(proto.nonce, 367);
         assert_eq!(
             proto.points,
             [
