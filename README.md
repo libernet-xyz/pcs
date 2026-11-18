@@ -80,7 +80,7 @@ implemented in the most EVM-friendly possible way. Check out Starkom's [EVM veri
 [koalabear]: https://docs.rs/starkom-koalabear
 [num_queries]: https://docs.rs/starkom-pcs/latest/starkom_pcs/fn.num_queries.html
 [options-satisfies]: https://docs.rs/starkom-pcs/latest/starkom_pcs/struct.Options.html#method.satisfies
-[plonk-options-blind]: https://docs.rs/starkom-plonk/latest/starkom_plonk/struct.Options.html#structfield.blind
+[plonk-options-blind]: https://docs.rs/starkom-plonk/latest/starkom_plonk/struct.CircuitOptions.html#structfield.blind
 [proof-verify]: https://docs.rs/starkom-pcs/latest/starkom_pcs/struct.Proof.html#method.verify
 [schraderbrau]: https://docs.rs/starkom-schraderbrau
 [starkom-plonk]: https://docs.rs/starkom-plonk
