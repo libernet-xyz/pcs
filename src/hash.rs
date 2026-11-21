@@ -1,7 +1,7 @@
-use crate::starkom::proto::pcs::v11 as proto;
+use crate::starkom::proto::pcs::v12 as proto;
 use crate::utils;
 use anyhow::{Result, anyhow};
-use primitive_types::{H256, U128, U256, U512};
+use primitive_types::{H256, U256, U512};
 use sha2::Digest;
 use starkom_ff::{Field, Field256};
 use std::fmt::Debug;
@@ -10,13 +10,13 @@ use std::marker::PhantomData;
 utils::prost_name!(
     proto::Sha2HashBackend,
     "Sha2HashBackend",
-    "starkom.proto.pcs.v11"
+    "starkom.proto.pcs.v12"
 );
 
 utils::prost_name!(
     proto::KeccakHashBackend,
     "KeccakHashBackend",
-    "starkom.proto.pcs.v11"
+    "starkom.proto.pcs.v12"
 );
 
 /// Describes a hash backend for hashing internal Merkle tree nodes.
@@ -56,14 +56,16 @@ pub trait Hasher<F: Field256>: MerkleHasher {
     /// Generates a ~256-bit Fiat-Shamir challenge from a transcript.
     ///
     /// The provided implementation hashes the transcript with [`Self::hash_transcript`] and
-    /// converts the hash to a field element. To avoid distribution bias, the transcript is hashed
-    /// twice with slightly different DSTs, and the resulting 512 bits are converted to a 256-bit
-    /// field element via modular reduction.
+    /// converts the hash to a field element. To avoid distribution bias, the conversion reduces 512
+    /// pseudorandom bits modulo the field order. The most significant 256 bits are the hash of the
+    /// transcript with `dst`, and the least significant 256 bits are the hash of the former with
+    /// `dst + 1` (as a single-element transcript). That way the transcript, which can be long, is
+    /// hashed only once.
     fn challenge(dst: H256, transcript: &[H256]) -> F {
         let dst_hi = U256::from_big_endian(dst.as_bytes());
         let dst_lo = dst_hi + U256::one();
         let hi = Self::hash_transcript(H256::from_slice(&dst_hi.to_big_endian()), transcript);
-        let lo = Self::hash_transcript(H256::from_slice(&dst_lo.to_big_endian()), transcript);
+        let lo = Self::hash_transcript(H256::from_slice(&dst_lo.to_big_endian()), &[hi]);
         let mut bytes = [0u8; 64];
         bytes[0..32].copy_from_slice(hi.as_bytes());
         bytes[32..].copy_from_slice(lo.as_bytes());
@@ -204,7 +206,7 @@ mod internal {
         fn hash_transcript(dst: H256, transcript: &[H256]) -> H256 {
             let mut hasher = H::default();
             hasher.update(dst.as_bytes());
-            hasher.update(&U128::from(transcript.len() as u64).to_big_endian());
+            hasher.update(&U256::from(transcript.len() as u64).to_big_endian());
             for element in transcript {
                 hasher.update(element.as_bytes());
             }
@@ -248,11 +250,11 @@ mod tests {
     fn test_hash_backend_type_urls() {
         assert_eq!(
             proto::Sha2HashBackend::type_url(),
-            "type.starkom.io/starkom.proto.pcs.v11.Sha2HashBackend"
+            "type.starkom.io/starkom.proto.pcs.v12.Sha2HashBackend"
         );
         assert_eq!(
             proto::KeccakHashBackend::type_url(),
-            "type.starkom.io/starkom.proto.pcs.v11.KeccakHashBackend"
+            "type.starkom.io/starkom.proto.pcs.v12.KeccakHashBackend"
         );
     }
 
@@ -485,7 +487,7 @@ mod tests {
                     "0x5b584bf4398b7ef509abeb33ba8521c96a4a497ffba046a492cc43ac34174c16"
                 )]
             ),
-            parse("0x60555de477c0592d48a0f76f80c88c39a0c127d7209e2ba893de300778792682")
+            parse("0x7c6534149fcf5a86469aa81dc5ed7eb1247df06d53c550ba3a78d94ae8ab350d")
         );
         assert_eq!(
             Sha2Hash::<BS>::challenge(
@@ -495,7 +497,7 @@ mod tests {
                     parse("0x39de8bea57c1ab4082270791ce637189f07d169852f8bba5d05784368b505a12"),
                 ]
             ),
-            parse("0x2abcb323efcc551be2b473c75ccc1c3f563530df6a279dc4f053282deafccabc")
+            parse("0x21b62448a09d0f47610e8f1fa5afb2c4dde88c4bd71161be74904ae305e95ca2")
         );
         assert_eq!(
             Sha2Hash::<BS>::challenge(
@@ -506,7 +508,7 @@ mod tests {
                     parse("0x32c783c083c0fafa4dba39e2176fc3a14791b83d4f1a51372aa483279a93d687"),
                 ]
             ),
-            parse("0x1e4a2f56b812c4842720698bb2fb8708eec162e1febe52e90aceac66bb57ae3e")
+            parse("0x3b5e54e02f06cd4d72a0e49b6fef86b76345aa46528cf85ffcddab81a2311c20")
         );
     }
 
@@ -519,7 +521,7 @@ mod tests {
                     "0x5b584bf4398b7ef509abeb33ba8521c96a4a497ffba046a492cc43ac34174c16"
                 )]
             ),
-            parse("0x3db58df62452afc50e241f9ae42230b788cf37d4aa0b13a43831946bed72e170")
+            parse("0x49b6d25fcfd1a79d4e7b6709da6a47a48e135bddcac04f00700c350e67699b22")
         );
         assert_eq!(
             Sha2Hash::<GL4>::challenge(
@@ -529,7 +531,7 @@ mod tests {
                     parse("0x39de8bea57c1ab4082270791ce637189f07d169852f8bba5d05784368b505a12"),
                 ]
             ),
-            parse("0x10fecd76d44d659f9b0502705a45dd0c54236211eb6f88680df390d92e5d5d06")
+            parse("0xcfda2227d1ffdd6a14d76c1e55183308df20e1d2e5f144099b124b076c4c8db5")
         );
         assert_eq!(
             Sha2Hash::<GL4>::challenge(
@@ -540,7 +542,7 @@ mod tests {
                     parse("0x32c783c083c0fafa4dba39e2176fc3a14791b83d4f1a51372aa483279a93d687"),
                 ]
             ),
-            parse("0x19f2ce3d8ba0c988a6ed215951f72abb675b50da360d4b0c9868360105b69e19")
+            parse("0xaf5d033d19e06a29d46573c6fbe668e521c58054636b3f9814d9fcfe93aa2ac6")
         );
     }
 
@@ -553,7 +555,7 @@ mod tests {
                     "0x5b584bf4398b7ef509abeb33ba8521c96a4a497ffba046a492cc43ac34174c16"
                 )]
             ),
-            parse("0x66647f27ced95c30909f94ab8649419a5457026e3b7d956902401b521672b1bd")
+            parse("0x6d8cbbf7a48eedea2cd9c827f3caf9ebbcdf18f13d5120c1078472f4a4c51889")
         );
         assert_eq!(
             Keccak256Hash::<BS>::challenge(
@@ -563,7 +565,7 @@ mod tests {
                     parse("0x39de8bea57c1ab4082270791ce637189f07d169852f8bba5d05784368b505a12"),
                 ]
             ),
-            parse("0x448a77521c4edee2ead1cbaedb7d2b9cdf2f72b7f54abbb6824241ce3f273355")
+            parse("0x55021224fa461943ba11d2eb8914241499a8d6651496d6bf7c3de325215da41e")
         );
         assert_eq!(
             Keccak256Hash::<BS>::challenge(
@@ -574,7 +576,7 @@ mod tests {
                     parse("0x32c783c083c0fafa4dba39e2176fc3a14791b83d4f1a51372aa483279a93d687"),
                 ]
             ),
-            parse("0x48e3fc25084ef8f0183b3ed2d827ad8b701a7129c25ba03f471fada5ab59568a")
+            parse("0x5fdcf88830fed1cec79eac7d295593258985e884868f15935479ec6d037fa0f0")
         );
     }
 
@@ -587,7 +589,7 @@ mod tests {
                     "0x5b584bf4398b7ef509abeb33ba8521c96a4a497ffba046a492cc43ac34174c16"
                 )]
             ),
-            parse("0xe80eb8ea838e3bf1e5734f4ac0efe313d2faee4b74593eaa52e1772040b22e3f")
+            parse("0x70976bfb022745ede6b644d5ed620d81cea15fefeaa94f285366098409a61878")
         );
         assert_eq!(
             Keccak256Hash::<GL4>::challenge(
@@ -597,7 +599,7 @@ mod tests {
                     parse("0x39de8bea57c1ab4082270791ce637189f07d169852f8bba5d05784368b505a12"),
                 ]
             ),
-            parse("0xc7327dd09bc9df340622777b370ed74e9cb57e4882bc7fc9a23127bcae403499")
+            parse("0x1134b29f1d7a0ed7759a4cce507dc48fb8dbbb3da068c3ae34f650df05e9db4a")
         );
         assert_eq!(
             Keccak256Hash::<GL4>::challenge(
@@ -608,7 +610,7 @@ mod tests {
                     parse("0x32c783c083c0fafa4dba39e2176fc3a14791b83d4f1a51372aa483279a93d687"),
                 ]
             ),
-            parse("0x4123d9b2786928a9e646df736814516967778af7c0c0e28de6719e6c24c0bde8")
+            parse("0x31429fe891097e8ff3ef2414039309efc1de6fd301643e5e82abe1c8b1d6ca5a")
         );
     }
 }

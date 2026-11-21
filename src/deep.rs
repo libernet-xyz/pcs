@@ -1,7 +1,7 @@
 use crate::fri;
 use crate::hash::Hasher;
 use crate::merkle::{Proof as LeafProof, Tree};
-use crate::starkom::proto::pcs::v11 as proto;
+use crate::starkom::proto::pcs::v12 as proto;
 use crate::utils;
 use anyhow::{Context, Result, anyhow};
 use primitive_types::{H256, U256};
@@ -26,6 +26,10 @@ pub const MAX_FRI_ROUNDS: usize = u32::MAX as usize;
 /// Domain separator tag used by [`Committer::transcript_hash`].
 static TRANSCRIPT_DST: LazyLock<H256> =
     LazyLock::new(|| utils::make_dst(b"starkom/deep/transcript"));
+
+/// Domain separator tag used by [`deep_transcript_hash`].
+static DEEP_TRANSCRIPT_DST: LazyLock<H256> =
+    LazyLock::new(|| utils::make_dst(b"starkom/deep/transcript/deep"));
 
 /// First domain separator tag for the Fiat-Shamir challenge used to derive query indices.
 static QUERY_DST0: LazyLock<H256> = LazyLock::new(|| utils::make_dst(b"starkom/deep/query/0"));
@@ -272,21 +276,27 @@ fn rlc<F: Field>(values: impl IntoIterator<Item = F>, alpha: F) -> F {
     rlc
 }
 
-/// Encodes the transcript of the DEEP layer, that is the protocol parameters, all Merkle roots of
-/// the committed polynomials, all opened points, and their claimed evaluations.
+/// Hashes the transcript of the DEEP layer with [`DEEP_TRANSCRIPT_DST`]. The transcript is made up
+/// of the protocol parameters, all Merkle roots of the committed polynomials, all opened points,
+/// and their claimed evaluations.
 ///
-/// The parameters come first, in the order of the fields of [`Options`]. They're those declared by
-/// the proof, which the verifier checks against the expected ones separately (see
-/// [`Options::satisfies`]). Binding them prevents a prover from changing them after seeing the
-/// challenges: e.g. declaring a number of grinding bits that matches the proof of work it found, or
-/// choosing the FRI settings that suit the query indices.
-fn deep_transcript<F: Field256>(
+/// The protocol parameters, provided in `options` are those declared by the proof, which the
+/// verifier checks against the expected ones separately using [`Options::satisfies`]. Binding them
+/// prevents a prover from changing them after seeing the challenges, e.g. declaring a number of
+/// grinding bits that matches the proof of work it found, or choosing some FRI settings that suit
+/// the query indices.
+///
+/// The size of the transcript is linear in the number of committed polynomials times the number of
+/// opened points. All Fiat-Shamir values of the DEEP layer, that is the challenges returned by
+/// [`deep_challenges`] and the seed returned by [`query_seed`], are derived from this hash rather
+/// than from the transcript itself. That way the transcript is hashed only once.
+fn deep_transcript_hash<F: Field256, H: Hasher<F>>(
     options: &Options,
     tree_roots: &[H256],
     num_polys: usize,
     points: &BTreeMap<F, Vec<F>>,
-) -> impl Iterator<Item = H256> {
-    [
+) -> H256 {
+    let transcript: Vec<H256> = [
         options.degree_bound,
         options.security_bits,
         options.blowup_log2,
@@ -305,47 +315,42 @@ fn deep_transcript<F: Field256>(
             .chain(values.iter())
             .map(|value| H256::from_slice(&value.to_be_bytes()))
     }))
+    .collect();
+    H::hash_transcript(*DEEP_TRANSCRIPT_DST, transcript.as_slice())
 }
 
-/// Derives the two Fiat-Shamir challenges of the DEEP layer.
+/// Derives the two Fiat-Shamir challenges of the DEEP layer from the hash of its transcript (see
+/// [`deep_transcript_hash`]).
 ///
 /// The first challenge uses [`RLC_DST`] and is used by the caller to combine all committed
 /// polynomials, while the second one uses [`QUOTIENT_DST`] and is used to combine all DEEP
 /// quotients.
 ///
 /// Both challenges are bound to the protocol parameters, to all Merkle roots of the committed
-/// polynomials, and to all opened points and their claimed evaluations (see [`deep_transcript`]).
-fn deep_challenges<F: Field256, H: Hasher<F>>(
-    options: &Options,
-    tree_roots: &[H256],
-    num_polys: usize,
-    points: &BTreeMap<F, Vec<F>>,
-) -> (F, F) {
-    let transcript: Vec<H256> = deep_transcript(options, tree_roots, num_polys, points).collect();
+/// polynomials, and to all opened points and their claimed evaluations.
+fn deep_challenges<F: Field256, H: Hasher<F>>(transcript_hash: H256) -> (F, F) {
     (
-        H::challenge(*RLC_DST, transcript.as_slice()),
-        H::challenge(*QUOTIENT_DST, transcript.as_slice()),
+        H::challenge(*RLC_DST, &[transcript_hash]),
+        H::challenge(*QUOTIENT_DST, &[transcript_hash]),
     )
 }
 
-/// Hashes the full transcript of a proof up to the queries: the protocol parameters, all Merkle
-/// roots of the committed polynomials, all opened points and their claimed evaluations (see
-/// [`deep_transcript`]), all FRI roots, and the coefficients of the folded quotient.
+/// Hashes the full transcript of a proof up to the queries, returning the 256-bit word used to seed
+/// the proof-of-work.
+///
+/// The `transcript_hash` argument must be the value returned by [`deep_transcript_hash`].
 ///
 /// The returned seed is the input of the proof of work, which in turn determines the FRI query
 /// indices (see [`get_query_indices`]). Since the seed binds the number of grinding bits, the
 /// prover commits to its grinding target before searching for a nonce.
 fn query_seed<F: Field256, H: Hasher<F>>(
-    options: &Options,
-    tree_roots: &[H256],
-    num_polys: usize,
-    points: &BTreeMap<F, Vec<F>>,
+    transcript_hash: H256,
     fri_commitment: &fri::Commitment<F>,
 ) -> H256 {
     let folded_quotient = fri_commitment.folded_polynomial();
     H::hash_transcript(
         *QUERY_DST0,
-        deep_transcript(options, tree_roots, num_polys, points)
+        std::iter::once(transcript_hash)
             .chain(std::iter::once(utils::encode_usize(fri_commitment.len())))
             .chain(fri_commitment.roots().iter().copied())
             .chain(std::iter::once(utils::encode_usize(folded_quotient.len())))
@@ -931,25 +936,20 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
         }
 
         let tree_roots = commitment.tree_roots();
-        let seed = query_seed::<F, H>(
+        let transcript_hash = deep_transcript_hash::<F, H>(
             &self.options,
             tree_roots.as_slice(),
             num_polys,
             &self.points,
-            &self.fri_commitment,
         );
+        let seed = query_seed::<F, H>(transcript_hash, &self.fri_commitment);
         let pow = proof_of_work::<F, H>(seed, self.nonce);
         if !check_proof_of_work(pow, self.options.grinding_bits) {
             return Err(anyhow!("insufficient proof of work"));
         }
         let indices = get_query_indices::<F, H>(pow, &self.options);
 
-        let (alpha, beta) = deep_challenges::<F, H>(
-            &self.options,
-            tree_roots.as_slice(),
-            num_polys,
-            &self.points,
-        );
+        let (alpha, beta) = deep_challenges::<F, H>(transcript_hash);
         let fri_seed = H256::from_slice(&beta.to_be_bytes());
 
         for ((query, openings), &expected_index) in
@@ -1219,8 +1219,9 @@ impl<F: Field256, H: Hasher<F>> Prover<F, H> {
             .collect();
 
         let tree_roots: Vec<H256> = self.batches.iter().map(Batch::root_hash).collect();
-        let (alpha, beta) =
-            deep_challenges::<F, H>(&self.options, tree_roots.as_slice(), num_polys, &points);
+        let transcript_hash =
+            deep_transcript_hash::<F, H>(&self.options, tree_roots.as_slice(), num_polys, &points);
+        let (alpha, beta) = deep_challenges::<F, H>(transcript_hash);
 
         let combined = Batch::combine(&self.batches, alpha);
 
@@ -1247,13 +1248,7 @@ impl<F: Field256, H: Hasher<F>> Prover<F, H> {
         );
         let fri_commitment = fri_prover.commit();
 
-        let seed = query_seed::<F, H>(
-            &self.options,
-            tree_roots.as_slice(),
-            num_polys,
-            &points,
-            &fri_commitment,
-        );
+        let seed = query_seed::<F, H>(transcript_hash, &fri_commitment);
         let (nonce, pow) = self.grind_nonce(seed);
         let indices = get_query_indices::<F, H>(pow, &self.options);
         let openings = indices
@@ -1403,13 +1398,13 @@ mod tests {
         proof: &Proof<BS, Sha2Hash<BS>>,
         valid: bool,
     ) -> u64 {
-        let seed = query_seed::<BS, Sha2Hash<BS>>(
+        let transcript_hash = deep_transcript_hash::<BS, Sha2Hash<BS>>(
             &proof.options,
             commitment.tree_roots().as_slice(),
             commitment.num_polys(),
             &proof.points,
-            &proof.fri_commitment,
         );
+        let seed = query_seed::<BS, Sha2Hash<BS>>(transcript_hash, &proof.fri_commitment);
         ((proof.nonce + 1)..)
             .find(|&nonce| {
                 let hash = proof_of_work::<BS, Sha2Hash<BS>>(seed, nonce);
@@ -1423,6 +1418,14 @@ mod tests {
         assert_eq!(
             *TRANSCRIPT_DST,
             parse("0x09f36235476a658841de9bcdd34e1ac31ec792e41def5de31aecb4eb3bb1816b")
+        );
+    }
+
+    #[test]
+    fn test_deep_transcript_dst() {
+        assert_eq!(
+            *DEEP_TRANSCRIPT_DST,
+            parse("0x81d5f3b82177662e6bc225147d63ffc9fbc536ce42e554dde965e4e421d0ec8b")
         );
     }
 
@@ -1912,7 +1915,7 @@ mod tests {
         let hash = proof_of_work::<BS, Sha2Hash<BS>>(H256::repeat_byte(0x12), 34);
         assert_eq!(
             hash,
-            parse("0x751c67edba4c1538ab9e01f62307319cbc97f2bd598d3a55686031fb84e96de6")
+            parse("0xe66c772b2612fa43d908e34bcb09ed08a3e8e35fea8750c00d7adb25dac4133a")
         );
     }
 
@@ -1921,7 +1924,7 @@ mod tests {
         let hash = proof_of_work::<BS, Keccak256Hash<BS>>(H256::repeat_byte(0x12), 34);
         assert_eq!(
             hash,
-            parse("0x4bd47978101f127ba6b5f99dff54c6110e351615a65e4f8a9fbfc9003ceaa5ec")
+            parse("0xfe341a32d1d3987da41fe4262ae9914dd0ab1f0234dac9ff5b9fbe76b1243ea0")
         );
     }
 
@@ -1970,7 +1973,7 @@ mod tests {
             grinding_bits: 104,
         };
         let indices = get_query_indices::<BS, Sha2Hash<BS>>(H256::repeat_byte(0x34), &options);
-        assert_eq!(indices, [27, 59, 7, 21, 14, 33]);
+        assert_eq!(indices, [40, 44, 29, 17, 4, 46]);
     }
 
     #[test]
@@ -2039,37 +2042,52 @@ mod tests {
         )
     }
 
-    #[test]
-    fn test_deep_challenges() {
-        let (alpha, beta) = deep_challenges::<BS, Sha2Hash<BS>>(
+    /// Hashes the transcript of the DEEP layer made of the fixtures above.
+    fn transcript_hash() -> H256 {
+        deep_transcript_hash::<BS, Sha2Hash<BS>>(
             &TRANSCRIPT_OPTIONS,
             &transcript_tree_roots(),
             3,
             &transcript_points(),
+        )
+    }
+
+    #[test]
+    fn test_deep_transcript_hash() {
+        assert_eq!(
+            transcript_hash(),
+            parse("0x81ad7ff372417b30d6a7fcff0f077c9a295ad2cbfd7520f813e8186d4be89b54")
         );
+    }
+
+    #[test]
+    fn test_deep_challenges() {
+        let (alpha, beta) = deep_challenges::<BS, Sha2Hash<BS>>(transcript_hash());
         assert_eq!(
             alpha,
-            parse("0x243dd98505084f06fd875df85a4e5ac05d8a11bc902de34df348450a0ec0b5df")
+            parse("0x7f50a3a5456cc8dd89895c312cd4c26dcdc14b5236bfcff0efc586f7c8386906")
         );
         assert_eq!(
             beta,
-            parse("0x18dd843cc2e3b8c7b8a4a95564c1a4ffbe859311199fa6eb90dfcac60d6e0cbf")
+            parse("0x21a45abf4907c8facc28f316e0ef3a8365d67b83f2770af46603d063fbd5d5a2")
         );
     }
 
     #[test]
     fn test_query_seed() {
-        let seed = query_seed::<BS, Sha2Hash<BS>>(
-            &TRANSCRIPT_OPTIONS,
-            &transcript_tree_roots(),
-            3,
-            &transcript_points(),
-            &transcript_fri_commitment(),
-        );
+        let seed = query_seed::<BS, Sha2Hash<BS>>(transcript_hash(), &transcript_fri_commitment());
         assert_eq!(
             seed,
-            parse("0xaf36070d70665854c2cc836979578c0f06368b82d4dbd001b7442790fb57478e")
+            parse("0x8f90a16262850cc2915f69fab939bafe3d8c934fb08991e61e6b477ed0b2478b")
         );
+    }
+
+    #[test]
+    fn test_query_seed_binds_transcript_hash() {
+        let fri_commitment = transcript_fri_commitment();
+        let seed = query_seed::<BS, Sha2Hash<BS>>(transcript_hash(), &fri_commitment);
+        let other_seed = query_seed::<BS, Sha2Hash<BS>>(H256::repeat_byte(0x42), &fri_commitment);
+        assert_ne!(seed, other_seed);
     }
 
     /// Every field of the protocol parameters that differs from [`TRANSCRIPT_OPTIONS`] in one of
@@ -2101,102 +2119,48 @@ mod tests {
         },
     ];
 
-    fn test_deep_challenges_bind_options_impl(options: Options) {
-        let challenges = deep_challenges::<BS, Sha2Hash<BS>>(
-            &TRANSCRIPT_OPTIONS,
-            &transcript_tree_roots(),
-            3,
-            &transcript_points(),
-        );
-        let other_challenges = deep_challenges::<BS, Sha2Hash<BS>>(
+    fn test_deep_transcript_hash_binds_options_impl(options: Options) {
+        let other_hash = deep_transcript_hash::<BS, Sha2Hash<BS>>(
             &options,
             &transcript_tree_roots(),
             3,
             &transcript_points(),
         );
-        assert_ne!(challenges.0, other_challenges.0);
-        assert_ne!(challenges.1, other_challenges.1);
+        assert_ne!(other_hash, transcript_hash());
     }
 
     #[test]
-    fn test_deep_challenges_bind_options() {
+    fn test_deep_transcript_hash_binds_options() {
         for options in OTHER_TRANSCRIPT_OPTIONS {
-            test_deep_challenges_bind_options_impl(options);
-        }
-    }
-
-    fn test_query_seed_binds_options_impl(options: Options) {
-        let seed = query_seed::<BS, Sha2Hash<BS>>(
-            &TRANSCRIPT_OPTIONS,
-            &transcript_tree_roots(),
-            3,
-            &transcript_points(),
-            &transcript_fri_commitment(),
-        );
-        let other_seed = query_seed::<BS, Sha2Hash<BS>>(
-            &options,
-            &transcript_tree_roots(),
-            3,
-            &transcript_points(),
-            &transcript_fri_commitment(),
-        );
-        assert_ne!(seed, other_seed);
-    }
-
-    #[test]
-    fn test_query_seed_binds_options() {
-        for options in OTHER_TRANSCRIPT_OPTIONS {
-            test_query_seed_binds_options_impl(options);
+            test_deep_transcript_hash_binds_options_impl(options);
         }
     }
 
     #[test]
-    fn test_query_seed_binds_points() {
-        let tree_roots = transcript_tree_roots();
-        let points = transcript_points();
-        let mut other_points = points.clone();
+    fn test_deep_transcript_hash_binds_points() {
+        let mut other_points = transcript_points();
         let values = other_points.remove(&BS::from_const(456)).unwrap();
         other_points.insert(BS::from_const(789), values);
-        let fri_commitment = transcript_fri_commitment();
-        let seed = query_seed::<BS, Sha2Hash<BS>>(
+        let other_hash = deep_transcript_hash::<BS, Sha2Hash<BS>>(
             &TRANSCRIPT_OPTIONS,
-            &tree_roots,
-            3,
-            &points,
-            &fri_commitment,
-        );
-        let other_seed = query_seed::<BS, Sha2Hash<BS>>(
-            &TRANSCRIPT_OPTIONS,
-            &tree_roots,
+            &transcript_tree_roots(),
             3,
             &other_points,
-            &fri_commitment,
         );
-        assert_ne!(seed, other_seed);
+        assert_ne!(other_hash, transcript_hash());
     }
 
     #[test]
-    fn test_query_seed_binds_evaluations() {
-        let tree_roots = transcript_tree_roots();
-        let points = transcript_points();
-        let mut other_points = points.clone();
+    fn test_deep_transcript_hash_binds_evaluations() {
+        let mut other_points = transcript_points();
         other_points.get_mut(&BS::from_const(456)).unwrap()[2] += BS::ONE;
-        let fri_commitment = transcript_fri_commitment();
-        let seed = query_seed::<BS, Sha2Hash<BS>>(
+        let other_hash = deep_transcript_hash::<BS, Sha2Hash<BS>>(
             &TRANSCRIPT_OPTIONS,
-            &tree_roots,
-            3,
-            &points,
-            &fri_commitment,
-        );
-        let other_seed = query_seed::<BS, Sha2Hash<BS>>(
-            &TRANSCRIPT_OPTIONS,
-            &tree_roots,
+            &transcript_tree_roots(),
             3,
             &other_points,
-            &fri_commitment,
         );
-        assert_ne!(seed, other_seed);
+        assert_ne!(other_hash, transcript_hash());
     }
 
     #[test]
@@ -2249,7 +2213,7 @@ mod tests {
         let hash = committer.transcript_hash();
         assert_eq!(
             hash,
-            parse("0x608c3f1c8a1354d04f2b596ff716e064e3d98d59ff9523bb2e8ecd1061c81816")
+            parse("0xb48067e6fd175575c8ca9ccfbf767f34f655a67203ff791fff1765ab1145c6b2")
         );
     }
 
@@ -2259,7 +2223,7 @@ mod tests {
         let hash = committer.transcript_hash();
         assert_eq!(
             hash,
-            parse("0xabc67f0c49806951ed936b32229b6fac2095f57a4524231fde67f63932692719")
+            parse("0xc7b1d22eaa6a15afc8fccca4dfc1602c7c51444f0df13f56e6031f8041b3f6a7")
         );
     }
 
@@ -2432,7 +2396,7 @@ mod tests {
         let hash = commitment.transcript_hash(1);
         assert_eq!(
             hash,
-            parse("0x608c3f1c8a1354d04f2b596ff716e064e3d98d59ff9523bb2e8ecd1061c81816")
+            parse("0xb48067e6fd175575c8ca9ccfbf767f34f655a67203ff791fff1765ab1145c6b2")
         );
     }
 
@@ -2443,7 +2407,7 @@ mod tests {
         let hash = commitment.transcript_hash(2);
         assert_eq!(
             hash,
-            parse("0xabc67f0c49806951ed936b32229b6fac2095f57a4524231fde67f63932692719")
+            parse("0xc7b1d22eaa6a15afc8fccca4dfc1602c7c51444f0df13f56e6031f8041b3f6a7")
         );
     }
 
@@ -2720,8 +2684,8 @@ mod tests {
         assert_eq!(
             proof.fri_commitment.roots(),
             [
-                parse::<H256>("0x863a81ca23ba5093f76b4e0d82ab5dea1b6572b42ff7da4a040686279f3b761d"),
-                parse("0x265b906c7e2dadb76e48016201025b3e235a488650d9d8b77a4685fd7016e4da"),
+                parse::<H256>("0x006a163c055df824c1d8ae95008c4379853b9c97fe84147da5a6a0690c62a189"),
+                parse("0x2b0d67751e40000f0db10059dbae71dbf1fe780ecab8403f009650dd55818106"),
             ]
         );
     }
@@ -2734,7 +2698,7 @@ mod tests {
         assert_eq!(
             proof.fri_commitment.folded_polynomial().coefficients(),
             [parse::<BS>(
-                "0x0970ce84dbf476f5e4a0d0971c7a75f0094fc87e817b70adce05a23485ced770"
+                "0x572cb182beb702c4838ded2a7b3ee17c52ee6b35d6409a76166c7955ceb0fad4"
             )]
         );
     }
@@ -2752,7 +2716,7 @@ mod tests {
         let committer = make_committer::<BS, Sha2Hash<BS>>(GROUND_OPTIONS, &SAMPLE_BATCHES);
         let (_, prover) = committer.commit();
         let proof = prover.prove(make_points(&SAMPLE_POINTS));
-        assert_eq!(proof.nonce(), 367);
+        assert_eq!(proof.nonce(), 28);
     }
 
     #[test]
@@ -3639,7 +3603,7 @@ mod tests {
         assert_eq!(proto.fold_rate, 1);
         assert_eq!(proto.max_rounds, u32::MAX);
         assert_eq!(proto.grinding_bits, 8);
-        assert_eq!(proto.nonce, 367);
+        assert_eq!(proto.nonce, 28);
         assert_eq!(
             proto.points,
             [
