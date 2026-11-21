@@ -1,6 +1,6 @@
 use crate::hash::Hasher;
 use crate::merkle;
-use crate::starkom::proto::pcs::v11 as proto;
+use crate::starkom::proto::pcs::v12 as proto;
 use crate::utils;
 use anyhow::{Result, anyhow};
 use primitive_types::H256;
@@ -891,7 +891,7 @@ mod tests {
     fn test_folding_challenge() {
         assert_eq!(
             folding_challenge::<BS, Sha2Hash<BS>>(TRANSCRIPT_HASH, H256([0x12; 32])),
-            parse("0x3fe9cfa6c6c6f2a17e41964cd508555eab0299ae240f0fa8455072d8345b1545")
+            parse("0x42f4a785d7c897e3f1e47c3c9960a97cf93d384829d72aed9b1279ca50ec5c84")
         );
     }
 
@@ -900,7 +900,7 @@ mod tests {
         let previous = folding_challenge::<BS, Sha2Hash<BS>>(TRANSCRIPT_HASH, H256([0x12; 32]));
         assert_eq!(
             folding_challenge::<BS, Sha2Hash<BS>>(encode_challenge(previous), H256([0x34; 32])),
-            parse("0x1edcc0a00dd45e162775dd35aa997b87f4783d982cf3471dc4ecb053cd4e551d")
+            parse("0x7f7df544a4fc8462a42e6cbccfca6270cd3f8a3c4be08a5e6b714c85ce571e88")
         );
     }
 
@@ -1307,20 +1307,20 @@ mod tests {
             MAX_FRI_ROUNDS,
             &[
                 "0x4dbf05b032faad3a0279e11536170c9dc6c2444b65bfda0917160a556b76ab5b",
-                "0x1788d451347692b604464d5b587f4595d2157fa2b68bfff3edd16cd20e551d15",
-                "0xd1e1970191b82722dd83378a1a1505efbb8aa6473f49889fa4e3f41347af4fd9",
+                "0x419f25ceafba4c81d0b000e92f9f2725ac90853c393335618e0a1d4a70542563",
+                "0x404980d5e1932262646f982424e460046855517cd301ed208e5f90458b723488",
             ],
-            &["0x0f79f29029e7a601c624b51a64358961f23a971f2b21d73934f2ac4ea1371f00"],
+            &["0x313488f312928890cbeaa95f6b3e2bd642e14e010ec5f8047d023b5815149394"],
         );
         test_commitment_impl::<Keccak256Hash<BS>>(
             1,
             MAX_FRI_ROUNDS,
             &[
                 "0xf62fdcf4604e703d26974310d70bca5ef93f22d316f2083167b3bc4fd4437f8f",
-                "0xd84d2cb88326e9a67bac0d64e5d974340869abc52ae0cbfea86c94a4201d2d6c",
-                "0x8720fa18457a7fafc42a2376bd1697b4dddf3368e586f6bb20d05f35a78c76ea",
+                "0x52915dd56150dd760070be6bc054f431ad0bd83eece2074f91b98ec38d88e7fe",
+                "0x54e564e5ab397d7bbbe3d176f0ce1b6c06b6b24b1f69b32433059e847a17cf41",
             ],
-            &["0x6fa49a02abcfa3cdbe7130a06505d44f65afae20f79459693a78efff103e3382"],
+            &["0x65885bfc786112f8dd8313d2e9241173c467680cf73302dcb99dda3cb7cf26c4"],
         );
     }
 
@@ -1331,8 +1331,8 @@ mod tests {
             MAX_FRI_ROUNDS,
             &["0x4dbf05b032faad3a0279e11536170c9dc6c2444b65bfda0917160a556b76ab5b"],
             &[
-                "0x246fb4756a2eba2fe7a4623d4a4e52bac8939a986f3734ee63477851547d9596",
-                "0x42699ccae500f23c84af2c9bb10b8aae4ffc879959336af31e5e00d4cd93d070",
+                "0x43e37db6d8dc9800ebe6076c3b1afd528626b36b2b56d76d2990376dbef8bb0f",
+                "0x2865fb41ac4cc74d4d32a558272b17d77d5840f3f6ab5a04a7b96d14bbb713b9",
             ],
         );
         test_commitment_impl::<Keccak256Hash<BS>>(
@@ -1340,8 +1340,8 @@ mod tests {
             MAX_FRI_ROUNDS,
             &["0xf62fdcf4604e703d26974310d70bca5ef93f22d316f2083167b3bc4fd4437f8f"],
             &[
-                "0x2e6ea18cfd4ab2138139fbf39ec4978c42b314b4a41ff6121feab18fd2093753",
-                "0x01f82fd8cbfaa9b558571e800a27619be8e61c24ac97d47e88ac7cb75a629ad0",
+                "0x732660df3ed5b0f3c2981323e9266b999ad4a2a0add0c0990b68e32a80e51efe",
+                "0x65f0d3d111a7e6038c8878ead0eb699149a1909c3dd288bc5972135955dcdab2",
             ],
         );
     }
@@ -1352,13 +1352,13 @@ mod tests {
             3,
             MAX_FRI_ROUNDS,
             &["0x4dbf05b032faad3a0279e11536170c9dc6c2444b65bfda0917160a556b76ab5b"],
-            &["0x0cba3f9693a5e4f0fd70ddc1ed1aa22c855e4ed659a40b2a675244e3a6f4758a"],
+            &["0x5b1530c4bcdc48eb923b2d71f924016c37b269c01cfc08974bb791e31f978352"],
         );
         test_commitment_impl::<Keccak256Hash<BS>>(
             3,
             MAX_FRI_ROUNDS,
             &["0xf62fdcf4604e703d26974310d70bca5ef93f22d316f2083167b3bc4fd4437f8f"],
-            &["0x2d0c0af54cff1cf17017806fd621fcc1f38eb26edf53cec0dc26bda6b6b75149"],
+            &["0x3e9498b78ba75028d863521a4b7d7b3696ccce65a3fa81e05c1891321b986beb"],
         );
     }
 
@@ -1369,10 +1369,10 @@ mod tests {
             1,
             &["0x4dbf05b032faad3a0279e11536170c9dc6c2444b65bfda0917160a556b76ab5b"],
             &[
-                "0x4fc43eeba3a8a8939570952f72f13bdc2ae7925c528aaae907a94a1b978922a5",
-                "0x6de836ca9b41881f6bc07b46fc83f0f27f62e681b440f6b96fde30e32f40a77e",
-                "0x7f55bf0b417232ef00e4504c19fb775a789862af4744a15eb81b80f3a20d2380",
-                "0x326910767e0b364112b742ae81ef101f606db142266d57bf7c88c45d2ef625a5",
+                "0x7ce2129fd076a818b788dd631ff69b7647d83d8408ec5c967ff3f28dff5e4e5e",
+                "0x5c4b959195e099c5d2f4e480656cd4a186ea8a6899e8a3003d4cc0a2ccb754eb",
+                "0x143666a61911145b52c1963c99c9f6c1311bf73f274af658f59d5b0fb0e9485e",
+                "0x0b75725cc1c89c490c392248c0b51ed9eb1d1dbd3709d3bc8460d5269f499ddd",
             ],
         );
         test_commitment_impl::<Keccak256Hash<BS>>(
@@ -1380,10 +1380,10 @@ mod tests {
             1,
             &["0xf62fdcf4604e703d26974310d70bca5ef93f22d316f2083167b3bc4fd4437f8f"],
             &[
-                "0x691476cd933e6dad66b79cfcc7073b3594acf3c8f7aeeafdf5545e8631789c2e",
-                "0x122c4359a283fbbaf413b3381e62806cc5bca001b3784d9f1c04f101518ce1d8",
-                "0x6d47c7f649acdbe2be732775612c1552fa82fa78944d44c8ce3a63ddafcfdc8e",
-                "0x780bcb92e8c6e000207aa628f36c633e585df01bca0325315146d85cc9b3d0c2",
+                "0x68401bef7ff626542192a3c78075a07afbbbd659544d610448a0e8beccd80f6c",
+                "0x0fc6422f8cda1dca1c1674fd4f0ef461edc2bf81ba7aa08c9fd060dd1194e080",
+                "0x01981240bb46e8ba936a10ba928849798f7c7a2084061ac0ab979befcd7874ec",
+                "0x39f8518003a60fb1d900f506c7717c12b2f11f898c2cdbdbc86d109e4dde96a5",
             ],
         );
     }

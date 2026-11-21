@@ -1,5 +1,5 @@
 use crate::hash::{Hasher, MerkleHasher};
-use crate::starkom::proto::pcs::v11 as proto;
+use crate::starkom::proto::pcs::v12 as proto;
 use crate::utils;
 use anyhow::{Result, anyhow};
 use primitive_types::{H256, U256, U512};

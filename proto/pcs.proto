@@ -2,16 +2,16 @@ syntax = "proto3";
 
 import "google/protobuf/any.proto";
 
-package starkom.proto.pcs.v11;
+package starkom.proto.pcs.v12;
 
 // Identifier for the Starkom-provided SHA2-256 hash backend.
 //
-// The type URL of this message is `type.starkom.io/starkom.proto.pcs.v11.Sha2HashBackend`.
+// The type URL of this message is `type.starkom.io/starkom.proto.pcs.v12.Sha2HashBackend`.
 message Sha2HashBackend {}
 
 // Identifier for the Starkom-provided Keccak-256 hash backend.
 //
-// The type URL of this message is `type.starkom.io/starkom.proto.pcs.v11.KeccakHashBackend`.
+// The type URL of this message is `type.starkom.io/starkom.proto.pcs.v12.KeccakHashBackend`.
 message KeccakHashBackend {}
 
 // A batched DEEP-FRI polynomial commitment.
